@@ -50,18 +50,6 @@ stock_analysis_tool = MCPToolset(
 #     )
 # )
 
-apify_tool = MCPToolset(
-    connection_params=StdioServerParameters(
-        command="npx",
-        args=[
-            "mcp-remote",
-            "https://mcp.apify.com/sse?actors=nmdmnd/yahoo-finance",
-            "--header",
-            f"Authorization: Bearer {os.getenv('APIFY_API_TOKEN', '')}"
-        ]
-    )
-)
-
 def read_stock_data() -> str:
     """
     Reads the stock data from the JSON file containing categorized stock tickers.
