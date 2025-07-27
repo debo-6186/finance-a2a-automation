@@ -57,7 +57,7 @@ apify_tool = MCPToolset(
             "mcp-remote",
             "https://mcp.apify.com/sse?actors=nmdmnd/yahoo-finance",
             "--header",
-            "Authorization: Bearer REMOVED_API_KEY"
+            f"Authorization: Bearer {os.getenv('APIFY_API_TOKEN', '')}"
         ]
     )
 )

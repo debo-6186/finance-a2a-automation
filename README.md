@@ -20,6 +20,31 @@ finance-a2a-automation/
 - [uv](https://github.com/astral-sh/uv) package manager
 - macOS/Linux environment
 
+### Environment Variables
+
+Before starting the agents, you need to set up the required API keys:
+
+1. **Google API Key** (required for all agents):
+   ```bash
+   export GOOGLE_API_KEY="your_google_api_key_here"
+   ```
+   Get your key from: https://makersuite.google.com/app/apikey
+
+2. **Apify API Token** (optional, for enhanced stock data):
+   ```bash
+   export APIFY_API_TOKEN="your_apify_api_token_here"
+   ```
+   Get your token from: https://console.apify.com/account/integrations
+
+3. **Create .env files** (optional, for easier setup):
+   ```bash
+   # Copy the example file
+   cp stockanalyser_agent/env.example stockanalyser_agent/.env
+   
+   # Edit the .env file with your actual keys
+   nano stockanalyser_agent/.env
+   ```
+
 ### Installation & Setup
 
 1. **Clone the repository:**
@@ -220,6 +245,17 @@ Agent: Processes portfolio statement and provides investment insights
    uv sync
    ```
 
+4. **API Key Issues:**
+   ```bash
+   # Check if environment variables are set
+   echo $GOOGLE_API_KEY
+   echo $APIFY_API_TOKEN
+   
+   # Set them if missing
+   export GOOGLE_API_KEY="your_key_here"
+   export APIFY_API_TOKEN="your_token_here"
+   ```
+
 ### Logs and Debugging
 
 - Check agent logs for error messages
@@ -249,6 +285,7 @@ stockanalyser_agent/
 ├── agent_executor.py
 ├── stock_data.json          # Stock categories and tickers
 ├── allocation.json          # User allocation list
+├── env.example             # Environment variables example
 ├── pyproject.toml
 └── uv.lock
 ```
