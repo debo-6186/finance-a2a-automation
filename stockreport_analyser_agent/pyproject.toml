@@ -1,0 +1,12 @@
+[project]
+name = "stock-report-agent"
+version = "0.1.0"
+description = "Stock report analyser agent for the A2A project."
+requires-python = ">=3.10"
+dependencies = [
+    "a2a-sdk>=0.2.5",
+    "google-adk>=1.2.1",
+    "python-dotenv",
+    "uvicorn",
+    "PyMuPDF>=1.24.9",
+]
