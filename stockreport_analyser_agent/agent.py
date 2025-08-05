@@ -4,11 +4,12 @@ import fitz  # PyMuPDF
 import io
 import os
 import re
+from google import genai
+from google.genai.types import GenerateContentConfig
 
 def read_portfolio_statement() -> str:
     """
-    Reads text from the local 'portfolio_statement.pdf' file and returns the text content.
-    Use this tool to get the content of the stock portfolio for analysis.
+    Reads portfolio statement PDF and returns text content.
     """
     try:
         # Construct an absolute path to the PDF file
@@ -51,141 +52,112 @@ def read_portfolio_statement() -> str:
 
 def extract_stock_tickers_from_portfolio(portfolio_text: str) -> str:
     """
-    Extracts and identifies all stock tickers from the portfolio text.
-    This tool helps identify all stocks mentioned in the portfolio for analysis.
+    Extracts stock tickers from portfolio text.
     
     Args:
-        portfolio_text: The text content from the portfolio statement
+        portfolio_text: The portfolio statement text
         
     Returns:
-        A formatted string with all identified stock tickers
+        List of stock tickers found
     """
     try:
-        print(f"Starting stock ticker extraction from {len(portfolio_text)} characters of text")
+        print(f"Starting LLM-based stock ticker extraction from {len(portfolio_text)} characters of text")
         
-        # Common patterns for stock tickers (1-5 letters, often in caps)
-        ticker_patterns = [
-            r'\b[A-Z]{1,5}\b',  # 1-5 letter tickers in caps
-            r'\b[A-Z]{1,5}\.[A-Z]{1,2}\b',  # Tickers with dots (e.g., BRK.A)
-            r'\b[A-Z]{1,5}-[A-Z]{1,2}\b',  # Tickers with hyphens
-            r'\b[A-Z]{1,5}\s+',  # Tickers followed by space
-            r'\s+[A-Z]{1,5}\b',  # Tickers preceded by space
-        ]
+        # Create the client with proper configuration
+        # Check if we should use Vertex AI or API key
+        if os.getenv("GOOGLE_GENAI_USE_VERTEXAI") == "TRUE":
+            client = genai.Client(vertexai=True)
+            print("Using Vertex AI for ticker extraction")
+        else:
+            api_key = os.getenv("GOOGLE_API_KEY")
+            if not api_key:
+                print("No GOOGLE_API_KEY found for ticker extraction")
+                return "**Error**: Google API key not configured for ticker extraction. Please set GOOGLE_API_KEY environment variable."
+            client = genai.Client(api_key=api_key)
+            print("Using Google AI API for ticker extraction")
         
-        found_tickers = set()
-        all_matches = []
+        # System prompt for stock ticker extraction
+        system_prompt = """You are an expert financial analyst specializing in analyzing portfolio statements and identifying stock ticker symbols.
+
+Your task is to carefully analyze portfolio text and extract ALL stock ticker symbols mentioned.
+
+Rules for extraction:
+1. Extract only valid stock ticker symbols (typically 1-5 characters, letters only)
+2. Look for company names and convert them to their ticker symbols (e.g., "Apple Inc." → "AAPL")
+3. Include both individual stocks and ETFs 
+4. Convert all tickers to uppercase
+5. Remove duplicates
+6. Do NOT include common words, currency codes, or non-stock identifiers
+7. Include tickers that appear in any context within the portfolio (holdings, transactions, etc.)
+
+Common patterns to look for:
+- Direct ticker mentions: "AAPL", "GOOGL", "TSLA"
+- Company names: "Apple Inc.", "Microsoft Corporation", "Tesla Inc."
+- ETF names: "Vanguard S&P 500 ETF" → "VOO"
+- Holdings tables with ticker columns
+- Transaction records
+
+Respond with ONLY a comma-separated list of ticker symbols in this format:
+AAPL,GOOGL,MSFT,TSLA,VOO
+
+If no tickers are found, respond with: NONE"""
+
+        # User prompt with the portfolio text
+        user_prompt = f"""Analyze this portfolio statement text and extract ALL stock ticker symbols:
+
+{portfolio_text}
+
+Provide only the comma-separated ticker list as specified."""
+
+        # Generate ticker extraction using LLM
+        print("Generating ticker extraction using LLM...")
+        response = client.models.generate_content(
+            model="gemini-2.5-flash",
+            contents=user_prompt,
+            config=GenerateContentConfig(
+                system_instruction=[system_prompt]
+            )
+        )
+        print("Received LLM response for ticker extraction")
         
-        # Extract tickers using patterns
-        for pattern in ticker_patterns:
-            matches = re.findall(pattern, portfolio_text)
-            all_matches.extend(matches)
-            for match in matches:
-                # Clean the match
-                clean_match = re.sub(r'[^\w]', '', match.upper())
-                if clean_match:
-                    # Filter out common words that might match the pattern
-                    common_words = {
-                        'THE', 'AND', 'FOR', 'WITH', 'FROM', 'THIS', 'THAT', 'HAVE', 'WILL', 'YOUR', 
-                        'PORTFOLIO', 'STOCK', 'SHARES', 'TOTAL', 'VALUE', 'PRICE', 'DATE', 'TIME', 
-                        'PAGE', 'REPORT', 'STATEMENT', 'ANALYSIS', 'INVESTMENT', 'FUND', 'ETF', 
-                        'MUTUAL', 'BOND', 'CASH', 'USD', 'DOL', 'PER', 'ALL', 'NEW', 'OLD', 'BIG', 
-                        'SMALL', 'HIGH', 'LOW', 'GOOD', 'BAD', 'YES', 'NO', 'ONE', 'TWO', 'THREE', 
-                        'FOUR', 'FIVE', 'SIX', 'SEVEN', 'EIGHT', 'NINE', 'TEN', 'INC', 'CORP', 
-                        'LTD', 'LLC', 'CO', 'COMPANY', 'SHARE', 'SHARES', 'STOCK', 'STOCKS',
-                        'HOLDINGS', 'HOLDING', 'POSITION', 'POSITIONS', 'ACCOUNT', 'ACCOUNTS',
-                        'BALANCE', 'BALANCES', 'AMOUNT', 'AMOUNTS', 'QUANTITY', 'QUANTITIES',
-                        'NUMBER', 'NUMBERS', 'COUNT', 'COUNTS', 'EACH', 'EVERY', 'SOME', 'MANY',
-                        'FEW', 'SEVERAL', 'MULTIPLE', 'SINGLE', 'DOUBLE', 'TRIPLE', 'QUAD',
-                        'FIRST', 'SECOND', 'THIRD', 'FOURTH', 'FIFTH', 'SIXTH', 'SEVENTH',
-                        'EIGHTH', 'NINTH', 'TENTH', 'LAST', 'NEXT', 'PREVIOUS', 'CURRENT',
-                        'FORMER', 'LATTER', 'EARLY', 'LATE', 'SOON', 'LATER', 'AGAIN',
-                        'ALSO', 'TOO', 'ASWELL', 'BESIDES', 'MOREOVER', 'FURTHERMORE',
-                        'ADDITIONALLY', 'FURTHER', 'BESIDES', 'EXCEPT', 'UNLESS', 'UNTIL',
-                        'SINCE', 'BEFORE', 'AFTER', 'DURING', 'WHILE', 'WHEN', 'WHERE',
-                        'WHY', 'HOW', 'WHAT', 'WHICH', 'WHO', 'WHOSE', 'WHOM', 'THERE',
-                        'HERE', 'THERE', 'WHERE', 'EVERYWHERE', 'NOWHERE', 'SOMEWHERE',
-                        'ANYWHERE', 'INSIDE', 'OUTSIDE', 'ABOVE', 'BELOW', 'UNDER', 'OVER',
-                        'BETWEEN', 'AMONG', 'AMONGST', 'BENEATH', 'BEHIND', 'BEFORE',
-                        'AFTER', 'DURING', 'SINCE', 'UNTIL', 'WHILE', 'ALTHOUGH', 'THOUGH',
-                        'UNLESS', 'EXCEPT', 'BESIDES', 'BEYOND', 'WITHIN', 'WITHOUT',
-                        'AGAINST', 'TOWARD', 'TOWARDS', 'UPON', 'ABOUT', 'AROUND', 'ACROSS',
-                        'THROUGH', 'THROUGHOUT', 'ALONG', 'ALONGSIDE', 'NEAR', 'NEARBY',
-                        'FAR', 'AWAY', 'CLOSE', 'DISTANT', 'REMOTE', 'LOCAL', 'GLOBAL',
-                        'WORLDWIDE', 'INTERNATIONAL', 'NATIONAL', 'REGIONAL', 'LOCAL',
-                        'PRIVATE', 'PUBLIC', 'COMMON', 'SPECIAL', 'UNIQUE', 'RARE',
-                        'USUAL', 'NORMAL', 'STANDARD', 'TYPICAL', 'AVERAGE', 'MEDIUM',
-                        'LARGE', 'SMALL', 'BIG', 'LITTLE', 'HUGE', 'TINY', 'MASSIVE',
-                        'MINI', 'MICRO', 'MACRO', 'MEGA', 'GIGA', 'TERA', 'PETA',
-                        'EXA', 'ZETTA', 'YOTTA', 'KILO', 'MILLI', 'MICRO', 'NANO',
-                        'PICO', 'FEMTO', 'ATTO', 'ZEPTO', 'YOCTO', 'CENTI', 'DECI',
-                        'DECA', 'HECTO', 'MEGA', 'GIGA', 'TERA', 'PETA', 'EXA',
-                        'ZETTA', 'YOTTA', 'KILO', 'MILLI', 'MICRO', 'NANO', 'PICO',
-                        'FEMTO', 'ATTO', 'ZEPTO', 'YOCTO', 'CENTI', 'DECI', 'DECA',
-                        'HECTO', 'MEGA', 'GIGA', 'TERA', 'PETA', 'EXA', 'ZETTA',
-                        'YOTTA', 'KILO', 'MILLI', 'MICRO', 'NANO', 'PICO', 'FEMTO',
-                        'ATTO', 'ZEPTO', 'YOCTO', 'CENTI', 'DECI', 'DECA', 'HECTO'
-                    }
-                    if clean_match not in common_words and len(clean_match) >= 1:
-                        found_tickers.add(clean_match)
+        found_tickers = []
         
-        print(f"Found {len(found_tickers)} potential tickers using regex patterns")
-        
-        # Also look for specific stock names that might be mentioned
-        stock_keywords = ['stock', 'shares', 'ticker', 'symbol', 'company', 'holding', 'position']
-        lines = portfolio_text.split('\n')
-        for line_num, line in enumerate(lines):
-            line_upper = line.upper()
-            for keyword in stock_keywords:
-                if keyword in line_upper:
-                    print(f"Found stock keyword '{keyword}' in line {line_num + 1}: {line[:100]}...")
-                    # Look for potential tickers in this line
-                    words = line.split()
-                    for word in words:
-                        word_clean = re.sub(r'[^\w]', '', word.upper())
-                        if len(word_clean) >= 1 and len(word_clean) <= 5 and word_clean not in common_words:
-                            found_tickers.add(word_clean)
-                            print(f"  Added ticker: {word_clean}")
-        
-        # Look for patterns like "X shares of Y" or "Y (Company Name)"
-        share_patterns = [
-            r'(\d+)\s+shares?\s+of\s+([A-Z]{1,5})',
-            r'([A-Z]{1,5})\s*\([^)]+\)',
-            r'([A-Z]{1,5})\s+Inc\.',
-            r'([A-Z]{1,5})\s+Corp\.',
-            r'([A-Z]{1,5})\s+Ltd\.',
-            r'([A-Z]{1,5})\s+LLC',
-        ]
-        
-        for pattern in share_patterns:
-            matches = re.findall(pattern, portfolio_text, re.IGNORECASE)
-            for match in matches:
-                if isinstance(match, tuple):
-                    for item in match:
-                        if len(item) >= 1 and len(item) <= 5 and item.isalpha():
-                            found_tickers.add(item.upper())
-                elif isinstance(match, str) and len(match) >= 1 and len(match) <= 5 and match.isalpha():
-                    found_tickers.add(match.upper())
-        
-        print(f"After share pattern matching, found {len(found_tickers)} tickers")
+        if response and response.text:
+            # Parse the LLM response
+            response_text = response.text.strip()
+            print(f"LLM ticker extraction response: {response_text}")
+            
+            # Parse the response
+            if response_text.upper() != "NONE":
+                # Split by commas and clean up
+                ticker_list = response_text.split(',')
+                for ticker in ticker_list:
+                    ticker = ticker.strip().upper()
+                    # Validate ticker format (1-5 characters, letters only)
+                    if ticker and len(ticker) >= 1 and len(ticker) <= 5 and ticker.isalpha():
+                        found_tickers.append(ticker)
+                
+                # Remove duplicates while preserving order
+                found_tickers = list(dict.fromkeys(found_tickers))
+        else:
+            print("No response from LLM for ticker extraction")
+            return "**Error**: Could not extract tickers using LLM. Please try again."
         
         if not found_tickers:
-            print("No stock tickers found. Here's a sample of the text:")
-            print(portfolio_text[:500] + "..." if len(portfolio_text) > 500 else portfolio_text)
+            print("No stock tickers found by LLM")
             return "No stock tickers found in the portfolio text. Please check if the portfolio statement contains stock symbols."
         
-        # Sort tickers for better readability
-        sorted_tickers = sorted(list(found_tickers))
+        print(f"LLM found {len(found_tickers)} tickers: {found_tickers}")
         
-        print(f"Final tickers found: {sorted_tickers}")
-        
+        # Format the result
         result = f"**Stock Tickers Found in Portfolio:**\n\n"
-        result += f"Total stocks identified: {len(sorted_tickers)}\n\n"
+        result += f"Total stocks identified: {len(found_tickers)}\n\n"
         result += "**Individual Stocks:**\n"
-        for i, ticker in enumerate(sorted_tickers, 1):
+        for i, ticker in enumerate(found_tickers, 1):
             result += f"{i}. {ticker}\n"
         
         result += f"\n**Analysis Recommendation:**\n"
-        result += f"These {len(sorted_tickers)} stocks should be analyzed for:\n"
+        result += f"These {len(found_tickers)} stocks should be analyzed for:\n"
         result += f"- Current performance and trends\n"
         result += f"- Risk assessment\n"
         result += f"- Portfolio diversification analysis\n"
@@ -197,58 +169,63 @@ def extract_stock_tickers_from_portfolio(portfolio_text: str) -> str:
         print(f"Error in extract_stock_tickers_from_portfolio: {e}")
         return f"Error extracting stock tickers: {e}"
 
-read_portfolio_tool = FunctionTool(read_portfolio_statement)
-extract_tickers_tool = FunctionTool(extract_stock_tickers_from_portfolio)
+
+def handle_portfolio_analysis_error() -> str:
+    """
+    Provides guidance when portfolio analysis encounters errors.
+    
+    Returns:
+        Error handling instructions
+    """
+    return """
+    **PORTFOLIO ANALYSIS ERROR GUIDANCE**
+    
+    **If you get malformed function call errors:**
+    
+    1. **Correct Function Calls:**
+       ✅ read_portfolio_statement()
+       ✅ extract_stock_tickers_from_portfolio(portfolio_text="[text content]")
+    
+    2. **Simple Workflow:**
+       - Step 1: Call read_portfolio_statement() first
+       - Step 2: Use the text result in extract_stock_tickers_from_portfolio()
+       - Step 3: Analyze the results
+    
+    3. **Parameter Rules:**
+       - read_portfolio_statement() takes NO parameters
+       - extract_stock_tickers_from_portfolio() takes portfolio_text as a string
+       - Always use quotes around string parameters
+    
+    **Recovery Steps:**
+    1. Call read_portfolio_statement() to get portfolio text
+    2. Call extract_stock_tickers_from_portfolio(portfolio_text="[paste the text here]")
+    3. Provide analysis based on the extracted tickers
+    """
+
+
+read_portfolio_statement_tool = FunctionTool(read_portfolio_statement)
+extract_stock_tickers_from_portfolio_tool = FunctionTool(extract_stock_tickers_from_portfolio)
+handle_portfolio_analysis_error_tool = FunctionTool(handle_portfolio_analysis_error)
 
 def create_agent() -> LlmAgent:
     """Constructs the ADK agent for stock report analysis."""
     return LlmAgent(
-        model="gemini-2.5-pro",
+        model="gemini-2.5-flash",
         name="stock_report_analyser_agent",
         instruction="""
-            **Role:** You are a professional financial analyst specializing in analyzing stock reports and portfolio statements.
+            **Role:** Analyze portfolio statements and extract stock information.
 
-            **Core Directives:**
-
-            *   **Portfolio Analysis:** To analyze the user's stock portfolio, you MUST use the `read_portfolio_statement` tool to read and process the portfolio statement. Then use the `extract_stock_tickers_from_portfolio` tool to identify ALL stocks in the portfolio. Focus on:
-                - Identifying ALL stock tickers in the portfolio
-                - Key financial metrics and performance indicators
-                - Revenue and profit trends
-                - Management commentary and guidance
-                - Risk factors and competitive positioning
-                - Comparison with previous periods and industry benchmarks
-                
-            *   **Stock Identification:** 
-                - Use the `extract_stock_tickers_from_portfolio` tool to systematically identify ALL stocks in the portfolio
-                - Ensure no stocks are missed in the analysis
-                - Provide a complete list of all identified stocks
-                - Analyze each identified stock thoroughly
-                
-            *   **Response Format:** When analyzing reports, structure your response as follows:
-                1. **Portfolio Summary**: Complete list of all stocks found in the portfolio
-                2. **Executive Summary** of key findings
-                3. **Financial Performance Analysis** (revenue, profit, margins)
-                4. **Key Highlights and Concerns**
-                5. **Management Outlook and Guidance**
-                6. **Investment Implications and Recommendations**
-                7. **Portfolio Diversification Analysis**
-                
-            *   **Analysis Depth:** Provide thorough analysis including:
-                - Complete identification of all portfolio stocks
-                - Quantitative metrics analysis for each stock
-                - Qualitative assessment of business performance
-                - Industry context and competitive positioning
-                - Forward-looking insights based on the report data
-                - Portfolio-level analysis and recommendations
-                
-            *   **Professional Standards:** 
-                - Use precise financial terminology
-                - Provide objective, data-driven analysis
-                - Highlight both positive and negative aspects
-                - Include relevant financial ratios and comparisons
-                - Ensure comprehensive coverage of ALL stocks in the portfolio
-                
-            *   **Scope:** Focus on comprehensive portfolio analysis and investment research based on the provided portfolio statement. Ensure ALL stocks are identified and analyzed.
+            **Workflow:**
+            
+            1. Call: read_portfolio_statement()
+            2. Call: extract_stock_tickers_from_portfolio(portfolio_text="[result from step 1]")
+            3. Analyze and provide recommendations
+            
+            **Function Call Rules:**
+            - read_portfolio_statement() - NO parameters
+            - extract_stock_tickers_from_portfolio(portfolio_text="text") - ONE string parameter
+            - Use exact parameter names with quotes
+            - If errors occur, use handle_portfolio_analysis_error()
         """,
-        tools=[read_portfolio_tool, extract_tickers_tool],
+        tools=[read_portfolio_statement_tool, extract_stock_tickers_from_portfolio_tool, handle_portfolio_analysis_error_tool],
     )

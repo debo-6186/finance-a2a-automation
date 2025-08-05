@@ -1,4 +1,3 @@
-import logging
 import os
 
 import uvicorn
@@ -17,11 +16,13 @@ from google.adk.artifacts import InMemoryArtifactService
 from google.adk.memory.in_memory_memory_service import InMemoryMemoryService
 from google.adk.runners import Runner
 from google.adk.sessions import InMemorySessionService
+from logger import setup_logging, get_logger
 
 load_dotenv()
 
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+# Setup logging
+setup_logging()
+logger = get_logger(__name__)
 
 
 class MissingAPIKeyError(Exception):

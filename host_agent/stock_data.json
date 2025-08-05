@@ -1,0 +1,74 @@
+{
+  "USA_TOP_FINANCIAL_STOCKS": [
+    "JPM",
+    "BAC",
+    "WFC",
+    "GS",
+    "MS",
+    "C",
+    "USB",
+    "PNC",
+    "TFC",
+    "COF"
+  ],
+  "USA_TOP_AUTOMOBILE_STOCKS": [
+    "TSLA",
+    "F",
+    "GM",
+    "TM",
+    "HMC",
+    "NIO",
+    "XPEV",
+    "LI",
+    "RIVN",
+    "LCID"
+  ],
+  "USA_TOP_TECHNOLOGY_STOCKS": [
+    "AAPL",
+    "MSFT",
+    "GOOGL",
+    "AMZN",
+    "NVDA",
+    "META",
+    "TSLA",
+    "NFLX",
+    "ADBE",
+    "CRM"
+  ],
+  "INDIA_TOP_FINANCIAL_STOCKS": [
+    "HDFCBANK",
+    "ICICIBANK",
+    "SBIN",
+    "AXISBANK",
+    "KOTAKBANK",
+    "INDUSINDBK",
+    "BANKBARODA",
+    "PNB",
+    "CANBK",
+    "UNIONBANK"
+  ],
+  "INDIA_TOP_AUTOMOBILE_STOCKS": [
+    "MARUTI",
+    "TATAMOTORS",
+    "M&M",
+    "HEROMOTOCO",
+    "BAJAJ-AUTO",
+    "EICHERMOT",
+    "ASHOKLEY",
+    "TVSMOTOR",
+    "FORCEMOT",
+    "MRF"
+  ],
+  "INDIA_TOP_TECHNOLOGY_STOCKS": [
+    "TCS",
+    "INFY",
+    "WIPRO",
+    "HCLTECH",
+    "TECHM",
+    "MINDTREE",
+    "LTI",
+    "MPHASIS",
+    "PERSISTENT",
+    "COFORGE"
+  ]
+} 

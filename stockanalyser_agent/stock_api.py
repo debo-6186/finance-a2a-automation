@@ -1,15 +1,15 @@
 import json
-import logging
 import os
 from typing import List
 
 import uvicorn
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
+from logger import setup_logging, get_logger
 
 # Configure logging
-logger = logging.getLogger(__name__)
-logger.setLevel(logging.DEBUG)
+setup_logging()
+logger = get_logger(__name__)
 
 # Initialize FastAPI app
 app = FastAPI(
