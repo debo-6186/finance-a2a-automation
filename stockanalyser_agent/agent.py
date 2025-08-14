@@ -1,6 +1,7 @@
 from google.adk.agents import LlmAgent
 from google.adk.tools.mcp_tool.mcp_toolset import MCPToolset, StdioServerParameters
 from google.adk.tools import FunctionTool
+# Schema imports removed - using basic FunctionTool without explicit schemas
 import json
 import os
 from typing import List, Dict, Optional
@@ -8,6 +9,8 @@ from datetime import datetime
 import asyncio
 import concurrent.futures
 import traceback
+import requests
+import base64
 from logger import setup_logging, get_logger, get_log_file_path
 from google import genai
 from google.genai.types import GenerateContentConfig, HttpOptions
@@ -16,18 +19,6 @@ from google.genai.types import GenerateContentConfig, HttpOptions
 log_file_path = setup_logging()
 logger = get_logger(__name__)
 logger.info(f"Logging initialized. Log file: {log_file_path}")
-
-# stock_analysis_tool = MCPToolset(
-#     connection_params=StdioServerParameters(
-#         command="uv",
-#         args=[
-#             "--directory", 
-#             "/Users/debojyotichakraborty/codebase/mcp-yfinance-server",
-#             "run", 
-#             "source/yf_server.py"
-#         ]
-#     )
-# )
 
 stock_analysis_tool = MCPToolset(
     connection_params=StdioServerParameters(
@@ -40,249 +31,11 @@ stock_analysis_tool = MCPToolset(
         ]
     )
 )
+ 
 
-# stock_analysis_tool = MCPToolset(
-#     connection_params=StdioServerParameters(
-#         command="uv",
-#         args=[
-#             "--directory", 
-#             "/Users/debojyotichakraborty/codebase/mcp-yfinance",
-#             "run", 
-#             "mcp_yfinance/server.py"
-#         ]
-#     )
-# )
-
-# stock_analysis_tool = MCPToolset(
-#     connection_params=StdioServerParameters(
-#         command="/Users/debojyotichakraborty/.pyenv/shims/python",
-#         args=[
-#             "/Users/debojyotichakraborty/codebase/mcp-yfinance/server.py",
-#         ]
-#     )
-# )
-
-def analyze_single_stock_parallel(ticker: str, stock_analysis_tool) -> Dict[str, str]:
+def aggregate_parallel_results(successful_analyses: str, failed_analyses: str, investment_amount: str = "", email_to: str = "") -> str:
     """
-    Analyzes a single stock by getting market data and expert analysis.
-    
-    Args:
-        ticker: Stock ticker symbol (e.g., "AAPL")
-        stock_analysis_tool: The MCP toolset for stock analysis
-    
-    Returns:
-        Dictionary with ticker, raw_data, expert_analysis, and status
-    """
-    try:
-        logger.info(f"Starting parallel analysis for {ticker}")
-        
-        # Step 2: Get stock market data using MCP tool
-        # Note: The actual MCP tool call will be handled by the LLM
-        # This function serves as a template for the parallel structure
-        
-        result = {
-            'ticker': ticker,
-            'raw_data': '',
-            'expert_analysis': '',
-            'status': 'pending',
-            'error_message': ''
-        }
-        
-        # The actual implementation will be handled by the LLM calling MCP tools
-        # This is a structural template for parallel processing
-        logger.info(f"Parallel analysis template ready for {ticker}")
-        return result
-        
-    except Exception as e:
-        logger.error(f"Error in parallel analysis for {ticker}: {str(e)}")
-        return {
-            'ticker': ticker,
-            'raw_data': '',
-            'expert_analysis': '',
-            'status': 'failed',
-            'error_message': f"{ticker} stock could not be analysed (error: {str(e)} - try again later)"
-        }
-
-
-def execute_parallel_stock_analysis(tickers: str) -> str:
-    """
-    Provides detailed instructions for executing parallel stock analysis.
-    
-    Args:
-        tickers: Comma-separated string of stock tickers
-    
-    Returns:
-        Detailed parallel execution instructions for the LLM
-    """
-    try:
-        ticker_list = [ticker.strip().upper() for ticker in tickers.split(',') if ticker.strip()]
-        
-        if not ticker_list:
-            return "Error: No valid tickers provided for parallel analysis."
-        
-        logger.info(f"Generating parallel execution instructions for {len(ticker_list)} stocks")
-        
-        instructions = f"""
-        **PARALLEL STOCK ANALYSIS EXECUTION PLAN**
-        
-        **Stocks for Parallel Processing:** {', '.join(ticker_list)}
-        **Total Stocks:** {len(ticker_list)}
-        
-        **EXECUTE THESE SIMULTANEOUSLY (IN PARALLEL):**
-        
-        For EACH ticker below, perform BOTH steps at the same time:
-        
-        """
-        
-        for i, ticker in enumerate(ticker_list, 1):
-            instructions += f"""
-        **PARALLEL TASK {i} - {ticker}:**
-        Step A: Call stock_analysis_tool for {ticker} to get market data
-        Step B: When data received, immediately call get_expert_stock_analysis(stock_analysis_response="[{ticker} data]", ticker="{ticker}")
-        
-        """
-        
-        instructions += f"""
-        **PARALLEL EXECUTION REQUIREMENTS:**
-        
-        1. **Simultaneous Processing:** Start analysis for ALL {len(ticker_list)} stocks at the same time
-        2. **Independent Results:** Keep each stock's analysis completely separate
-        3. **Error Isolation:** If one stock fails, continue with others
-        4. **Data Integrity:** Never mix data between different stocks
-        
-        **EXPECTED PARALLEL OUTPUTS:**
-        
-        For each successful stock, collect:
-        - Ticker symbol
-        - Raw market data from stock_analysis_tool
-        - Expert analysis and recommendation
-        - Buy/Sell/Hold recommendation
-        - Suggested allocation percentage
-        
-        For each failed stock, collect:
-        - Error message: "[TICKER] stock could not be analysed (try again later)"
-        
-        **NEXT STEP AFTER PARALLEL COMPLETION:**
-        Use aggregate_parallel_results() to combine all results into final recommendations.
-        
-        **START PARALLEL EXECUTION NOW FOR:** {', '.join(ticker_list)}
-        """
-        
-        return instructions
-        
-    except Exception as e:
-        logger.error(f"Error generating parallel execution instructions: {str(e)}")
-        return f"Error: Failed to generate parallel execution plan. {str(e)}"
-
-
-def calculate_investment_allocation(analysis_results: str, investment_amount: str) -> str:
-    """
-    Calculates specific dollar amounts for each BUY recommendation based on investment amount.
-    
-    Args:
-        analysis_results: String containing all stock analysis results
-        investment_amount: Total amount available for investment
-    
-    Returns:
-        Formatted investment allocation with specific dollar amounts
-    """
-    try:
-        # Parse the investment amount to get numeric value
-        investment_amount_numeric = 0
-        import re
-        amount_match = re.search(r'[\d,]+\.?\d*', investment_amount.replace(',', ''))
-        if amount_match:
-            investment_amount_numeric = float(amount_match.group().replace(',', ''))
-        
-        if investment_amount_numeric <= 0:
-            return "Error: Invalid investment amount provided. Please provide a valid dollar amount."
-        
-        # Parse analysis results to extract BUY recommendations
-        buy_stocks = []
-        hold_stocks = []
-        sell_stocks = []
-        
-        if analysis_results:
-            # Split analyses by stock sections
-            stock_sections = analysis_results.split("**EXPERT ANALYSIS FOR")
-            
-            for section in stock_sections[1:]:  # Skip first empty section
-                try:
-                    # Extract ticker from section
-                    lines = section.split('\n')
-                    ticker_line = lines[0] if lines else ""
-                    ticker = ticker_line.strip().replace('**', '').strip()
-                    
-                    # Look for recommendations in the section
-                    section_text = section.upper()
-                    
-                    if 'BUY' in section_text and ('RECOMMENDATION' in section_text or 'EXPERT RECOMMENDATION' in section_text):
-                        # Check if it's actually a BUY recommendation
-                        if 'BUY' in section_text and 'SELL' not in section_text.replace('BUY', ''):
-                            buy_stocks.append(ticker)
-                    elif 'HOLD' in section_text and ('RECOMMENDATION' in section_text or 'EXPERT RECOMMENDATION' in section_text):
-                        hold_stocks.append(ticker)
-                    elif 'SELL' in section_text and ('RECOMMENDATION' in section_text or 'EXPERT RECOMMENDATION' in section_text):
-                        sell_stocks.append(ticker)
-                except:
-                    continue
-        
-        # Format the results
-        result_parts = []
-        result_parts.append("**INVESTMENT ALLOCATION BASED ON EXPERT RECOMMENDATIONS**")
-        result_parts.append("=" * 60)
-        result_parts.append("")
-        result_parts.append(f"Total Investment Amount: {investment_amount}")
-        result_parts.append("")
-        
-        if buy_stocks:
-            # Calculate equal allocation among BUY stocks
-            amount_per_stock = investment_amount_numeric / len(buy_stocks)
-            
-            result_parts.append("**1) STOCK ALLOCATION:**")
-            for stock in buy_stocks:
-                result_parts.append(f"Stock Ticker: {stock}, Amount to invest: ${amount_per_stock:,.2f}")
-            result_parts.append("")
-            
-            result_parts.append("**2) RATIONALE / DETAILS:**")
-            result_parts.append(f"• BUY Recommendations: {len(buy_stocks)} stocks")
-            result_parts.append(f"• HOLD Recommendations: {len(hold_stocks)} stocks")
-            result_parts.append(f"• SELL Recommendations: {len(sell_stocks)} stocks")
-            result_parts.append(f"• Equal allocation strategy: ${amount_per_stock:,.2f} per BUY stock")
-            result_parts.append(f"• Total allocation: ${investment_amount_numeric:,.2f} (100% of available funds)")
-            result_parts.append("• Diversification across multiple BUY recommendations")
-            result_parts.append("• Based on comprehensive expert analysis and market assessment")
-            
-            if hold_stocks:
-                result_parts.append(f"• HOLD stocks ({', '.join(hold_stocks)}): No new investment recommended")
-            if sell_stocks:
-                result_parts.append(f"• SELL stocks ({', '.join(sell_stocks)}): Consider exiting positions")
-        else:
-            result_parts.append("**1) STOCK ALLOCATION:**")
-            result_parts.append("No BUY recommendations found in the analysis results.")
-            result_parts.append("")
-            result_parts.append("**2) RATIONALE / DETAILS:**")
-            result_parts.append(f"• BUY Recommendations: 0 stocks")
-            result_parts.append(f"• HOLD Recommendations: {len(hold_stocks)} stocks")
-            result_parts.append(f"• SELL Recommendations: {len(sell_stocks)} stocks")
-            result_parts.append("• No new investments recommended at this time")
-            result_parts.append("• Consider holding cash or reviewing alternative investment options")
-            
-            if hold_stocks:
-                result_parts.append(f"• HOLD stocks ({', '.join(hold_stocks)}): Maintain current positions")
-            if sell_stocks:
-                result_parts.append(f"• SELL stocks ({', '.join(sell_stocks)}): Consider reducing positions")
-        
-        return "\n".join(result_parts)
-        
-    except Exception as e:
-        logger.error(f"Error calculating investment allocation: {str(e)}")
-        return f"Error calculating investment allocation: {str(e)}"
-
-
-def aggregate_parallel_results(successful_analyses: str, failed_analyses: str, investment_amount: str = "") -> str:
-    """
-    Aggregates results from parallel stock analyses and provides comprehensive recommendations.
+    Uses LLM to aggregate and summarize results from parallel stock analyses with comprehensive recommendations.
     
     Args:
         successful_analyses: String containing all successful stock analyses
@@ -290,201 +43,177 @@ def aggregate_parallel_results(successful_analyses: str, failed_analyses: str, i
         investment_amount: Total investment amount (optional)
     
     Returns:
-        Comprehensive aggregated analysis and recommendations
+        LLM-generated comprehensive aggregated analysis and recommendations
     """
     try:
+        logger.info("Starting LLM-based aggregation of parallel stock analysis results")
+        
         # Parse the input strings to understand the data
         if not successful_analyses.strip() and not failed_analyses.strip():
             return "Error: No analysis results provided for aggregation."
         
         # Count successful and failed analyses by parsing the input strings
-        successful_count = successful_analyses.count("**") if successful_analyses else 0
+        successful_count = successful_analyses.count("**EXPERT ANALYSIS FOR") if successful_analyses else 0
         failed_count = failed_analyses.count("could not be analysed") if failed_analyses else 0
         total_requested = successful_count + failed_count
         
         logger.info(f"Aggregating results: {successful_count} successful, {failed_count} failed")
         
-        report_parts = []
-        
-        # Header
-        report_parts.append("**PARALLEL STOCK ANALYSIS - AGGREGATED RESULTS**")
-        report_parts.append("=" * 60)
-        report_parts.append("")
-        
-        # Summary Statistics
-        report_parts.append("**ANALYSIS SUMMARY:**")
-        report_parts.append(f"• Total Stocks Processed: {total_requested}")
-        report_parts.append(f"• Successfully Analyzed: {successful_count}")
-        report_parts.append(f"• Failed to Analyze: {failed_count}")
-        if investment_amount:
-            report_parts.append(f"• Investment Amount: {investment_amount}")
-        report_parts.append(f"• Success Rate: {(successful_count/total_requested)*100:.1f}%" if total_requested > 0 else "• Success Rate: 0%")
-        report_parts.append("")
-        
-        # Successful Analyses
-        if successful_analyses.strip():
-            report_parts.append("**SUCCESSFUL STOCK ANALYSES:**")
-            report_parts.append("-" * 40)
-            report_parts.append("")
-            report_parts.append(successful_analyses)
-            report_parts.append("")
-            report_parts.append("-" * 40)
-            report_parts.append("")
-        
-        # Failed Analyses
-        if failed_analyses.strip():
-            report_parts.append("**FAILED ANALYSES:**")
-            report_parts.append("-" * 20)
-            report_parts.append(failed_analyses)
-            report_parts.append("")
-        
-        # Portfolio Recommendations
-        if successful_analyses.strip():
-            report_parts.append("**AGGREGATED PORTFOLIO RECOMMENDATIONS:**")
-            report_parts.append("=" * 50)
-            report_parts.append("")
-            
-            report_parts.append("**ALLOCATION STRATEGY:**")
-            report_parts.append(f"Based on {successful_count} successfully analyzed stocks")
-            report_parts.append("Review individual expert recommendations above for specific allocation guidance")
-            report_parts.append("")
-            
-            if investment_amount:
-                # Parse the investment amount to get numeric value
-                investment_amount_numeric = 0
-                try:
-                    # Extract numeric value from investment amount string
-                    import re
-                    amount_match = re.search(r'[\d,]+\.?\d*', investment_amount.replace(',', ''))
-                    if amount_match:
-                        investment_amount_numeric = float(amount_match.group().replace(',', ''))
-                except:
-                    investment_amount_numeric = 0
-                
-                # Parse successful analyses to extract BUY recommendations
-                buy_stocks = []
-                if successful_analyses and investment_amount_numeric > 0:
-                    # Split analyses by stock sections
-                    stock_sections = successful_analyses.split("**EXPERT ANALYSIS FOR")
-                    
-                    for section in stock_sections[1:]:  # Skip first empty section
-                        try:
-                            # Extract ticker from section
-                            lines = section.split('\n')
-                            ticker_line = lines[0] if lines else ""
-                            ticker = ticker_line.strip().replace('**', '').strip()
-                            
-                            # Look for BUY recommendation in the section
-                            section_text = section.upper()
-                            if 'BUY' in section_text and ('RECOMMENDATION' in section_text or 'EXPERT RECOMMENDATION' in section_text):
-                                # Check if it's actually a BUY recommendation (not SELL or HOLD)
-                                if 'BUY' in section_text and 'SELL' not in section_text.replace('BUY', ''):
-                                    buy_stocks.append(ticker)
-                        except:
-                            continue
-                
-                report_parts.append(f"**INVESTMENT ALLOCATION RECOMMENDATIONS:**")
-                report_parts.append(f"Total Investment Amount: {investment_amount}")
-                report_parts.append("")
-                
-                if buy_stocks and investment_amount_numeric > 0:
-                    # Calculate equal allocation among BUY stocks (can be modified for weighted allocation)
-                    amount_per_stock = investment_amount_numeric / len(buy_stocks)
-                    
-                    report_parts.append("**1) STOCK ALLOCATION:**")
-                    for stock in buy_stocks:
-                        report_parts.append(f"Stock Ticker: {stock}, Amount to invest: ${amount_per_stock:,.2f}")
-                    report_parts.append("")
-                    
-                    report_parts.append("**2) RATIONALE / DETAILS:**")
-                    report_parts.append(f"• Total stocks recommended for BUY: {len(buy_stocks)}")
-                    report_parts.append(f"• Equal allocation strategy: ${amount_per_stock:,.2f} per stock")
-                    report_parts.append(f"• Based on expert analysis showing BUY recommendations")
-                    report_parts.append(f"• Diversification across {len(buy_stocks)} different stocks")
-                    report_parts.append("• Review individual expert analysis above for detailed reasoning")
-                    report_parts.append("• Consider adjusting amounts based on risk tolerance and conviction levels")
-                    report_parts.append("")
-                    
-                    report_parts.append("**IMPLEMENTATION NOTES:**")
-                    report_parts.append("• Execute BUY orders for the recommended amounts")
-                    report_parts.append("• Consider dollar-cost averaging for large positions")
-                    report_parts.append("• Set appropriate stop-loss levels based on expert analysis")
-                    report_parts.append("• Monitor performance and rebalance as needed")
-                else:
-                    report_parts.append("**1) STOCK ALLOCATION:**")
-                    report_parts.append("No BUY recommendations found in the analysis results.")
-                    report_parts.append("")
-                    report_parts.append("**2) RATIONALE / DETAILS:**")
-                    report_parts.append("• No stocks received BUY recommendations from expert analysis")
-                    report_parts.append("• Consider holding cash or reviewing other investment options")
-                    report_parts.append("• Check individual stock analyses above for HOLD or SELL recommendations")
-                
-                report_parts.append("")
-            
-            report_parts.append("**PORTFOLIO DIVERSIFICATION:**")
-            report_parts.append("• Review sector distribution across analyzed stocks")
-            report_parts.append("• Consider risk levels of individual recommendations")
-            report_parts.append("• Monitor correlation between selected stocks")
-            report_parts.append("• Balance growth vs. value stocks based on expert analysis")
-            report_parts.append("")
-            
-            report_parts.append("**IMPLEMENTATION RECOMMENDATIONS:**")
-            report_parts.append("• Prioritize stocks with 'BUY' recommendations")
-            report_parts.append("• Consider position sizing based on confidence levels")
-            report_parts.append("• Implement dollar-cost averaging for large investments")
-            report_parts.append("• Set stop-loss levels based on expert analysis")
-            report_parts.append("• Review and rebalance portfolio quarterly")
-            
+        # Initialize the Google GenAI client
+        api_key = os.getenv("GOOGLE_API_KEY")
+        if os.getenv("GOOGLE_GENAI_USE_VERTEXAI") == "TRUE":
+            client = genai.Client(vertexai=True)
+            logger.info("Using Vertex AI for results aggregation")
+        elif api_key:
+            client = genai.Client(api_key=api_key)
+            logger.info("Using Google GenAI API for results aggregation")
         else:
-            report_parts.append("**NO SUCCESSFUL ANALYSES AVAILABLE**")
-            report_parts.append("Unable to provide portfolio recommendations due to analysis failures.")
-            report_parts.append("Please retry with different stocks or check data availability.")
+            client = genai.Client()
+            logger.info("Using default GenAI client for results aggregation")
         
-        report_parts.append("")
-        report_parts.append("**ANALYSIS COMPLETED**")
-        report_parts.append(f"Generated on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        # System prompt for aggregation INCLUDING INDIVIDUAL STOCK ALLOCATION FIRST
+        system_prompt = """You are a senior financial analyst and portfolio manager responsible for creating comprehensive investment reports. 
+
+Your task is to analyze multiple stock analysis results and create a professional, actionable investment report that STARTS with INDIVIDUAL STOCK ALLOCATION.
+
+CRITICAL REQUIREMENTS:
+1. BEGIN the report with a section titled: "INDIVIDUAL STOCK ALLOCATION"
+   - For each BUY-recommended stock, provide:
+     • Stock Ticker: SYMBOL
+     • Amount to invest: $X,XXX.XX (use the provided investment amount; if not provided, recommend percentage allocations and show 0$ placeholder)
+     • Allocation Percentage: XX.X% of total
+   - Base allocations on the expert analyses quality, conviction, diversification, and risk balance
+   - The allocation must be internally consistent and sum to 100% (when investment amount is given)
+2. Synthesize individual stock analyses into portfolio-level insights
+3. Provide clear investment recommendations with specific allocation guidance
+4. Assess risk levels and diversification across the analyzed stocks
+5. Create actionable investment strategies based on the analysis
+6. Highlight key opportunities and risks
+7. Provide implementation timelines and monitoring suggestions
+8. Consider market conditions and sector correlations
+
+Format your response as a professional investment report with clear sections, bullet points, and actionable recommendations. Always start with INDIVIDUAL STOCK ALLOCATION."""
+
+        # Prepare the data for LLM analysis
+        analysis_data = f"""**ANALYSIS STATISTICS:**
+• Total Stocks Processed: {total_requested}
+• Successfully Analyzed: {successful_count}
+• Failed to Analyze: {failed_count}
+• Success Rate: {(successful_count/total_requested)*100:.1f}%" if total_requested > 0 else "0%"
+"""
+        if investment_amount:
+            analysis_data += f"• Investment Amount: {investment_amount}\n"
+
+        if successful_analyses.strip():
+            analysis_data += f"\n**SUCCESSFUL STOCK ANALYSES:**\n{successful_analyses}\n"
         
-        final_report = "\n".join(report_parts)
-        logger.info(f"Aggregated report generated: {len(final_report)} characters")
+        if failed_analyses.strip():
+            analysis_data += f"\n**FAILED ANALYSES:**\n{failed_analyses}\n"
+
+        # User prompt with the analysis data
+        user_prompt = f"""Please create a comprehensive investment report based on the following stock analysis results:
+
+{analysis_data}
+
+**REQUIRED REPORT SECTIONS (IN THIS ORDER):**
+
+1. **INDIVIDUAL STOCK ALLOCATION** (FIRST)
+   - For each BUY-recommended stock: Ticker, Amount to invest (USD), Allocation Percentage of total
+   - If investment amount is not provided, provide percentage allocations and set amount to $0.00 (clearly note this)
+   - Brief rationale for each allocation (one sentence)
+2. **EXECUTIVE SUMMARY**: Key findings and overall investment outlook
+3. **PORTFOLIO RECOMMENDATIONS**: Specific allocation strategy and stock selections
+4. **RISK ASSESSMENT**: Risk analysis, diversification evaluation, and risk mitigation strategies
+5. **SECTOR ANALYSIS**: Sector distribution and concentration risks/opportunities
+6. **INVESTMENT STRATEGY**: Recommended approach (growth vs value, timing, etc.)
+7. **IMPLEMENTATION PLAN**: Step-by-step execution guidance with timeline
+8. **MONITORING & REBALANCING**: Ongoing portfolio management recommendations
+9. **ALTERNATIVE SCENARIOS**: What-if analysis and contingency planning
+
+**SPECIAL REQUIREMENTS:**
+- If investment amount is provided, include specific dollar allocations and ensure totals match the investment amount
+- Focus on actionable recommendations
+- Use clear, professional language
+- Provide specific numbers and percentages where possible
+- Highlight key risks and opportunities"""
+
+        # Generate aggregated report using LLM
+        logger.info("Generating aggregated report using LLM")
+        response = client.models.generate_content(
+            model="gemini-2.5-flash",
+            contents=user_prompt,
+            config=GenerateContentConfig(
+                system_instruction=[system_prompt],
+                temperature=0.4,  # Balanced temperature for creativity with consistency
+                max_output_tokens=3000
+            )
+        )
+        logger.info("Received LLM response for aggregated report")
         
-        return final_report
-        
+        if response and response.text:
+            aggregated_response = response.text.strip()
+            logger.info(f"LLM aggregated report generated: {len(aggregated_response)} characters")
+            
+            # Format the response with header and statistics
+            formatted_response = f"""**PARALLEL STOCK ANALYSIS - COMPREHENSIVE INVESTMENT REPORT**
+{"=" * 70}
+
+**ANALYSIS STATISTICS:**
+• Total Stocks Processed: {total_requested}
+• Successfully Analyzed: {successful_count}
+• Failed to Analyze: {failed_count}
+• Success Rate: {(successful_count/total_requested)*100:.1f}%" if total_requested > 0 else "0%"
+{"• Investment Amount: " + investment_amount if investment_amount else ""}
+
+{"=" * 70}
+
+{aggregated_response}
+
+{"=" * 70}
+**REPORT COMPLETED**
+Generated on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+Method: AI-Generated Comprehensive Analysis
+Analyst: Advanced Portfolio Management System"""
+            
+            # Log that we're sending the response back to host agent
+            logger.info(f"Prepared formatted response for host agent: {len(formatted_response)} characters")
+            logger.info("Response will be automatically sent back to host agent through A2A framework")
+            send_analysis_to_webhook(formatted_response, email_to=email_to)
+            return formatted_response
+        else:
+            logger.error("No response from LLM for aggregated report")
+            # Fallback to basic summary if LLM fails
+            basic_summary = f"""**PARALLEL STOCK ANALYSIS - BASIC SUMMARY**
+{"=" * 60}
+
+**ANALYSIS STATISTICS:**
+• Total Stocks Processed: {total_requested}
+• Successfully Analyzed: {successful_count}
+• Failed to Analyze: {failed_count}
+• Success Rate: {(successful_count/total_requested)*100:.1f}%" if total_requested > 0 else "0%"
+{"• Investment Amount: " + investment_amount if investment_amount else ""}
+
+**SUCCESSFUL ANALYSES:**
+{successful_analyses if successful_analyses.strip() else "None"}
+
+**FAILED ANALYSES:**
+{failed_analyses if failed_analyses.strip() else "None"}
+
+**Note:** Advanced LLM analysis was unavailable. Please review individual stock analyses above for investment decisions.
+
+**ANALYSIS COMPLETED**
+Generated on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"""
+            
+            logger.info(f"Using fallback basic summary for host agent: {len(basic_summary)} characters")
+            send_analysis_to_webhook(basic_summary, email_to=email_to)
+            return basic_summary
+            
     except Exception as e:
-        error_msg = f"Error aggregating parallel results: {str(e)}"
+        error_msg = f"Error in LLM-based aggregation: {str(e)}"
         logger.error(error_msg)
-        return f"**Error**: Failed to aggregate analysis results. {str(e)}"
+        return f"**Error**: Failed to aggregate analysis results using LLM. {str(e)}"
+    
 
-
-def get_allocation_list() -> str:
-    """
-    Reads the current allocation list from the allocation.json file.
-    Returns the current allocation as a formatted string.
-    """
-    try:
-        # Construct an absolute path to the allocation file
-        agent_dir = os.path.dirname(os.path.abspath(__file__))
-        allocation_path = os.path.join(agent_dir, "allocation.json")
-        
-        if not os.path.exists(allocation_path):
-            return "No allocation list found. The allocation list is empty."
-        
-        with open(allocation_path, 'r') as f:
-            allocation_data = json.load(f)
-        
-        if not allocation_data:
-            return "Allocation list is empty."
-        
-        result = "Current Allocation List:\n"
-        for i, stock in enumerate(allocation_data, 1):
-            result += f"{i}. {stock}\n"
-        
-        result += f"\nTotal stocks in allocation: {len(allocation_data)}"
-        return result
-        
-    except json.JSONDecodeError as e:
-        return f"Error reading allocation file: {e}"
-    except Exception as e:
-        return f"Error reading allocation list: {e}"
 
 
 def extract_stocks_from_analysis_request(analysis_request: str) -> str:
@@ -696,7 +425,7 @@ Please be thorough but concise, focusing on the most important factors for inves
         if response and response.text:
             # Log the expert analysis response
             logger.info(f"**EXPERT ANALYSIS FOR {ticker}**\n\n{response.text}")
-            return f"**EXPERT ANALYSIS FOR {ticker}**\n\n{response.text}"
+            return response.text
         else:
             return f"**Error**: Could not generate expert analysis for {ticker}. Please try again."
             
@@ -734,16 +463,14 @@ def handle_malformed_function_call_error() -> str:
     **CORRECT Function Call Examples:**
     
     1. **Extract Stocks:**
-       ✅ extract_stocks_from_analysis_request(analysis_request="[FULL REQUEST TEXT]")
-       ❌ extract_stocks_from_analysis_request([FULL REQUEST TEXT])
+       extract_stocks_from_analysis_request(analysis_request="[FULL REQUEST TEXT]")
     
     2. **Get Stock Data:**
-       ✅ Use stock_analysis_tool directly (it's an MCP toolset)
-       ❌ Don't try to call it with custom parameters
+       Use stock_analysis_tool directly (it's an MCP toolset)
+       Don't try to call it with custom parameters
     
     3. **Expert Analysis:**
-       ✅ get_expert_stock_analysis(stock_analysis_response="[RAW DATA]", ticker="AAPL")
-       ❌ get_expert_stock_analysis([RAW DATA], AAPL)
+       get_expert_stock_analysis(stock_analysis_response="[RAW DATA]", ticker="AAPL")
 
     **Recovery Steps:**
     1. Call `extract_stocks_from_analysis_request(analysis_request="[FULL REQUEST]")` first
@@ -768,6 +495,7 @@ def prepare_stock_analysis_summary(stocks_analyzed: str, total_investment: str) 
     Returns:
         A structured template for organizing analysis results
     """
+    logger.info(f"Preparing stock analysis summary for stocks: {stocks_analyzed}, investment: {total_investment}")
     template = f"""
     **STOCK ANALYSIS SUMMARY TEMPLATE**
     
@@ -799,14 +527,106 @@ def prepare_stock_analysis_summary(stocks_analyzed: str, total_investment: str) 
     return template
 
 
-# Create function tools
+def send_analysis_to_webhook(analysis_response: str, email_to: str, webhook_url: str = None, username: str = None, password: str = None) -> str:
+    """
+    Securely sends analysis response data to the Activepieces webhook endpoint.
+    
+    Args:
+        analysis_response: The analysis data to send
+        webhook_url: Webhook URL (defaults to Activepieces endpoint)
+        username: Basic auth username (defaults to environment variable)
+        password: Basic auth password (defaults to environment variable)
+    
+    Returns:
+        Success/error message with details
+    """
+    try:
+        logger.info("Preparing to send analysis response to webhook endpoint")
+        # Use environment variables for sensitive data if not provided
+        webhook_url = webhook_url or "https://cloud.activepieces.com/api/v1/webhooks/BzkDtbfmZODV2C3jotH94"
+        username = username or os.getenv("ACTIVEPIECES_USERNAME")
+        password = password or os.getenv("ACTIVEPIECES_PASSWORD")
+        
+        # Validate required parameters
+        if not username or not password:
+            logger.error("Missing Activepieces authentication credentials")
+            return "Error: Missing authentication credentials. Please set ACTIVEPIECES_USERNAME and ACTIVEPIECES_PASSWORD environment variables."
+        
+        if not analysis_response or not analysis_response.strip():
+            logger.error("Empty analysis response provided")
+            return "Error: Analysis response cannot be empty."
+        
+        # Prepare the request data - match the working curl payload structure
+        payload = {
+            "analysis_response": analysis_response,
+            "email_to": email_to
+        }
+        
+        # Create basic auth header - exactly like your working curl
+        credentials = f"{username}:{password}"
+        encoded_credentials = base64.b64encode(credentials.encode()).decode()
+        headers = {
+            "Authorization": f"Basic {encoded_credentials}",
+            "Content-Type": "application/json"
+            # Removed User-Agent to match your curl exactly
+        }
+        
+        logger.info(f"Sending analysis data to webhook: {webhook_url}")
+        logger.info(f"Payload: {json.dumps(payload, indent=2)}")
+        logger.info(f"Headers: {json.dumps({k: v for k, v in headers.items() if k != 'Authorization'}, indent=2)}")
+        logger.info(f"Auth: Basic {encoded_credentials[:10]}...")
+        
+        # Make the POST request - exactly like your curl
+        response = requests.post(
+            webhook_url,
+            json=payload,
+            headers=headers,
+            timeout=30
+        )
+        
+        # Log the full response for debugging
+        logger.info(f"Response status: {response.status_code}")
+        logger.info(f"Response headers: {dict(response.headers)}")
+        logger.info(f"Response text: {response.text[:500]}")
+        
+        # Check response status
+        if response.status_code == 200:
+            logger.info("Successfully sent analysis data to webhook")
+            return f"Success: Analysis data sent to webhook. Response: {response.status_code} - {response.text[:100]}..."
+        elif response.status_code == 401:
+            logger.error("Authentication failed - check username/password")
+            return f"Error: Authentication failed. Please verify your Activepieces credentials. Response: {response.text[:200]}"
+        elif response.status_code == 404:
+            logger.error("Webhook endpoint not found")
+            return f"Error: Webhook endpoint not found. Please verify the URL. Response: {response.text[:200]}"
+        elif response.status_code >= 500:
+            logger.error(f"Server error from webhook: {response.status_code}")
+            return f"Error: Server error from webhook ({response.status_code}). Response: {response.text[:200]}"
+        else:
+            logger.warning(f"Unexpected response from webhook: {response.status_code}")
+            return f"Warning: Unexpected response from webhook ({response.status_code}): {response.text[:200]}"
+            
+    except requests.exceptions.Timeout:
+        logger.error("Request timeout - webhook endpoint took too long to respond")
+        return "Error: Request timeout. The webhook endpoint took too long to respond."
+    except requests.exceptions.ConnectionError:
+        logger.error("Connection error - unable to reach webhook endpoint")
+        return "Error: Connection error. Unable to reach the webhook endpoint."
+    except requests.exceptions.SSLError:
+        logger.error("SSL certificate verification failed")
+        return "Error: SSL certificate verification failed. Please check the webhook endpoint."
+    except requests.exceptions.RequestException as e:
+        logger.error(f"Request error: {str(e)}")
+        return f"Error: Request failed - {str(e)}"
+    except Exception as e:
+        logger.error(f"Unexpected error sending to webhook: {str(e)}")
+        return f"Error: Unexpected error occurred - {str(e)}"
+
+
+# Create function tools with basic FunctionTool (no explicit schemas)
 extract_stocks_from_analysis_request_tool = FunctionTool(extract_stocks_from_analysis_request)
 get_expert_stock_analysis_tool = FunctionTool(get_expert_stock_analysis)
-get_log_file_path_tool = FunctionTool(get_log_file_path)
 handle_malformed_function_call_error_tool = FunctionTool(handle_malformed_function_call_error)
-prepare_stock_analysis_summary_tool = FunctionTool(prepare_stock_analysis_summary)
-execute_parallel_stock_analysis_tool = FunctionTool(execute_parallel_stock_analysis)
-calculate_investment_allocation_tool = FunctionTool(calculate_investment_allocation)
 aggregate_parallel_results_tool = FunctionTool(aggregate_parallel_results)
 
 def create_agent() -> LlmAgent:
@@ -815,87 +635,60 @@ def create_agent() -> LlmAgent:
         model="gemini-2.5-flash",
         name="stock_analyser_agent",
         instruction="""
-            **Role:** You are a professional stock analyst. Analyze stocks in parallel and send incremental updates to prevent timeouts.
+            **Role:** You are a professional stock analyst. You MUST follow this EXACT workflow step by step.
 
-            **TIMEOUT PREVENTION WORKFLOW:**
+            **CRITICAL WORKFLOW - FOLLOW EXACTLY:**
+
+            **STEP 1 - Extract Stocks (REQUIRED FIRST STEP):**
+            When you receive ANY analysis request, IMMEDIATELY call:
+            extract_stocks_from_analysis_request(analysis_request="[COPY THE ENTIRE REQUEST TEXT HERE]")
             
-            **STEP 1 - Extract Stocks:**
-            Call: extract_stocks_from_analysis_request(analysis_request="[full request text]")
+            **STEP 2 - Execute Parallel Analysis:**
+            After getting the stock list from STEP 1, for EACH stock ticker:
+            a) Use stock_analysis_tool MCP tool to get market data for the ticker
+            b) Call get_expert_stock_analysis(stock_analysis_response="[data from stock_analysis_tool]", ticker="TICKER")
+            c) Collect successful analyses in a list
+            d) Collect failed analyses in a list
             
-            **STEP 2 - Get Parallel Execution Plan:**
-            Call: execute_parallel_stock_analysis(tickers="TICKER1,TICKER2,TICKER3")
+            **STEP 3 - Aggregate Results (FINAL STEP):**
+            After ALL individual stock analyses are complete, call:
+            aggregate_parallel_results(
+                successful_analyses="[ALL successful results combined]",
+                failed_analyses="[ALL failed messages combined]", 
+                investment_amount="[amount from request]",
+                email_to="[email id from request]"
+            )
+
+            **IMPORTANT RULES:**
+            - ALWAYS start with STEP 1 (extract_stocks_from_analysis_request)
+            - NEVER skip any step
+            - ALWAYS wait for each function call to complete before proceeding
+            - Use the EXACT function names and parameters shown above
+            - If any step fails, use handle_malformed_function_call_error() for guidance
             
-            **STEP 3 - Execute Parallel Analysis WITH PROGRESS UPDATES:**
-            For EACH stock ticker simultaneously (in parallel):
-            a) Use stock_analysis_tool to get market data for the ticker
-            b) If expert analysis takes time: prevent_timeout_with_keepalive(operation_name="Expert analysis for TICKER")
-            c) Call get_expert_stock_analysis(stock_analysis_response="[data]", ticker="TICKER")
+            **EXAMPLE WORKFLOW:**
+            1. Call: extract_stocks_from_analysis_request(analysis_request="[full request]")
+            2. For each stock returned: get_expert_stock_analysis(...)
+            3. Call: aggregate_parallel_results(...)
             
             **ERROR HANDLING:**
-            - If MCP connection fails, use handle_malformed_function_call_error() for guidance
+            - If you get MALFORMED_FUNCTION_CALL, use handle_malformed_function_call_error()
             - If individual stock analysis fails, continue with other stocks
             - Report failed stocks as: "[TICKER] stock could not be analysed (try again later)"
-            
-            **STEP 4 - Send Final Summary:**
-            After all individual stock updates are sent, call:
-            Then call: aggregate_parallel_results(
-                successful_analyses="[all successful results]",
-                failed_analyses="[all failed messages]", 
-                investment_amount="[amount]"
-            )
-            
-            **OPTIONAL - Specific Investment Allocation:**
-            For detailed dollar amount breakdown, you can also use:
-            calculate_investment_allocation(
-                analysis_results="[all successful analyses]",
-                investment_amount="[dollar amount]"
-            )
-            This provides the exact format: "Stock Ticker: XYZ, Amount to invest: $123"
-            
-            **Key Principles:**
-            - Analyze each stock individually using available MCP tools
-            - Don't repeat function calls for the same stock
-            - Continue processing other stocks if one fails
-            - Focus recommendations on successfully analyzed stocks only
-            
-            **Response Format:**
-            1. **Portfolio Recommendations**: 
-                - Recommended allocation percentages based on successful analyses and investment amount (which is inside analysis request)
-                - Suggest Diversification improvements if required
-                - Risk management suggestions
-            2. **Portfolio Overview**: Summary of existing portfolio distribution
-            3. **Stock-by-Stock Analysis**: For each successfully analyzed stock:
-                - Raw data from MCP tools
-                - Expert analysis and recommendations
-                - Buy/sell/hold recommendations with reasoning
-            4. **Failed Stocks**: List any stocks that could not be analyzed with error messages
-            5. **Final Summary**: Updated allocation recommendations
-            6. **Send the message to host agent.**
-            
-            **Error Handling:**
-            - If individual stock analysis fails, report "XXX stock could not be analysed (try again later)"
-            - Continue with other stocks
-            - If you encounter errors, use `handle_malformed_function_call_error` for guidance
-            - Make recommendations only based on successfully analyzed stocks
             
             **Professional Standards:**
             - Use precise financial terminology
             - Provide objective, data-driven analysis
-            - Highlight both positive and negative aspects
-            - Include relevant financial ratios and comparisons
-            - Always consider the existing portfolio distribution
-            - Prioritize diversification and risk management
-            - Be transparent about data limitations
+            - Focus on actionable investment recommendations
+            - Consider portfolio diversification and risk management
             
-            **Scope:** Focus on comprehensive portfolio analysis, stock analysis, and allocation management. Provide thorough, actionable investment recommendations based on available data.
+            **Scope:** Comprehensive portfolio analysis, stock analysis, and allocation management.
         """,
         tools=[
             stock_analysis_tool,
             extract_stocks_from_analysis_request_tool,
             get_expert_stock_analysis_tool,
             handle_malformed_function_call_error_tool,
-            execute_parallel_stock_analysis_tool,
-            calculate_investment_allocation_tool,
-            aggregate_parallel_results_tool
+            aggregate_parallel_results_tool,
         ],
     )

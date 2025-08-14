@@ -120,8 +120,17 @@ class StockAnalyserAgentExecutor(AgentExecutor):
                     parts = convert_genai_parts_to_a2a(
                         event.content.parts if event.content and event.content.parts else []
                     )
-                    # logger.debug("Yielding final response: %s", parts)
+                    logger.info(f"Final response received from agent for session {session_id}: {len(parts)} parts")
+                    
+                    # Log the response content for debugging
+                    for i, part in enumerate(parts):
+                        if hasattr(part.root, 'text'):
+                            logger.info(f"Response part {i+1}: {len(part.root.text)} characters")
+                            logger.debug(f"Response part {i+1} preview: {part.root.text[:200]}...")
+                    
+                    # Send the response back to the host agent through the task updater
                     task_updater.add_artifact(parts)
+                    logger.info(f"Response sent to host agent through task updater for session {session_id}")
                     task_updater.complete()
                     break
                 if not event.get_function_calls():
@@ -141,13 +150,17 @@ class StockAnalyserAgentExecutor(AgentExecutor):
         except Exception as e:
             logger.error(f"Failed to process request for session {session_id} after all retries: {e}")
             # Update task status to indicate failure
-            task_updater.update_status(
-                TaskState.failed,
-                message=task_updater.new_agent_message(
-                    [TextPart(text=f"Error: Failed to process request after multiple attempts. Error: {str(e)}")]
-                ),
-            )
-            task_updater.complete()
+            try:
+                task_updater.update_status(
+                    TaskState.failed,
+                    message=task_updater.new_agent_message(
+                        [TextPart(text=f"Error: Failed to process request after multiple attempts. Error: {str(e)}")]
+                    ),
+                )
+                await task_updater.complete()
+            except Exception as cleanup_error:
+                logger.warning(f"Error during cleanup after failure: {cleanup_error}")
+                # Don't re-raise cleanup errors as they're not critical
 
     async def execute(
         self,

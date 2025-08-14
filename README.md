@@ -91,9 +91,17 @@ uv venv
 # Activate virtual environment
 source .venv/bin/activate
 
-# Run the host agent
+# Install dependencies
+uv sync
+
+# Run the host agent API server
+python __main__.py
+
+# Or alternatively:
 uv run --active .
 ```
+
+The Host Agent will start a REST API server on `http://localhost:10001` with the `/chats` endpoint.
 
 ### Step 2: Stock Analyser Agent Setup
 
@@ -131,11 +139,14 @@ uv run --active .
 
 ### Host Agent
 - **Purpose**: Main coordination agent for the A2A automation system
-- **Port**: Default A2A port
+- **Port**: 10001 (HTTP REST API)
 - **Features**: 
+  - REST API with `/chats` endpoint for user conversations
   - Coordinates between different agents
   - Manages agent communication
   - Handles routing and task distribution
+  - Streaming and non-streaming chat responses
+  - Session management for conversations
 
 ### Stock Analyser Agent
 - **Purpose**: Comprehensive stock analysis and allocation management
@@ -218,10 +229,121 @@ Agent: Processes portfolio statement and provides investment insights
 ## 🔄 Workflow
 
 1. **Start all agents** using the setup instructions above
-2. **Connect to host agent** for coordination
-3. **Use stock analyser** for individual stock analysis and allocation management
-4. **Use stock report analyser** for portfolio and document analysis
-5. **Coordinate through host agent** for complex multi-agent tasks
+2. **Use the Host Agent REST API** at `http://localhost:10001` for user conversations
+3. **Send messages via `/chats` endpoint** to interact with the coordination system
+4. **Use stock analyser** for individual stock analysis and allocation management (via host agent)
+5. **Use stock report analyser** for portfolio and document analysis (via host agent)
+6. **All communication** now goes through the `/chats` API instead of ADK web UI
+
+## 📡 Host Agent API Documentation
+
+The Host Agent now provides a REST API for user conversations, replacing the previous ADK web UI.
+
+### Base URL
+```
+http://localhost:10001
+```
+
+### Available Endpoints
+
+#### POST /chats
+Send a chat message and receive a complete response.
+
+**Request Body:**
+```json
+{
+  "message": "Hello, I need help with stock analysis",
+  "session_id": "optional-session-id"
+}
+```
+
+**Response:**
+```json
+{
+  "response": "I'll help you with stock analysis...",
+  "session_id": "generated-or-provided-session-id",
+  "is_complete": true
+}
+```
+
+#### POST /chats/stream
+Send a chat message and receive streaming responses for real-time updates.
+
+**Request Body:** Same as `/chats`
+
+**Response:** NDJSON stream of:
+```json
+{
+  "content": "Final response content",
+  "updates": "Intermediate update message",
+  "is_task_complete": false,
+  "session_id": "session-id"
+}
+```
+
+#### GET /health
+Check if the Host Agent API is healthy.
+
+**Response:**
+```json
+{
+  "status": "healthy",
+  "message": "Host Agent is running",
+  "connected_agents": ["Stock Analyser Agent", "Stock Report Analyser Agent"]
+}
+```
+
+#### GET /agents/status
+Get detailed status of all connected agents.
+
+#### GET /chats/sessions/{session_id}
+Get information about a specific chat session.
+
+#### POST /agents/{agent_name}/test
+Test connection to a specific agent.
+
+### Usage Examples
+
+#### Using curl:
+```bash
+# Health check
+curl http://localhost:10001/health
+
+# Send a chat message
+curl -X POST http://localhost:10001/chats \
+  -H "Content-Type: application/json" \
+  -d '{"message": "Analyze AAPL stock"}'
+
+# Stream a chat message
+curl -X POST http://localhost:10001/chats/stream \
+  -H "Content-Type: application/json" \
+  -d '{"message": "What agents are available?"}' \
+  --no-buffer
+```
+
+#### Using Python:
+```python
+import httpx
+import asyncio
+
+async def chat_with_host_agent():
+    async with httpx.AsyncClient() as client:
+        response = await client.post(
+            "http://localhost:10001/chats",
+            json={"message": "Hello, I need help with stock analysis"}
+        )
+        result = response.json()
+        print(f"Response: {result['response']}")
+
+asyncio.run(chat_with_host_agent())
+```
+
+#### Testing with the provided test script:
+```bash
+# Run the test script to validate all endpoints
+cd host_agent
+python test_chats_api.py
+```
 
 ## 🛠️ Troubleshooting
 

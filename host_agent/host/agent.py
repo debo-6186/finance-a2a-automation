@@ -55,6 +55,7 @@ class HostAgent:
         self.existing_portfolio_stocks: List[str] = []
         self.new_stocks: List[str] = []
         self.investment_amount: float = 0.0
+        self.receiver_email_id: str = ""
         self._agent = self.create_agent()
         self._user_id = "host_agent"
         self._runner = Runner(
@@ -138,11 +139,11 @@ class HostAgent:
                 FunctionTool(self.send_message),
                 FunctionTool(self.store_stock_report_response),
                 FunctionTool(self.store_investment_amount),
+                FunctionTool(self.store_receiver_email_id),
                 FunctionTool(self.get_investment_amount),
                 FunctionTool(self.add_existing_stocks),
                 FunctionTool(self.add_new_stocks),
                 FunctionTool(self.get_stock_lists),
-                FunctionTool(self.clear_stock_lists),
                 FunctionTool(self.analyze_all_stocks),
                 FunctionTool(self.suggest_stocks_by_category),
                 FunctionTool(self.get_agent_status),
@@ -184,9 +185,11 @@ class HostAgent:
         - ** You must show the stocks from the sector to the user, till user confirms the selection.**
         - If user mentions a specific stock: Add them using `add_new_stocks`
 
+        **STEP 5:** Ask user the email id to send the analysis to and store it using `store_receiver_email_id`
+
         **STEP 6:** Prepare comprehensive analysis:
         - Use `analyze_all_stocks` to prepare the analysis request
-        - IMMEDIATELY after getting the result from `analyze_all_stocks`, use `send_message(agent_name='stock_analyser_agent', task='[USE THE EXACT RESULT FROM analyze_all_stocks]')`
+        - IMMEDIATELY after getting the result from `analyze_all_stocks`, use `send_message(agent_name='stock_analyser_agent', task='[USE THE EXACT RESULT FROM analyze_all_stocks] Email ID: {self.receiver_email_id}')`
         - Tell user: "I'm analyzing all stocks for comprehensive recommendations. This will take about a minute."
         - WAIT for response from stock analyser agent
         - Do a stock analysis
@@ -196,12 +199,6 @@ class HostAgent:
         - ALWAYS wait for agent responses before proceeding
         - ALWAYS use the exact tools specified
         - ALWAYS inform user about waiting times
-
-        **Stock Lists Management:**
-        - **Existing Portfolio Stocks:** Use `add_existing_stocks` to add stocks found in the portfolio statement
-        - **New Stocks:** Use `add_new_stocks` to add stocks the user wants to consider for investment
-        - **Stock Report Response:** Automatically stored when communicating with stock_report_analyser_agent
-        - **Create Analysis List:** Use `analyze_all_stocks` to create the final list of stocks to analyze
 
         **AVAILABLE SECTORS:**
         * **ONLY suggest stocks from stock_data.json**: Never suggest sectors or stocks that aren't in the available data. The available categories are:
@@ -218,6 +215,8 @@ class HostAgent:
         **Available Tools:**
         * `send_message`: Delegate tasks to other agents
         * `store_stock_report_response`: Manually store stock report response
+        * `store_investment_amount`: Store the investment amount
+        * `store_receiver_email_id`: Store the email ID to send analysis to
         * `add_existing_stocks`: Add stocks from portfolio statement
         * `add_new_stocks`: Add new stocks user wants to consider
         * `get_stock_lists`: View current state of all lists
@@ -346,6 +345,19 @@ class HostAgent:
                     if artifact.get("parts"):
                         resp.extend(artifact["parts"])
             
+            # Log the response details for debugging
+            logger.info(f"Response from {agent_name} contains {len(resp)} parts")
+            for i, part in enumerate(resp):
+                if isinstance(part, dict):
+                    if part.get("type") == "text":
+                        logger.info(f"Response part {i+1} (text): {len(part.get('text', ''))} characters")
+                        logger.debug(f"Response part {i+1} preview: {part.get('text', '')[:200]}...")
+                    else:
+                        logger.info(f"Response part {i+1} (type: {part.get('type', 'unknown')})")
+                elif isinstance(part, str):
+                    logger.info(f"Response part {i+1} (string): {len(part)} characters")
+                    logger.debug(f"Response part {i+1} preview: {part[:200]}...")
+            
             # Automatically store response from stock report analyser agent
             if agent_name.lower() == "stock_report_analyser_agent" and resp:
                 # Extract text content from response parts
@@ -360,6 +372,8 @@ class HostAgent:
                     self.stock_report_response = response_text
                     logger.info(f"Automatically stored response from {agent_name}: {len(response_text)} characters")
             
+            # Log when we're about to return the response to the host agent
+            logger.info(f"Returning response from {agent_name} to host agent: {len(resp)} parts")
             return resp
             
         except httpx.ReadTimeout as e:
@@ -453,6 +467,12 @@ class HostAgent:
         logger.info(f"Stored investment amount: ${amount:,.2f}")
         return f"Investment amount stored successfully: ${amount:,.2f}"
 
+    def store_receiver_email_id(self, email_id: str):
+        """Stores the receiver email ID for sending stock analysis."""
+        self.receiver_email_id = email_id
+        logger.info(f"Stored receiver email ID: {email_id}")
+        return f"Receiver email ID stored successfully: {email_id}"
+
     def get_investment_amount(self):
         """Returns the stored investment amount."""
         if self.investment_amount > 0:
@@ -489,6 +509,13 @@ class HostAgent:
         else:
             result += "Not set yet.\n\n"
         
+        # Add receiver email ID
+        result += f"**Receiver Email ID:**\n"
+        if self.receiver_email_id:
+            result += f"{self.receiver_email_id}\n\n"
+        else:
+            result += "Not set yet.\n\n"
+        
         result += f"**Existing Portfolio Stocks ({len(self.existing_portfolio_stocks)}):**\n"
         if self.existing_portfolio_stocks:
             for i, stock in enumerate(self.existing_portfolio_stocks, 1):
@@ -511,15 +538,6 @@ class HostAgent:
             result += "No stock report response stored yet.\n"
         
         return result
-
-    def clear_stock_lists(self):
-        """Clears all stock lists, investment amount, and report response."""
-        self.existing_portfolio_stocks.clear()
-        self.new_stocks.clear()
-        self.stock_report_response = ""
-        self.investment_amount = 0.0
-        logger.info("Cleared all stock lists, investment amount, and report response")
-        return "All stock lists, investment amount, and report response have been cleared."
 
     def analyze_all_stocks(self):
         """Creates a comprehensive list of stocks to analyze and prepares the delegation request."""
@@ -545,6 +563,9 @@ class HostAgent:
 
         **INVESTMENT AMOUNT:**
         {self.investment_amount}
+
+        **RECEIVER EMAIL ID:**
+        {self.receiver_email_id if self.receiver_email_id else 'Not specified'}
 
         **DELEGATION INSTRUCTIONS:**
         Please analyze all the stocks listed above and provide comprehensive recommendations.
