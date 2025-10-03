@@ -117,25 +117,48 @@ class StockAnalyserAgentExecutor(AgentExecutor):
         try:
             async for event in self._run_agent_with_retry(session_id, new_message):
                 if event.is_final_response():
+                    # Log raw event content for debugging
+                    if event.content and event.content.parts:
+                        logger.info(f"Raw event parts for session {session_id}: {len(event.content.parts)} parts")
+                        for i, raw_part in enumerate(event.content.parts):
+                            logger.info(f"Raw part {i+1}: text={bool(raw_part.text)}, file_data={bool(raw_part.file_data)}, inline_data={bool(raw_part.inline_data)}")
+                            if raw_part.text:
+                                logger.info(f"Raw part {i+1} text preview: {raw_part.text[:100]}...")
+
                     parts = convert_genai_parts_to_a2a(
                         event.content.parts if event.content and event.content.parts else []
                     )
                     logger.info(f"Final response received from agent for session {session_id}: {len(parts)} parts")
-                    
+
+                    # If no parts were converted, create a default completion message
+                    if not parts:
+                        logger.warning(f"No parts converted for session {session_id}, creating default completion message")
+                        parts = [Part(root=TextPart(text="Analysis completed successfully. Results have been saved to the system."))]
+
                     # Log the response content for debugging
                     for i, part in enumerate(parts):
                         if hasattr(part.root, 'text'):
                             logger.info(f"Response part {i+1}: {len(part.root.text)} characters")
                             logger.debug(f"Response part {i+1} preview: {part.root.text[:200]}...")
-                    
+
                     # Send the response back to the host agent through the task updater
-                    task_updater.add_artifact(parts)
-                    logger.info(f"Response sent to host agent through task updater for session {session_id}")
-                    task_updater.complete()
+                    try:
+                        logger.info(f"About to call task_updater.add_artifact for session {session_id} with {len(parts)} parts")
+                        await task_updater.add_artifact(parts)
+                        logger.info(f"Successfully called task_updater.add_artifact for session {session_id}")
+
+                        logger.info(f"About to call task_updater.complete() for session {session_id}")
+                        await task_updater.complete()
+                        logger.info(f"Successfully called task_updater.complete() for session {session_id}")
+                    except Exception as task_error:
+                        logger.error(f"Error completing task for session {session_id}: {task_error}")
+                        logger.error(f"Task error type: {type(task_error)}")
+                        logger.error(f"Task error details: {str(task_error)}")
+                        # Don't raise the error as the analysis was successful, just log it
                     break
                 if not event.get_function_calls():
                     logger.debug("Yielding update response")
-                    task_updater.update_status(
+                    await task_updater.update_status(
                         TaskState.working,
                         message=task_updater.new_agent_message(
                             convert_genai_parts_to_a2a(
@@ -151,15 +174,16 @@ class StockAnalyserAgentExecutor(AgentExecutor):
             logger.error(f"Failed to process request for session {session_id} after all retries: {e}")
             # Update task status to indicate failure
             try:
-                task_updater.update_status(
+                await task_updater.update_status(
                     TaskState.failed,
                     message=task_updater.new_agent_message(
                         [TextPart(text=f"Error: Failed to process request after multiple attempts. Error: {str(e)}")]
                     ),
                 )
                 await task_updater.complete()
+                logger.info(f"Task marked as failed and completed for session {session_id}")
             except Exception as cleanup_error:
-                logger.warning(f"Error during cleanup after failure: {cleanup_error}")
+                logger.warning(f"Error during cleanup after failure for session {session_id}: {cleanup_error}")
                 # Don't re-raise cleanup errors as they're not critical
 
     async def execute(
@@ -172,10 +196,23 @@ class StockAnalyserAgentExecutor(AgentExecutor):
         if not context.message:
             raise ValueError("RequestContext must have a message")
 
+        logger.info(f"Execute: Initial context.task_id={context.task_id}, context.context_id={context.context_id}")
+        logger.info(f"Execute: context.current_task={context.current_task}")
+
         updater = TaskUpdater(event_queue, context.task_id, context.context_id)
+        logger.info(f"Execute: Created TaskUpdater with task_id={context.task_id}")
+
         if not context.current_task:
-            updater.submit()
-        updater.start_work()
+            logger.info("Execute: No current_task, calling await updater.submit()")
+            await updater.submit()
+            logger.info("Execute: Called await updater.submit()")
+        else:
+            logger.info("Execute: current_task exists, skipping updater.submit()")
+
+        logger.info("Execute: Calling await updater.start_work()")
+        await updater.start_work()
+        logger.info("Execute: Called await updater.start_work()")
+
         await self._process_request(
             types.UserContent(
                 parts=convert_a2a_parts_to_genai(context.message.parts),

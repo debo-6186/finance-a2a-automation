@@ -16,6 +16,7 @@ from google.adk.artifacts import InMemoryArtifactService
 from google.adk.memory.in_memory_memory_service import InMemoryMemoryService
 from google.adk.runners import Runner
 from google.adk.sessions import InMemorySessionService
+from limited_context_session_service import LimitedContextSessionService
 from logger import setup_logging, get_logger
 
 load_dotenv()
@@ -67,7 +68,7 @@ def main():
             app_name=agent_card.name,
             agent=adk_agent,
             artifact_service=InMemoryArtifactService(),
-            session_service=InMemorySessionService(),
+            session_service=LimitedContextSessionService(max_messages=6),  # Limit context to prevent overflow
             memory_service=InMemoryMemoryService(),
         )
         agent_executor = StockAnalyserAgentExecutor(runner)

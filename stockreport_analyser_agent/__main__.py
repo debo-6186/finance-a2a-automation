@@ -17,6 +17,7 @@ from google.adk.artifacts import InMemoryArtifactService
 from google.adk.memory.in_memory_memory_service import InMemoryMemoryService
 from google.adk.runners import Runner
 from google.adk.sessions import InMemorySessionService
+from limited_context_session_service import LimitedContextSessionService
 
 load_dotenv()
 
@@ -51,7 +52,7 @@ def main():
             examples=["Analyze this quarterly earnings report", "Review this company's financial statements"],
         )
         agent_card = AgentCard(
-            name="Stock Report Analyser Agent",
+            name="stock_report_analyser_agent",
             description="An agent that analyzes stock reports, earnings statements, and financial documents to provide comprehensive financial analysis and investment recommendations.",
             url=f"http://{host}:{port}/",
             version="1.0.0",
@@ -66,7 +67,7 @@ def main():
             app_name=agent_card.name,
             agent=adk_agent,
             artifact_service=InMemoryArtifactService(),
-            session_service=InMemorySessionService(),
+            session_service=LimitedContextSessionService(max_messages=6),  # Limit context to prevent overflow
             memory_service=InMemoryMemoryService(),
         )
         agent_executor = StockReportAnalyserAgentExecutor(runner)

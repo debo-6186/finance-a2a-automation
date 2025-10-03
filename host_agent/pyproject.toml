@@ -9,8 +9,8 @@ readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
     # Shared ADK & A2A Dependencies
-    "google-adk>=1.2.1",
-    "a2a-sdk>=0.2.5",
+    "a2a-sdk>=0.3.6",
+    "google-adk>=1.14.1",
     "nest-asyncio>=1.6.0",
     "python-dotenv",
     "click",
@@ -21,6 +21,13 @@ dependencies = [
     # FastAPI dependencies for /chats API
     "fastapi>=0.104.0",
     "pydantic>=2.0.0",
+    
+    # Database dependencies
+    "sqlalchemy>=2.0.0",
+    "psycopg2-binary>=2.9.0",
+    
+    # Firebase dependencies
+    "firebase-admin>=6.0.0",
 
     # Kaitlyn's agent dependencies (future)
     # "langgraph"

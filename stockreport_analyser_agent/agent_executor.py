@@ -133,7 +133,7 @@ class StockReportAnalyserAgentExecutor(AgentExecutor):
             logger.error(f"Failed to process request for session {session_id} after all retries: {e}")
             # Update task status to indicate failure
             try:
-                task_updater.update_status(
+                await task_updater.update_status(
                     TaskState.failed,
                     message=task_updater.new_agent_message(
                         [TextPart(text=f"Error: Failed to process request after multiple attempts. Error: {str(e)}")]
@@ -170,7 +170,7 @@ class StockReportAnalyserAgentExecutor(AgentExecutor):
             logger.error(f"Error in execute method: {e}")
             # Try to update task status to failed, but don't fail if cleanup fails
             try:
-                updater.update_status(
+                await updater.update_status(
                     TaskState.failed,
                     message=updater.new_agent_message(
                         [TextPart(text=f"Error during execution: {str(e)}")]

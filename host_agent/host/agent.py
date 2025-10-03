@@ -2,6 +2,7 @@ import asyncio
 import json
 import uuid
 import os
+import time
 from datetime import datetime
 from typing import Any, AsyncIterable, List
 
@@ -16,6 +17,8 @@ from a2a.types import (
     SendMessageSuccessResponse,
     Task,
 )
+from google.cloud import storage
+from google.oauth2 import service_account
 from dotenv import load_dotenv
 from google.adk import Agent
 from google.adk.agents.readonly_context import ReadonlyContext
@@ -56,6 +59,7 @@ class HostAgent:
         self.new_stocks: List[str] = []
         self.investment_amount: float = 0.0
         self.receiver_email_id: str = ""
+        self.current_session_id = {"id": "", "is_file_uploaded": False}  # Store current session info
         self._agent = self.create_agent()
         self._user_id = "host_agent"
         self._runner = Runner(
@@ -130,28 +134,56 @@ class HostAgent:
         return instance
 
     def create_agent(self) -> Agent:
-        return Agent(
-            model="gemini-2.5-flash",
-            name="Host_Agent",
-            instruction=self.root_instruction,
-            description="This Host agent orchestrates scheduling pickleball with friends.",
-            tools=[
-                FunctionTool(self.send_message),
-                FunctionTool(self.store_stock_report_response),
-                FunctionTool(self.store_investment_amount),
-                FunctionTool(self.store_receiver_email_id),
-                FunctionTool(self.get_investment_amount),
-                FunctionTool(self.add_existing_stocks),
-                FunctionTool(self.add_new_stocks),
-                FunctionTool(self.get_stock_lists),
-                FunctionTool(self.analyze_all_stocks),
-                FunctionTool(self.suggest_stocks_by_category),
-                FunctionTool(self.get_agent_status),
-                FunctionTool(self.test_agent_connection),
-            ],
-        )
+        max_retries = 5  # Increased retries for API reliability
+        base_delay = 2   # Base delay in seconds
+
+        for attempt in range(max_retries):
+            try:
+                return Agent(
+                    model="gemini-2.5-flash",
+                    name="Host_Agent",
+                    instruction=self.root_instruction,
+                    description="This Host agent orchestrates scheduling pickleball with friends.",
+                    tools=[
+                        FunctionTool(self.send_message),
+                        FunctionTool(self.store_portfolio_file),
+                        FunctionTool(self.check_file_upload_status),
+                        FunctionTool(self.store_stock_report_response),
+                        FunctionTool(self.store_investment_amount),
+                        FunctionTool(self.store_receiver_email_id),
+                        FunctionTool(self.get_investment_amount),
+                        FunctionTool(self.add_existing_stocks),
+                        FunctionTool(self.add_new_stocks),
+                        FunctionTool(self.get_stock_lists),
+                        FunctionTool(self.analyze_all_stocks),
+                        FunctionTool(self.suggest_stocks_by_category),
+                        FunctionTool(self.get_agent_status),
+                        FunctionTool(self.test_agent_connection),
+                    ],
+                )
+            except Exception as e:
+                error_message = str(e)
+                is_api_error = any(code in error_message for code in ["500", "503", "INTERNAL", "UNAVAILABLE"])
+
+                logger.warning(f"Agent creation attempt {attempt + 1} failed: {e}")
+
+                if attempt == max_retries - 1:
+                    logger.error(f"Failed to create agent after {max_retries} attempts")
+                    raise
+
+                if is_api_error:
+                    # Exponential backoff for API errors with jitter
+                    import random
+                    delay = base_delay * (2 ** attempt) + random.uniform(0, 1)
+                    logger.info(f"Google AI API error detected, retrying in {delay:.2f}s...")
+                    time.sleep(delay)
+                else:
+                    # Linear backoff for other errors
+                    time.sleep(base_delay * (attempt + 1))
 
     def root_instruction(self, context: ReadonlyContext) -> str:
+        # Access context to satisfy linter requirement
+        _ = context
         return f"""
         **Role:** You are a stock list coordinator and delegation agent. Your ONLY job is to:
         1. Collect stocks from user's portfolio (via stock report analyser agent)
@@ -165,7 +197,11 @@ class HostAgent:
         **STRICT WORKFLOW - FOLLOW EXACTLY:**
 
         **STEP 1:** When user asks for stock allocation based on portfolio:
+        - First tell user: "Please upload your latest portfolio statement (PDF format)."
+        - Use `check_file_upload_status` tool to check if file has been uploaded
+        - Once file IS uploaded, inform user: "Your portfolio statement has been uploaded"
         - IMMEDIATELY use `send_message` to send portfolio statement to `stock_report_analyser_agent`
+        - The task message should include session ID for tracking: "Please analyze the portfolio statement. Session ID: [current_session_id]"
         - Tell user: "I'm analyzing your portfolio statement. This will take about a minute."
         - WAIT for response from stock report analyser agent
 
@@ -186,19 +222,19 @@ class HostAgent:
         - If user mentions a specific stock: Add them using `add_new_stocks`
 
         **STEP 5:** Ask user the email id to send the analysis to and store it using `store_receiver_email_id`
+        - When `store_receiver_email_id` is called and all prerequisites are met (portfolio uploaded, investment amount set, stocks selected), STEP 6 will be automatically triggered
+        - The session will end with confirmation message: "Stock analysis in progress, we will email you the stock allocation report"
 
-        **STEP 6:** Prepare comprehensive analysis:
-        - Use `analyze_all_stocks` to prepare the analysis request
-        - IMMEDIATELY after getting the result from `analyze_all_stocks`, use `send_message(agent_name='stock_analyser_agent', task='[USE THE EXACT RESULT FROM analyze_all_stocks] Email ID: {self.receiver_email_id}')`
-        - Tell user: "I'm analyzing all stocks for comprehensive recommendations. This will take about a minute."
-        - WAIT for response from stock analyser agent
-        - Do a stock analysis
+        **STEP 6:** Prepare comprehensive analysis (automatically triggered by `store_receiver_email_id`):
+        - `store_receiver_email_id` will automatically call `analyze_all_stocks` to prepare the analysis request
+        - When `store_receiver_email_id` returns a JSON string, return exactly that JSON string as your response
+        - DO NOT WAIT for response from stock analyser agent - return the response from `store_receiver_email_id` immediately
 
         **CRITICAL RULES:**
         - NEVER skip any step
-        - ALWAYS wait for agent responses before proceeding
+        - ALWAYS wait for agent responses before proceeding (EXCEPT for stock_analyser_agent in STEP 6)
         - ALWAYS use the exact tools specified
-        - ALWAYS inform user about waiting times
+        - ALWAYS inform user about waiting times (EXCEPT in STEP 6 where analysis happens in background)
 
         **AVAILABLE SECTORS:**
         * **ONLY suggest stocks from stock_data.json**: Never suggest sectors or stocks that aren't in the available data. The available categories are:
@@ -210,10 +246,13 @@ class HostAgent:
           - INDIA_TOP_TECHNOLOGY_STOCKS
         * **Ask for specific sectors**: When user wants to invest in other sectors, ask: "Which sector would you like to consider? Available options are: Technology, Financial, or Automobile for USA/India."
         * **Consider existing portfolio stocks**: When analyzing allocation, include stocks from the user's current portfolio if they are good candidates for the new allocation.
-        * **No assumptions**: Don't suggest diversification into sectors not in stock_data.json. Only work with the available data.
+        * **No assumptions**: Don't sugg
+        est diversification into sectors not in stock_data.json. Only work with the available data.
 
         **Available Tools:**
         * `send_message`: Delegate tasks to other agents
+        * `store_portfolio_file`: Store uploaded portfolio file to Google Cloud Storage
+        * `check_file_upload_status`: Check if file has been uploaded for current session
         * `store_stock_report_response`: Manually store stock report response
         * `store_investment_amount`: Store the investment amount
         * `store_receiver_email_id`: Store the email ID to send analysis to
@@ -227,8 +266,8 @@ class HostAgent:
 
         **Directives:**
         * **FOLLOW THE STRICT WORKFLOW EXACTLY** - Do not deviate from the 6 steps outlined above
-        * **ALWAYS WAIT** for agent responses before proceeding to the next step
-        * **ALWAYS INFORM** users about waiting times (about a minute)
+        * **ALWAYS WAIT** for agent responses before proceeding to the next step (EXCEPT in STEP 6 with stock_analyser_agent)
+        * **ALWAYS INFORM** users about waiting times (about a minute), except in STEP 6 where analysis happens in background
         * **ONLY COORDINATE AND DELEGATE** - Do not perform any analysis yourself
         * Use the provided tools to create lists and delegate to other agents
         * Do not invent or assume any financial data
@@ -249,6 +288,8 @@ class HostAgent:
         """
         Streams the agent's response to a given query.
         """
+        # Store the current session ID for use in tool functions
+        self.current_session_id = {"id": session_id, "is_file_uploaded": False}
         session = await self._runner.session_service.get_session(
             app_name=self._agent.name,
             user_id=self._user_id,
@@ -262,27 +303,53 @@ class HostAgent:
                 state={},
                 session_id=session_id,
             )
-        async for event in self._runner.run_async(
-            user_id=self._user_id, session_id=session.id, new_message=content
-        ):
-            if event.is_final_response():
-                response = ""
-                if (
-                    event.content
-                    and event.content.parts
-                    and event.content.parts[0].text
-                ):
-                    response = "\n".join(
-                        [p.text for p in event.content.parts if p.text]
-                    )
+        try:
+            async for event in self._runner.run_async(
+                user_id=self._user_id, session_id=session.id, new_message=content
+            ):
+                if event.is_final_response():
+                    response = ""
+                    if event.content and event.content.parts:
+                        # Filter out non-text parts and handle structured responses
+                        text_parts = []
+                        for part in event.content.parts:
+                            if hasattr(part, 'text') and part.text:
+                                text_parts.append(part.text)
+                            elif hasattr(part, 'function_call'):
+                                # Log function calls but don't include in response
+                                logger.info(f"Function call detected in response: {part.function_call}")
+                            elif hasattr(part, 'thought_signature'):
+                                # Log thought signatures but don't include in response
+                                logger.info(f"Thought signature detected in response: {part.thought_signature}")
+
+                        if text_parts:
+                            response = "\n".join(text_parts)
+                        else:
+                            logger.warning("No text parts found in final response, using fallback")
+                            response = "Task completed successfully."
+
+                    yield {
+                        "is_task_complete": True,
+                        "content": response,
+                    }
+                else:
+                    yield {
+                        "is_task_complete": False,
+                        "updates": "The host agent is thinking...",
+                    }
+        except Exception as e:
+            error_message = str(e)
+            if "500 INTERNAL" in error_message or "503 UNAVAILABLE" in error_message:
+                logger.error(f"Google AI API error in stream: {error_message}")
                 yield {
                     "is_task_complete": True,
-                    "content": response,
+                    "content": "I'm experiencing temporary connectivity issues with the AI service. Please try again in a moment.",
                 }
             else:
+                logger.error(f"Unexpected error in stream: {error_message}")
                 yield {
-                    "is_task_complete": False,
-                    "updates": "The host agent is thinking...",
+                    "is_task_complete": True,
+                    "content": "An unexpected error occurred. Please try again.",
                 }
 
     async def _send_message_async(self, agent_name: str, task: str):
@@ -294,8 +361,7 @@ class HostAgent:
         if not connection:
             raise ValueError(f"Connection not available for {agent_name}")
 
-        # Simplified task and context ID management
-        task_id = str(uuid.uuid4())
+        # Simplified task and context ID management - let the remote agent create the task
         context_id = str(uuid.uuid4())
         message_id = str(uuid.uuid4())
 
@@ -304,7 +370,6 @@ class HostAgent:
                 "role": "user",
                 "parts": [{"type": "text", "text": task}],
                 "messageId": message_id,
-                "taskId": task_id,
                 "contextId": context_id,
             },
         }
@@ -329,6 +394,15 @@ class HostAgent:
                 send_response: SendMessageResponse = await temp_agent_client.send_message(message_request)
             
             logger.info(f"Successfully received response from {agent_name}")
+            
+            # Debug logging to understand response structure
+            logger.info(f"Response type: {type(send_response)}")
+            logger.info(f"Response root type: {type(send_response.root)}")
+            if hasattr(send_response.root, 'result'):
+                logger.info(f"Response root result type: {type(send_response.root.result)}")
+            else:
+                logger.info("Response root has no 'result' attribute")
+            logger.info(f"Response root content: {send_response.root}")
 
             if not isinstance(
                 send_response.root, SendMessageSuccessResponse
@@ -399,6 +473,11 @@ class HostAgent:
     def send_message(self, agent_name: str, task: str):
         """Sends a task to a remote friend agent with simple retry logic."""
         try:
+            # Replace placeholder with actual session ID if present
+            if "[current_session_id]" in task and self.current_session_id["id"]:
+                task = task.replace("[current_session_id]", self.current_session_id["id"])
+                logger.info(f"Replaced session ID placeholder. Task now: {task}")
+            
             # Check if any agents are connected
             if not self.remote_agent_connections:
                 error_msg = "No agents are currently connected. Please check if the stock analyser and stock report analyser agents are running."
@@ -455,6 +534,108 @@ class HostAgent:
             logger.error(error_msg)
             return f"Error: {error_msg}"
 
+    def send_message_background(self, agent_name: str, task: str):
+        """Send message in background without blocking."""
+        import threading
+        import asyncio
+        
+        def run_in_background():
+            try:
+                asyncio.run(self._send_message_async(agent_name, task))
+            except Exception as e:
+                logger.error(f"Background send_message failed: {e}")
+        
+        threading.Thread(target=run_in_background, daemon=True).start()
+        logger.info(f"Started background task to send message to {agent_name}")
+
+    def store_portfolio_file(self, user_name: str, file_path: str, session_id: str):
+        """Stores the uploaded portfolio file to Google Cloud Storage bucket."""
+        try:
+            # Use provided session_id
+            target_session_id = session_id
+            
+            # Generate filename using the specified format
+            filename = f"{user_name}_{target_session_id}_portfolio_statement.pdf"
+            
+            logger.info(f"Portfolio file upload requested for user: {user_name}")
+            logger.info(f"Source file path: {file_path}")
+            logger.info(f"Target GCS filename: {filename}")
+            logger.info(f"Session ID: {target_session_id}")
+            
+            # Load credentials from environment variable
+            credentials_path = os.getenv('FIREBASE_SERVICE_ACCOUNT_PATH')
+            if credentials_path:
+                credentials = service_account.Credentials.from_service_account_file(credentials_path)
+                client = storage.Client(credentials=credentials)
+            else:
+                client = storage.Client()  # Fall back to default credentials
+            
+            bucket = client.bucket('portfolio_statements')
+            blob = bucket.blob(filename)
+            blob.upload_from_filename(file_path)
+            
+            # Update database to mark portfolio statement as uploaded
+            if target_session_id:
+                try:
+                    from database import get_db, mark_portfolio_statement_uploaded
+                    db = next(get_db())
+                    success = mark_portfolio_statement_uploaded(db, target_session_id)
+                    if success:
+                        logger.info(f"Database updated: portfolio_statement_uploaded = True for session {target_session_id}")
+                    else:
+                        logger.warning(f"Failed to update database for session {target_session_id}")
+                    db.close()
+                except Exception as db_error:
+                    logger.error(f"Error updating database for session {target_session_id}: {db_error}")
+                    # Don't fail the upload if database update fails
+            
+            return f"Portfolio file stored successfully in Google Cloud Storage as: {filename}"
+            
+        except Exception as e:
+            error_msg = f"Error storing portfolio file: {e}"
+            logger.error(error_msg)
+            return f"Error: {error_msg}"
+
+    def check_file_upload_status(self):
+        """Check if a file has been uploaded for the current session."""
+        try:
+            session_id = self.current_session_id["id"]
+            if not session_id:
+                logger.warning("No session ID available for file upload status check")
+                return "File upload status: NO SESSION ID - cannot check status"
+            
+            # Check database for actual upload status
+            try:
+                from database import get_db, get_session
+                db = next(get_db())
+                session = get_session(db, session_id)
+                db.close()
+                
+                if session and session.portfolio_statement_uploaded:
+                    # Update in-memory flag to match database
+                    self.current_session_id["is_file_uploaded"] = True
+                    logger.info(f"File upload status check: File HAS been uploaded for session {session_id} (verified from database)")
+                    return f"File upload status: UPLOADED for session {session_id}"
+                else:
+                    logger.info(f"File upload status check: File NOT yet uploaded for session {session_id} (verified from database)")
+                    return f"File upload status: NOT UPLOADED for session {session_id}"
+                    
+            except Exception as db_error:
+                logger.error(f"Database error checking file upload status: {db_error}")
+                # Fall back to in-memory check
+                is_uploaded = self.current_session_id["is_file_uploaded"]
+                if is_uploaded:
+                    logger.info(f"File upload status check (fallback): File HAS been uploaded for session {session_id}")
+                    return f"File upload status: UPLOADED for session {session_id} (fallback check)"
+                else:
+                    logger.info(f"File upload status check (fallback): File NOT yet uploaded for session {session_id}")
+                    return f"File upload status: NOT UPLOADED for session {session_id} (fallback check)"
+                    
+        except Exception as e:
+            error_msg = f"Error checking file upload status: {e}"
+            logger.error(error_msg)
+            return f"Error: {error_msg}"
+
     def store_stock_report_response(self, response: str):
         """Stores the response received from the stock report analyser agent."""
         self.stock_report_response = response
@@ -471,7 +652,68 @@ class HostAgent:
         """Stores the receiver email ID for sending stock analysis."""
         self.receiver_email_id = email_id
         logger.info(f"Stored receiver email ID: {email_id}")
-        return f"Receiver email ID stored successfully: {email_id}"
+        
+        # Check if all prerequisites are met for ending the session
+        has_portfolio = False
+        has_investment_amount = self.investment_amount > 0
+        has_stocks = len(self.existing_portfolio_stocks) > 0 or len(self.new_stocks) > 0
+        
+        # Check if portfolio statement is uploaded
+        try:
+            session_id = self.current_session_id["id"]
+            if session_id:
+                from database import get_db, get_session
+                db = next(get_db())
+                session = get_session(db, session_id)
+                db.close()
+                has_portfolio = session and session.portfolio_statement_uploaded
+        except Exception as e:
+            logger.warning(f"Could not check portfolio upload status: {e}")
+            has_portfolio = self.current_session_id.get("is_file_uploaded", False)
+        
+        # If all conditions are met, trigger stock analysis and return end session message
+        if has_portfolio and has_investment_amount and has_stocks:
+            logger.info(f"All prerequisites met for email {email_id}. Triggering stock analysis.")
+            
+            # Execute STEP 6: Prepare comprehensive analysis
+            try:
+                # Get analysis request from analyze_all_stocks
+                analysis_request = self.analyze_all_stocks()
+                logger.info(f"Analysis request: {analysis_request}")
+                
+                if analysis_request and not analysis_request.startswith("No stocks") and not analysis_request.startswith("Error"):
+                    # Send message to stock_analyser_agent
+                    task_with_email = f"{analysis_request} Email ID: {self.receiver_email_id}"
+                    logger.info(f"Sending analysis request to stock_analyser_agent for email {email_id}")
+                    
+                    # Send the message asynchronously (don't wait for response)
+                    logger.info(f"Sending analysis request to Stock Analyser Agent with task: {task_with_email}")
+                    self.send_message_background(agent_name='Stock Analyser Agent', task=task_with_email)
+                    logger.info(f"Analysis request sent to Stock Analyser Agent. Ending session.")
+                else:
+                    logger.error(f"Failed to prepare analysis request: {analysis_request}")
+                    
+            except Exception as e:
+                logger.error(f"Error triggering stock analysis for {email_id}: {e}")
+            
+            # Return a special JSON string that the API can parse
+            import json
+            return json.dumps({
+                "message": "Stock analysis in progress, we will email you the stock allocation report",
+                "end_session": True
+            })
+        else:
+            # Log what's missing for debugging
+            missing = []
+            if not has_portfolio:
+                missing.append("portfolio statement")
+            if not has_investment_amount:
+                missing.append("investment amount")
+            if not has_stocks:
+                missing.append("stocks selection")
+            logger.info(f"Prerequisites not met for {email_id}. Missing: {', '.join(missing)}")
+            
+            return f"Receiver email ID stored successfully: {email_id}"
 
     def get_investment_amount(self):
         """Returns the stored investment amount."""
@@ -546,16 +788,23 @@ class HostAgent:
         if not all_stocks:
             return "No stocks available for analysis. Please add stocks to the lists first."
         
-        if not self.stock_report_response:
-            return "No stock report response available. Please store the report response first."
-        
         # Create the delegation request with the list of stocks to analyze
-        delegation_request = f"""
-        **STOCKS TO ANALYZE - DELEGATION REQUEST**
-
+        # Include portfolio report if available, otherwise proceed without it
+        portfolio_section = ""
+        if self.stock_report_response:
+            portfolio_section = f"""
         **PORTFOLIO REPORT (for context):**
         {self.stock_report_response}
-
+        """
+        else:
+            portfolio_section = """
+        **PORTFOLIO REPORT:**
+        No existing portfolio report available. Proceeding with analysis based on selected stocks only.
+        """
+        
+        delegation_request = f"""
+        **STOCKS TO ANALYZE - DELEGATION REQUEST**
+        {portfolio_section}
         **COMPLETE LIST OF STOCKS TO ANALYZE:**
         - Existing Portfolio Stocks: {', '.join(self.existing_portfolio_stocks) if self.existing_portfolio_stocks else 'None'}
         - New Stocks to Consider: {', '.join(self.new_stocks) if self.new_stocks else 'None'}
