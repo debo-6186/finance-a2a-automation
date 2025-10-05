@@ -1077,6 +1077,8 @@ def main():
         if not os.getenv("GOOGLE_API_KEY") and not os.getenv("GOOGLE_GENAI_USE_VERTEXAI") == "TRUE":
             logger.error("GOOGLE_API_KEY environment variable not set and GOOGLE_GENAI_USE_VERTEXAI is not TRUE.")
             exit(1)
+
+        logger.info(f"GOOGLE_API_KEY: {os.getenv("GOOGLE_API_KEY")}")
         
         host = "localhost"
         port = 10001  # Different port from other agents

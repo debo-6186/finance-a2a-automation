@@ -143,7 +143,7 @@ class HostAgent:
                     model="gemini-2.5-flash",
                     name="Host_Agent",
                     instruction=self.root_instruction,
-                    description="This Host agent orchestrates scheduling pickleball with friends.",
+                    description="This Host agent orchestrates stock allocation logic.",
                     tools=[
                         FunctionTool(self.send_message),
                         FunctionTool(self.store_portfolio_file),

@@ -114,4 +114,7 @@ logs/
 venv/
 
 # Environment variables
-.env 
+.env
+
+# Firebase credentials
+*firebase-adminsdk*.json 
