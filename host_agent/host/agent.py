@@ -732,13 +732,116 @@ class HostAgent:
         return f"Added {len(stocks)} existing portfolio stocks. Current list: {', '.join(self.existing_portfolio_stocks)}"
 
     def add_new_stocks(self, stocks: List[str]):
-        """Adds new stocks to the list."""
-        for stock in stocks:
-            stock_upper = stock.upper().strip()
-            if stock_upper not in self.new_stocks:
-                self.new_stocks.append(stock_upper)
-        logger.info(f"Added {len(stocks)} new stocks. Total: {len(self.new_stocks)}")
-        return f"Added {len(stocks)} new stocks. Current list: {', '.join(self.new_stocks)}"
+        """Adds new stocks to the list, converting stock names to tickers using LLM."""
+        from google import genai
+        from google.genai.types import GenerateContentConfig
+
+        logger.info(f"Using LLM to find stock tickers for: {stocks}")
+
+        # Create the client with proper configuration
+        if os.getenv("GOOGLE_GENAI_USE_VERTEXAI") == "TRUE":
+            client = genai.Client(vertexai=True)
+            logger.info("Using Vertex AI for ticker lookup")
+        else:
+            api_key = os.getenv("GOOGLE_API_KEY")
+            if not api_key:
+                logger.error("No GOOGLE_API_KEY found for ticker lookup")
+                # Fallback to original behavior
+                for stock in stocks:
+                    stock_upper = stock.upper().strip()
+                    if stock_upper not in self.new_stocks:
+                        self.new_stocks.append(stock_upper)
+                logger.info(f"Added {len(stocks)} new stocks (fallback mode). Total: {len(self.new_stocks)}")
+                return f"Added {len(stocks)} new stocks (API key missing). Current list: {', '.join(self.new_stocks)}"
+            client = genai.Client(api_key=api_key)
+            logger.info("Using Google AI API for ticker lookup")
+
+        # System prompt for ticker lookup
+        system_prompt = """You are a financial data expert. Your job is to convert stock names or company names to their correct stock ticker symbols.
+
+For US stocks: Return the ticker symbol (e.g., "AAPL" for Apple)
+For Indian stocks: Return the ticker with exchange suffix (e.g., "RELIANCE.NS" for Reliance on NSE, or "RELIANCE.BO" for BSE)
+
+Return ONLY a JSON array of ticker symbols, nothing else. Example: ["AAPL", "MSFT", "RELIANCE.NS"]"""
+
+        # Prepare the ticker lookup request
+        stocks_input = ', '.join(stocks)
+        ticker_request = f"""Convert the following stock names to their ticker symbols: {stocks_input}
+
+Return ONLY a JSON array of uppercase ticker symbols. If a name is already a ticker, keep it as is."""
+
+        try:
+            # Make the LLM call with retry logic
+            max_retries = 3
+            base_delay = 2
+            response = None
+
+            for attempt in range(max_retries):
+                try:
+                    if attempt > 0:
+                        import random
+                        delay = base_delay * (2 ** attempt) + random.uniform(0, 1)
+                        logger.info(f"Retrying ticker lookup after {delay:.2f}s delay (attempt {attempt + 1}/{max_retries})")
+                        time.sleep(delay)
+
+                    response = client.models.generate_content(
+                        model="gemini-2.5-flash",
+                        contents=ticker_request,
+                        config=GenerateContentConfig(
+                            system_instruction=[system_prompt]
+                        )
+                    )
+
+                    logger.info(f"Successfully generated ticker lookup (attempt {attempt + 1})")
+                    break
+
+                except Exception as e:
+                    error_message = str(e)
+                    is_api_error = any(code in error_message for code in ["500", "503", "INTERNAL", "UNAVAILABLE"])
+
+                    if attempt == max_retries - 1:
+                        logger.error(f"Failed to generate ticker lookup after {max_retries} attempts: {e}")
+                        raise
+
+                    if is_api_error:
+                        logger.warning(f"Google AI API error on attempt {attempt + 1}: {e}")
+                    else:
+                        logger.warning(f"Unexpected error on attempt {attempt + 1}: {e}")
+
+            # Extract the response text
+            response_text = response.text.strip()
+            logger.info(f"LLM response for stock tickers: {response_text}")
+
+            # Parse the JSON response
+            # Remove markdown code blocks if present
+            if response_text.startswith("```"):
+                response_text = response_text.split("```")[1]
+                if response_text.startswith("json"):
+                    response_text = response_text[4:]
+                response_text = response_text.strip()
+
+            tickers = json.loads(response_text)
+
+            # Add tickers to the list
+            added_count = 0
+            for ticker in tickers:
+                ticker_upper = ticker.upper().strip()
+                if ticker_upper not in self.new_stocks:
+                    self.new_stocks.append(ticker_upper)
+                    added_count += 1
+
+            logger.info(f"Added {added_count} new stocks. Total: {len(self.new_stocks)}")
+            return f"Added {added_count} new stocks (tickers: {', '.join(tickers)}). Current list: {', '.join(self.new_stocks)}"
+
+        except Exception as e:
+            logger.error(f"Error in LLM ticker lookup: {e}")
+            # Fallback to original behavior if LLM call fails
+            for stock in stocks:
+                stock_upper = stock.upper().strip()
+                if stock_upper not in self.new_stocks:
+                    self.new_stocks.append(stock_upper)
+            logger.info(f"Added {len(stocks)} new stocks (fallback mode). Total: {len(self.new_stocks)}")
+            return f"Added {len(stocks)} new stocks (using input as-is due to error: {str(e)}). Current list: {', '.join(self.new_stocks)}"
 
     def get_stock_lists(self):
         """Returns the current stock lists, investment amount, and report response."""

@@ -106,68 +106,39 @@ class StockAnalyzerAgent:
                 logger.info("Using Google AI API for stock extraction")
             
             # System prompt for stock extraction
-            system_prompt = f"""You are a senior portfolio manager with 20+ years of experience in equity analysis and portfolio construction. Your role is to provide data-driven, objective investment recommendations based on rigorous fundamental and technical analysis.
+            system_prompt = """You are a stock ticker extraction specialist. Your sole task is to extract stock ticker symbols from analysis requests.
 
-ANALYTICAL FRAMEWORK:
-1. Fundamental Analysis: Evaluate valuation metrics (P/E, P/B, PEG ratio), financial health (debt ratios, cash flow), growth metrics (revenue/earnings growth), and profitability margins
-2. Technical Analysis: Assess price momentum, trend strength (50-day vs 200-day MA), and proximity to 52-week highs/lows
-3. Analyst Consensus: Consider analyst ratings and price target upside/downside
-4. Portfolio Context: Evaluate sector concentration, risk diversification, and position sizing
-5. Risk Assessment: Analyze beta, volatility, and company-specific risks from recent news
+TASK:
+Extract stock tickers from the analysis request and categorize them as existing portfolio stocks or new stocks to analyze.
+If stock names (not tickers) are provided, identify and convert them to their corresponding ticker symbols.
 
-DECISION CRITERIA:
-BUY: Must meet ALL of the following:
-- Current price offers ≥10% upside to analyst mean target OR strong fundamental growth (>20% revenue/earnings growth) with reasonable valuation
-- Positive technical momentum (price above 50-day MA or strong recent trend)
-- Analyst recommendation of "buy" or "strong buy" 
-- Fits portfolio diversification needs (not overweighting existing sector concentration)
+RULES:
+- Extract ONLY valid stock ticker symbols (e.g., AAPL, GOOGL, TSLA)
+- If a company name is provided (e.g., "Apple", "Microsoft"), convert it to the ticker (AAPL, MSFT)
+- Categorize stocks as "existing" if they are mentioned as part of current portfolio
+- Categorize stocks as "new" if they are mentioned for potential investment or analysis
+- Also extract the investment amount and email ID if present
 
-HOLD: Meets ANY of the following:
-- Current price within ±10% of fair value estimate
-- Mixed signals (strong fundamentals but negative momentum, or vice versa)
-- Already appropriately weighted in portfolio
-- Neutral analyst consensus or significant uncertainty
+OUTPUT FORMAT (respond with ONLY these lines):
+EXISTING: TICKER1, TICKER2, TICKER3 (or NONE if no existing stocks)
+NEW: TICKER1, TICKER2, TICKER3 (or NONE if no new stocks)
+INVESTMENT_AMOUNT: amount (numeric value only, or 0 if not found)
+EMAIL_ID: email@example.com (or not_found if not present)
 
-SELL: Must meet ANY of the following:
-- Current price ≥15% above analyst mean target with deteriorating fundamentals
-- Declining revenue/earnings with high valuation (P/E >30 and negative growth)
-- Significant negative news or fundamental deterioration
-- Overweight position that increases portfolio concentration risk above 25% in any stock
+EXAMPLES:
+Input: "I have Apple and Microsoft in my portfolio. I want to invest $5000 in Tesla and Amazon. Email: john@example.com"
+Output:
+EXISTING: AAPL, MSFT
+NEW: TSLA, AMZN
+INVESTMENT_AMOUNT: 5000
+EMAIL_ID: john@example.com
 
-PORTFOLIO CONSTRAINTS:
-- Total investment budget: ${self.investment_amount}
-- Maximum single stock allocation: 25% of total budget
-- Ensure sector diversification: No more than 40% in any single sector
-- Current portfolio concentration: NVDA (24.58%) and VOO (37.16%) are already significant positions
-
-OUTPUT FORMAT:
-1. PORTFOLIO ASSESSMENT (2-3 sentences):
-   - Current concentration risks and sector exposures
-   - Overall portfolio health assessment
-
-2. ALLOCATION BREAKDOWN:
-   - List each BUY recommendation with percentage allocation
-   - Ensure total equals 100% of ${self.investment_amount}
-   - Justify allocation percentages based on conviction level and risk
-
-3. INDIVIDUAL STOCK RECOMMENDATIONS:
-   For each stock provide:
-   Ticker: RECOMMENDATION (BUY/SELL/HOLD)
-   Investment Amount: $X (for BUY only)
-   Key Metrics: Current P/E [X], Target Upside [X%], Analyst Rating [X], Revenue Growth [X%]
-   Reasoning: 2-3 sentences explaining the decision based on the criteria above
-   
-4. RISK WARNINGS (if applicable):
-   - Flag any stocks with elevated risk (high beta, negative news, valuation concerns)
-   - Note portfolio-level risks (concentration, sector imbalance)
-
-CRITICAL RULES:
-- Base ALL decisions on the quantitative data provided, not general market knowledge
-- Be consistent: apply the same criteria to all stocks
-- Be objective: no bias toward popular stocks or sectors
-- Show your work: reference specific metrics that drove each decision
-- Ensure total BUY allocations sum exactly to ${self.investment_amount}
-- Do not use asterisks (*) for formatting - use clear paragraph breaks and dashes instead"""
+Input: "Analyze NVDA, VOO and suggest new stocks PLTR, GOOGL for $10000"
+Output:
+EXISTING: NVDA, VOO
+NEW: PLTR, GOOGL
+INVESTMENT_AMOUNT: 10000
+EMAIL_ID: not_found"""
 
             # Generate stock extraction using LLM with retry logic
             logger.info("Generating stock extraction using LLM")
@@ -192,7 +163,7 @@ CRITICAL RULES:
                     )
 
                     # If we get here, the call was successful
-                    logger.info(f"Successfully generated stock extraction (attempt {attempt + 1})")
+                    logger.info(f"Successfully generated stock extraction {response.text})")
                     break
 
                 except Exception as e:
@@ -301,26 +272,67 @@ CRITICAL RULES:
                 logger.info("Using default GenAI client for portfolio analysis")
 
             # Expert system prompt for portfolio recommendations
-            system_prompt = f"""You are a senior portfolio manager and investment advisor. Your task is to analyze a comprehensive portfolio of stocks and provide specific investment recommendations.
+            system_prompt = f"""You are a senior portfolio manager with 20+ years of experience in equity analysis and portfolio construction. Your role is to provide data-driven stock allocation recommendations with specific buy/sell/hold decisions.
 
-            CRITICAL REQUIREMENTS:
-            - Analyze the complete portfolio and individual stocks
-            - Provide specific BUY/SELL/HOLD recommendations for each stock
-            - Calculate exact dollar amounts to invest for each BUY recommendation
-            - Total investment budget: {self.investment_amount}
-            - Focus on portfolio optimization and risk diversification
-            - Consider market conditions and sector concentration
-            - Be data-driven and specific in recommendations
+ANALYTICAL FRAMEWORK:
+1. Fundamental Analysis: Evaluate valuation metrics (P/E, P/B, PEG ratio), financial health (debt ratios, cash flow), growth metrics (revenue/earnings growth), and profitability margins
+2. Technical Analysis: Assess price momentum, trend strength (50-day vs 200-day MA), and proximity to 52-week highs/lows
+3. Analyst Consensus: Consider analyst ratings and price target upside/downside
+4. Portfolio Context: Evaluate sector concentration, risk diversification, and position sizing
+5. Risk Assessment: Analyze beta, volatility, and company-specific risks from recent news
 
-            OUTPUT FORMAT:
-            1. ALLOCATION BREAKDOWN: Percentage allocation across all BUY recommendations, amount allocation for that stock
-            2. INVESTMENT RECOMMENDATIONS: For each stock, provide:
-               - Ticker: RECOMMENDATION (BUY/SELL/HOLD)
-               - Investment Amount: $X (for BUY recommendations only)
-               - Brief reasoning (1-2 sentences)
-            3. PORTFOLIO SUMMARY: Brief overview of current portfolio composition
+DECISION CRITERIA:
+BUY: Must meet ALL of the following:
+- Current price offers ≥10% upside to analyst mean target OR strong fundamental growth (>20% revenue/earnings growth) with reasonable valuation
+- Positive technical momentum (price above 50-day MA or strong recent trend)
+- Analyst recommendation of "buy" or "strong buy"
+- Fits portfolio diversification needs (not overweighting existing sector concentration)
 
-            Keep response focused and actionable. Do not use any asterisk (*)"""
+HOLD: Meets ANY of the following:
+- Current price within ±10% of fair value estimate
+- Mixed signals (strong fundamentals but negative momentum, or vice versa)
+- Already appropriately weighted in portfolio
+- Neutral analyst consensus or significant uncertainty
+
+SELL: Must meet ANY of the following:
+- Current price ≥15% above analyst mean target with deteriorating fundamentals
+- Declining revenue/earnings with high valuation (P/E >30 AND negative growth)
+- Significant negative news or fundamental deterioration
+- Overweight position that increases portfolio concentration risk above 25% in any stock
+
+PORTFOLIO CONSTRAINTS:
+- Total investment budget: ${self.investment_amount}
+- Maximum single stock allocation: 25% of total budget
+- Ensure sector diversification: No more than 40% in any single sector
+
+OUTPUT FORMAT:
+1. PORTFOLIO ASSESSMENT (2-3 sentences):
+   - Current concentration risks and sector exposures
+   - Overall portfolio health assessment
+
+2. ALLOCATION BREAKDOWN:
+   - List each BUY recommendation with percentage allocation and dollar amount
+   - Ensure total equals 100% of ${self.investment_amount}
+   - Justify allocation percentages based on conviction level and risk
+
+3. INDIVIDUAL STOCK RECOMMENDATIONS:
+   For each stock provide:
+   Ticker: RECOMMENDATION (BUY/SELL/HOLD)
+   Investment Amount: $X (for BUY only)
+   Key Metrics: Current P/E [X], Target Upside [X%], Analyst Rating [X], Revenue Growth [X%]
+   Reasoning: 2-3 sentences explaining the decision based on the criteria above
+
+4. RISK WARNINGS (if applicable):
+   - Flag any stocks with elevated risk (high beta, negative news, valuation concerns)
+   - Note portfolio-level risks (concentration, sector imbalance)
+
+CRITICAL RULES:
+- Base ALL decisions on the quantitative data provided, not general market knowledge
+- Be consistent: apply the same criteria to all stocks
+- Be objective: no bias toward popular stocks or sectors
+- Show your work: reference specific metrics that drove each decision
+- Ensure total BUY allocations sum exactly to ${self.investment_amount}
+- Do not use asterisks (*) for formatting - use clear paragraph breaks and dashes instead"""
 
             # Prepare comprehensive data for analysis
             portfolio_summary = f"""
@@ -583,6 +595,160 @@ STOCK ANALYSIS DATA:
             logger.error(error_msg)
             return error_msg
 
+    def convert_portfolio_analysis_to_html(self, text: str) -> str:
+        """
+        Converts portfolio analysis text to HTML email-friendly format.
+        Removes markdown formatting (#, *, etc.) and applies proper HTML styling.
+
+        Args:
+            text: The raw portfolio analysis text with markdown formatting
+
+        Returns:
+            HTML formatted string suitable for email body
+        """
+        lines = text.strip().split('\n')
+        html_parts = []
+
+        # Start HTML with basic styling
+        html_parts.append('''<html>
+<head>
+<style>
+body { font-family: Arial, sans-serif; line-height: 1.6; color: #333; max-width: 800px; margin: 0 auto; padding: 20px; }
+h1 { color: #2c3e50; border-bottom: 3px solid #3498db; padding-bottom: 10px; font-size: 24px; }
+h2 { color: #34495e; margin-top: 30px; font-size: 20px; }
+h3 { color: #7f8c8d; margin-top: 20px; font-size: 16px; font-weight: bold; }
+.allocation { background-color: #ecf0f1; padding: 15px; border-radius: 5px; margin: 15px 0; }
+.stock-card { background-color: #f8f9fa; border-left: 4px solid #3498db; padding: 15px; margin: 15px 0; }
+.buy { border-left-color: #27ae60; }
+.hold { border-left-color: #f39c12; }
+.sell { border-left-color: #e74c3c; }
+.ticker { font-weight: bold; font-size: 18px; color: #2c3e50; }
+.recommendation { font-weight: bold; padding: 3px 8px; border-radius: 3px; display: inline-block; }
+.rec-buy { background-color: #27ae60; color: white; }
+.rec-hold { background-color: #f39c12; color: white; }
+.rec-sell { background-color: #e74c3c; color: white; }
+ul { margin: 10px 0; }
+li { margin: 8px 0; }
+.warning { background-color: #fff3cd; border-left: 4px solid #ffc107; padding: 15px; margin: 15px 0; }
+</style>
+</head>
+<body>''')
+
+        i = 0
+        while i < len(lines):
+            line = lines[i].strip()
+
+            if not line:
+                i += 1
+                continue
+
+            # Handle headers (remove ### and #)
+            if line.startswith('###'):
+                header_text = line.replace('#', '').strip()
+                html_parts.append(f'<h1>{header_text}</h1>')
+            elif line.startswith('##'):
+                header_text = line.replace('#', '').strip()
+                html_parts.append(f'<h2>{header_text}</h2>')
+
+            # Handle allocation breakdown bullets
+            elif line.startswith('-') and ('**' in line or 'VOO' in line or 'MSFT' in line or 'Total:' in line):
+                # Remove ** and - characters
+                clean_line = line.replace('**', '').replace('-', '').strip()
+                if 'Total:' in clean_line:
+                    # Close any open list before the total
+                    if '<ul' in ''.join(html_parts[-10:]) and '</ul>' not in ''.join(html_parts[-3:]):
+                        html_parts.append('</ul>')
+                    html_parts.append(f'<div class="allocation"><strong>{clean_line}</strong></div>')
+                else:
+                    if '<ul' not in ''.join(html_parts[-3:]):
+                        html_parts.append('<ul class="allocation">')
+                    html_parts.append(f'<li>{clean_line}</li>')
+
+            # Handle stock recommendations
+            elif line.startswith('Ticker:'):
+                # Determine recommendation type
+                rec_type = 'hold'
+                rec_class = 'rec-hold'
+                if 'BUY' in line:
+                    rec_type = 'buy'
+                    rec_class = 'rec-buy'
+                elif 'SELL' in line:
+                    rec_type = 'sell'
+                    rec_class = 'rec-sell'
+
+                # Extract ticker and recommendation
+                parts = line.split(' - RECOMMENDATION')
+                ticker = parts[0].replace('Ticker:', '').replace('**', '').strip()
+                recommendation = parts[1].replace('(', '').replace(')', '').strip() if len(parts) > 1 else 'HOLD'
+
+                html_parts.append(f'<div class="stock-card {rec_type}">')
+                html_parts.append(f'<span class="ticker">{ticker}</span> - <span class="recommendation {rec_class}">{recommendation}</span>')
+
+                # Collect all related lines
+                i += 1
+                while i < len(lines) and lines[i].strip() and not lines[i].strip().startswith('Ticker:') and not lines[i].strip().startswith('###') and not lines[i].strip().startswith('**'):
+                    detail_line = lines[i].strip()
+                    if detail_line.startswith('Investment Amount:'):
+                        clean = detail_line.replace('**', '')
+                        html_parts.append(f'<p><strong>{clean}</strong></p>')
+                    elif detail_line.startswith('Key Metrics:'):
+                        clean = detail_line.replace('**', '')
+                        html_parts.append(f'<p><strong>{clean}</strong></p>')
+                    elif detail_line.startswith('Reasoning:'):
+                        clean = detail_line.replace('**', '')
+                        html_parts.append(f'<p><strong>Reasoning:</strong> {clean.replace("Reasoning:", "").strip()}</p>')
+                    else:
+                        # Capture any other detail lines (like continued reasoning text)
+                        clean = detail_line.replace('**', '')
+                        html_parts.append(f'<p>{clean}</p>')
+                    i += 1
+
+                html_parts.append('</div>')
+                continue
+
+            # Handle section headers like "BUY Recommendations"
+            elif 'Recommendations' in line or 'ALLOCATION BREAKDOWN' in line:
+                # Close any open list before the header
+                if '<ul' in ''.join(html_parts[-10:]) and '</ul>' not in ''.join(html_parts[-3:]):
+                    html_parts.append('</ul>')
+                clean_line = line.replace('**', '').strip()
+                html_parts.append(f'<h3>{clean_line}</h3>')
+
+            # Handle regular paragraphs
+            elif line and not line.startswith('-'):
+                # Close any open list before a paragraph
+                if '<ul' in ''.join(html_parts[-10:]) and '</ul>' not in ''.join(html_parts[-3:]):
+                    html_parts.append('</ul>')
+                clean_line = line.replace('**', '').replace('*', '')
+                # Check if this is a risk warning section
+                if 'High Beta Stocks:' in line or 'Sector Concentration:' in line:
+                    if '<div class="warning">' not in ''.join(html_parts[-5:]):
+                        html_parts.append('<div class="warning">')
+                    html_parts.append(f'<p><strong>{clean_line}</strong></p>')
+                else:
+                    html_parts.append(f'<p>{clean_line}</p>')
+
+            # Handle bullet points
+            elif line.startswith('-'):
+                clean_line = line.replace('-', '').replace('**', '').strip()
+                if '<ul' not in ''.join(html_parts[-3:]):
+                    html_parts.append('<ul>')
+                html_parts.append(f'<li>{clean_line}</li>')
+
+            i += 1
+
+        # Close any open tags
+        if '<ul>' in ''.join(html_parts[-10:]) and '</ul>' not in ''.join(html_parts[-5:]):
+            html_parts.append('</ul>')
+
+        if '<div class="warning">' in ''.join(html_parts[-20:]) and '</div>' not in ''.join(html_parts[-5:]):
+            html_parts.append('</div>')
+
+        # Close HTML
+        html_parts.append('</body></html>')
+
+        return ''.join(html_parts)
+
     def send_analysis_to_webhook(self, analysis_response: str, email_to: str, webhook_url: Optional[str] = None, username: Optional[str] = None, password: Optional[str] = None) -> str:
         """
         Securely sends analysis response data to the Activepieces webhook endpoint.
@@ -639,13 +805,18 @@ STOCK ANALYSIS DATA:
             
             logger.info(f"Sending analysis data to webhook: {webhook_url}")
             logger.info(f"Payload: {payload}")
+            html_content = self.convert_portfolio_analysis_to_html(response_with_date)
+            html_payload = {
+                "analysis_response": html_content,
+                "email_to": email_to
+            }
             logger.info(f"Headers: {json.dumps({k: v for k, v in headers.items() if k != 'Authorization'}, indent=2)}")
             logger.info(f"Auth: Basic {encoded_credentials[:10]}...")
             
             # Make the POST request - exactly like your curl
             response = requests.post(
                 webhook_url,
-                json=payload,
+                json=html_payload,
                 headers=headers,
                 timeout=30
             )
@@ -715,6 +886,7 @@ STOCK ANALYSIS DATA:
             logger.info("Step 2: Extracting stocks from analysis request")
             stocks_result = self.extract_stocks_from_analysis_request(analysis_request)
             stocks_data = json.loads(stocks_result)
+            logger.info(f"stocks_data: {stocks_data}")
 
             existing_stocks = stocks_data.get("existing_stocks", [])
             new_stocks = stocks_data.get("new_stocks", [])
