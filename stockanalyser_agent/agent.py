@@ -24,6 +24,8 @@ import asyncio
 from functools import wraps
 from google import genai
 from google.genai.types import GenerateContentConfig, HttpOptions
+from database import get_db, save_stock_recommendation
+from openai import OpenAI
 
 # Setup logging and get log file path
 log_file_path = setup_logging()
@@ -40,6 +42,9 @@ class StockAnalyzerAgent:
         self.investment_amount = ""
         self.email_id = ""
         self.portfolio_analysis = ""
+        self.user_id = ""
+        self.session_id = ""
+        self.stock_analysis_data = {}  # Store stock analysis data in memory
         
         # Initialize MCP tool
         mcp_env = {**os.environ}
@@ -65,7 +70,7 @@ class StockAnalyzerAgent:
         self.execute_programmatic_flow_tool = FunctionTool(self.execute_programmatic_flow)
         self.extract_stocks_from_analysis_request_tool = FunctionTool(self.extract_stocks_from_analysis_request)
         self.get_expert_portfolio_recommendations_tool = FunctionTool(self.get_expert_portfolio_recommendations)
-        self.save_stock_analysis_to_file_tool = FunctionTool(self.save_stock_analysis_to_file)
+        self.save_stock_analysis_to_memory_tool = FunctionTool(self.save_stock_analysis_to_memory)
         self.save_portfolio_analysis_to_file_tool = FunctionTool(self.save_portfolio_analysis_to_file)
         self.save_investment_details_to_file_tool = FunctionTool(self.save_investment_details_to_file)
         self.send_analysis_to_webhook_tool = FunctionTool(self.send_analysis_to_webhook)
@@ -117,13 +122,15 @@ RULES:
 - If a company name is provided (e.g., "Apple", "Microsoft"), convert it to the ticker (AAPL, MSFT)
 - Categorize stocks as "existing" if they are mentioned as part of current portfolio
 - Categorize stocks as "new" if they are mentioned for potential investment or analysis
-- Also extract the investment amount and email ID if present
+- Also extract the investment amount, email ID, user ID, and session ID if present
 
 OUTPUT FORMAT (respond with ONLY these lines):
 EXISTING: TICKER1, TICKER2, TICKER3 (or NONE if no existing stocks)
 NEW: TICKER1, TICKER2, TICKER3 (or NONE if no new stocks)
 INVESTMENT_AMOUNT: amount (numeric value only, or 0 if not found)
 EMAIL_ID: email@example.com (or not_found if not present)
+USER_ID: user_id (or not_found if not present)
+SESSION_ID: session_id (or not_found if not present)
 
 EXAMPLES:
 Input: "I have Apple and Microsoft in my portfolio. I want to invest $5000 in Tesla and Amazon. Email: john@example.com"
@@ -132,13 +139,17 @@ EXISTING: AAPL, MSFT
 NEW: TSLA, AMZN
 INVESTMENT_AMOUNT: 5000
 EMAIL_ID: john@example.com
+USER_ID: not_found
+SESSION_ID: not_found
 
-Input: "Analyze NVDA, VOO and suggest new stocks PLTR, GOOGL for $10000"
+Input: "Analyze NVDA, VOO and suggest new stocks PLTR, GOOGL for $10000. USER ID: user123 SESSION ID: sess456"
 Output:
 EXISTING: NVDA, VOO
 NEW: PLTR, GOOGL
 INVESTMENT_AMOUNT: 10000
-EMAIL_ID: not_found"""
+EMAIL_ID: not_found
+USER_ID: user123
+SESSION_ID: sess456"""
 
             # Generate stock extraction using LLM with retry logic
             logger.info("Generating stock extraction using LLM")
@@ -186,12 +197,12 @@ EMAIL_ID: not_found"""
             
             existing_stocks = []
             new_stocks = []
-            
+
             if response and response.text:
                 # Parse the LLM response
                 response_text = response.text.strip()
                 logger.info(f"LLM stock extraction response: {response_text}")
-                
+
                 # Parse the response lines
                 lines = response_text.split('\n')
                 for line in lines:
@@ -208,6 +219,10 @@ EMAIL_ID: not_found"""
                         self.investment_amount = line.replace("INVESTMENT_AMOUNT:", "").strip()
                     elif line.startswith("EMAIL_ID:"):
                         self.email_id = line.replace("EMAIL_ID:", "").strip()
+                    elif line.startswith("USER_ID:"):
+                        self.user_id = line.replace("USER_ID:", "").strip()
+                    elif line.startswith("SESSION_ID:"):
+                        self.session_id = line.replace("SESSION_ID:", "").strip()
                 
             else:
                 logger.error("No response from LLM for stock extraction")
@@ -222,6 +237,8 @@ EMAIL_ID: not_found"""
             logger.info(f"LLM-powered stock extraction complete: {len(existing_stocks)} existing, {len(new_stocks)} new stocks")
             logger.info(f"Investment amount: {self.investment_amount}")
             logger.info(f"Email id: {self.email_id}")
+            logger.info(f"User ID: {self.user_id}")
+            logger.info(f"Session ID: {self.session_id}")
 
             return json.dumps(result)
             
@@ -229,47 +246,43 @@ EMAIL_ID: not_found"""
             logger.error(f"Error in LLM stock extraction: {str(e)}")
             return f"Error extracting stocks from analysis request: {e}"
 
-    def get_expert_portfolio_recommendations(self, text_file_path: str = "stock_analysis_results.txt") -> str:
+    def get_expert_portfolio_recommendations(self) -> str:
         """
-        Analyzes portfolio data from text file and provides comprehensive investment recommendations.
+        Analyzes portfolio data from memory and provides comprehensive investment recommendations.
         Reads both portfolio analysis and individual stock data to make buy/sell/hold decisions.
-
-        Args:
-            text_file_path: Path to the text file containing portfolio and stock analysis data
+        Uses Perplexity's sonar-pro model for analysis.
 
         Returns:
-            Comprehensive portfolio analysis with specific investment recommendations and amounts
+            JSON string with comprehensive portfolio analysis with specific investment recommendations and amounts
         """
         try:
             logger.info(f"get_expert_portfolio_recommendations called with investment amount: ${self.investment_amount}")
 
-            if not os.path.exists(text_file_path):
-                logger.error(f"Text file not found: {text_file_path}")
-                return f"**Error**: Stock analysis file not found at {text_file_path}. Please ensure data is available."
+            if not self.stock_analysis_data:
+                logger.error("No stock analysis data available in memory")
+                return json.dumps({"error": "No stock analysis data available. Please ensure stocks have been analyzed first."})
 
-            # Read the text file
-            with open(text_file_path, 'r') as f:
-                text_content = f.read()
+            # Build text content from in-memory data
+            text_content_parts = []
+            for ticker, data in self.stock_analysis_data.items():
+                text_content_parts.append(f"\n{'='*50}\nTicker: {ticker}\nTimestamp: {data['timestamp']}\n{'='*50}\n{data['data']}\n")
 
-            logger.info(f"Successfully loaded portfolio data from {text_file_path}")
+            text_content = "\n".join(text_content_parts)
 
-            if not text_content.strip():
-                logger.error("Empty text file")
-                return "**Error**: The analysis file is empty."
+            logger.info(f"Successfully loaded portfolio data from memory")
+            logger.info(f"Found text content with {len(text_content)} characters for {len(self.stock_analysis_data)} stocks")
 
-            logger.info(f"Found text content with {len(text_content)} characters")
+            # Initialize Perplexity client using OpenAI-compatible format
+            perplexity_api_key = os.getenv("PERPLEXITY_API_KEY")
+            if not perplexity_api_key:
+                logger.error("PERPLEXITY_API_KEY not found in environment variables")
+                return json.dumps({"error": "PERPLEXITY_API_KEY not configured. Please set the environment variable."})
 
-            # Create the client with proper configuration
-            api_key = os.getenv("GOOGLE_API_KEY")
-            if os.getenv("GOOGLE_GENAI_USE_VERTEXAI") == "TRUE":
-                client = genai.Client(vertexai=True)
-                logger.info("Using Vertex AI for portfolio analysis")
-            elif api_key:
-                client = genai.Client(api_key=api_key)
-                logger.info("Using Google GenAI API for portfolio analysis")
-            else:
-                client = genai.Client()
-                logger.info("Using default GenAI client for portfolio analysis")
+            client = OpenAI(
+                api_key=perplexity_api_key,
+                base_url="https://api.perplexity.ai"
+            )
+            logger.info("Using Perplexity API with sonar-pro model for portfolio analysis")
 
             # Expert system prompt for portfolio recommendations
             system_prompt = f"""You are a senior portfolio manager with 20+ years of experience in equity analysis and portfolio construction. Your role is to provide data-driven stock allocation recommendations with specific buy/sell/hold decisions.
@@ -305,34 +318,41 @@ PORTFOLIO CONSTRAINTS:
 - Maximum single stock allocation: 25% of total budget
 - Ensure sector diversification: No more than 40% in any single sector
 
-OUTPUT FORMAT:
-1. PORTFOLIO ASSESSMENT (2-3 sentences):
-   - Current concentration risks and sector exposures
-   - Overall portfolio health assessment
-
-2. ALLOCATION BREAKDOWN:
-   - List each BUY recommendation with percentage allocation and dollar amount
-   - Ensure total equals 100% of ${self.investment_amount}
-   - Justify allocation percentages based on conviction level and risk
-
-3. INDIVIDUAL STOCK RECOMMENDATIONS:
-   For each stock provide:
-   Ticker: RECOMMENDATION (BUY/SELL/HOLD)
-   Investment Amount: $X (for BUY only)
-   Key Metrics: Current P/E [X], Target Upside [X%], Analyst Rating [X], Revenue Growth [X%]
-   Reasoning: 2-3 sentences explaining the decision based on the criteria above
-
-4. RISK WARNINGS (if applicable):
-   - Flag any stocks with elevated risk (high beta, negative news, valuation concerns)
-   - Note portfolio-level risks (concentration, sector imbalance)
+OUTPUT FORMAT (** STRICTLY FOLLOW THE BELOW JSON FORMAT **):
+You must return ONLY a valid JSON object with the following structure:
+{{
+    "allocation_breakdown": [
+        {{
+            "ticker": "string",
+            "percentage": "string (e.g., '25%')",
+            "investment_amount": "string (e.g., '$2500')"
+        }}
+    ],
+    "individual_stock_recommendations": [
+        {{
+            "ticker": "string",
+            "recommendation": "string (BUY/HOLD/SELL)",
+            "investment_amount": "string (e.g., '$2500' for BUY, '$0' for HOLD/SELL)",
+            "key_metrics": "string (Current P/E [X], Target Upside [X%], Analyst Rating [X], Revenue Growth [X%])",
+            "reasoning": "string (2-3 sentences explaining the decision)"
+        }}
+    ],
+    "risk_warnings": [
+        "string (risk warning point 1)",
+        "string (risk warning point 2)"
+    ]
+}}
 
 CRITICAL RULES:
+- Return ONLY valid JSON - no markdown, no extra text, no code blocks, no ```json wrapper
 - Base ALL decisions on the quantitative data provided, not general market knowledge
 - Be consistent: apply the same criteria to all stocks
 - Be objective: no bias toward popular stocks or sectors
-- Show your work: reference specific metrics that drove each decision
+- Reference specific metrics that drove each decision in the reasoning field
 - Ensure total BUY allocations sum exactly to ${self.investment_amount}
-- Do not use asterisks (*) for formatting - use clear paragraph breaks and dashes instead"""
+- IMPORTANT: If the request includes specific DIVERSIFICATION REQUIREMENTS or INVESTMENT PATTERN preferences, prioritize following those instructions
+- If user wants to DIVERSIFY: Focus heavily on sector diversification and risk minimization, potentially recommending lower allocation percentages to existing concentrated sectors
+- If user wants to MAINTAIN EXISTING PATTERN: Analyze and replicate the sector distribution from their existing portfolio"""
 
             # Prepare comprehensive data for analysis
             portfolio_summary = f"""
@@ -342,7 +362,7 @@ Total Investment Budget: {self.investment_amount}
 STOCK ANALYSIS DATA:
 {text_content}
 """
-            
+
             # Create user prompt
             user_prompt = f"""Please analyze this complete investment portfolio and provide specific recommendations:
 
@@ -351,9 +371,9 @@ STOCK ANALYSIS DATA:
             Provide actionable investment decisions with exact dollar amounts for each BUY recommendation, ensuring the total does not exceed ${self.investment_amount}."""
 
             # Generate portfolio recommendations using LLM
-            logger.info(f"Generating comprehensive portfolio recommendations with user_prompt: {user_prompt}")
+            logger.info(f"Generating comprehensive portfolio recommendations")
 
-            max_retries = 3
+            max_retries = 5  # Increased retries to account for JSON validation retries
             base_delay = 1.0
 
             for attempt in range(max_retries):
@@ -364,31 +384,83 @@ STOCK ANALYSIS DATA:
                         logger.info(f"Retrying portfolio analysis after {delay:.2f}s delay (attempt {attempt + 1}/{max_retries})")
                         time.sleep(delay)
 
-                    response = client.models.generate_content(
-                        model="gemini-2.5-pro",
-                        contents=user_prompt,
-                        config=GenerateContentConfig(
-                            system_instruction=[system_prompt],
-                            max_output_tokens=120000,  # Increased for comprehensive portfolio analysis
-                            temperature=0
-                        )
+                    # Call Perplexity API with sonar-pro model
+                    completion = client.chat.completions.create(
+                        messages=[
+                            {
+                                "role": "system",
+                                "content": system_prompt
+                            },
+                            {
+                                "role": "user",
+                                "content": user_prompt
+                            }
+                        ],
+                        model="sonar-pro"
                     )
 
-                    if response and response.text:
-                        # Log successful generation
-                        logger.info(f"Successfully generated portfolio recommendations: {len(response.text)} characters (attempt {attempt + 1})")
+                    response_text = completion.choices[0].message.content if completion and completion.choices else None
 
-                        logger.info(f"Final analysis response: {response.text}")
-                        return response.text
+                    if response_text:
+                        # Log successful generation
+                        logger.info(f"Successfully generated portfolio recommendations: {len(response_text)} characters (attempt {attempt + 1})")
+
+                        # Clean the response text (remove markdown code blocks if present)
+                        cleaned_text = response_text.strip()
+                        if cleaned_text.startswith("```json"):
+                            cleaned_text = cleaned_text[7:]  # Remove ```json
+                        if cleaned_text.startswith("```"):
+                            cleaned_text = cleaned_text[3:]  # Remove ```
+                        if cleaned_text.endswith("```"):
+                            cleaned_text = cleaned_text[:-3]  # Remove trailing ```
+                        cleaned_text = cleaned_text.strip()
+
+                        # Validate JSON
+                        try:
+                            parsed_json = json.loads(cleaned_text)
+
+                            # Validate required fields
+                            required_fields = ["allocation_breakdown", "individual_stock_recommendations", "risk_warnings"]
+                            missing_fields = [field for field in required_fields if field not in parsed_json]
+
+                            if missing_fields:
+                                logger.warning(f"JSON missing required fields: {missing_fields} (attempt {attempt + 1})")
+                                if attempt == max_retries - 1:
+                                    return json.dumps({"error": f"Invalid JSON response: missing fields {missing_fields}"})
+                                continue  # Retry
+
+                            # Return the validated JSON string
+                            logger.info(f"Successfully validated JSON response")
+                            return json.dumps(parsed_json)
+
+                        except json.JSONDecodeError as json_err:
+                            logger.warning(f"Invalid JSON response from LLM (attempt {attempt + 1}): {str(json_err)}")
+                            logger.warning(f"Response text (first 500 chars): {cleaned_text[:500]}")
+
+                            if attempt == max_retries - 1:
+                                # Last attempt - return error with partial response
+                                return json.dumps({
+                                    "error": f"Failed to parse JSON after {max_retries} attempts",
+                                    "raw_response": cleaned_text[:1000],
+                                    "parse_error": str(json_err)
+                                })
+                            continue  # Retry
+
                     else:
                         logger.warning(f"Empty response from LLM for portfolio analysis (attempt {attempt + 1})")
                         if attempt == max_retries - 1:
-                            return f"**Error**: Could not generate portfolio recommendations. Empty response from LLM after {max_retries} attempts."
+                            return json.dumps({"error": f"Empty response from LLM after {max_retries} attempts"})
+
+                except json.JSONDecodeError as json_err:
+                    logger.error(f"JSON parsing error (attempt {attempt + 1}): {str(json_err)}")
+                    if attempt == max_retries - 1:
+                        return json.dumps({"error": f"JSON parsing failed: {str(json_err)}"})
+                    continue  # Retry
 
                 except Exception as llm_error:
                     logger.error(f"LLM API error for portfolio analysis (attempt {attempt + 1}): {str(llm_error)}")
                     if attempt == max_retries - 1:
-                        return f"**Error**: LLM API error for portfolio analysis: {str(llm_error)}. Failed after {max_retries} attempts."
+                        return json.dumps({"error": f"LLM API error: {str(llm_error)}"})
 
                     # Check if it's a quota/rate limit error
                     error_str = str(llm_error).lower()
@@ -396,18 +468,14 @@ STOCK ANALYSIS DATA:
                         logger.warning(f"Rate limit detected for portfolio analysis, increasing delay")
                         base_delay = min(base_delay * 2, 10.0)  # Cap at 10 seconds
 
-        except FileNotFoundError:
-            error_msg = f"Stock analysis file not found: {text_file_path}"
-            logger.error(error_msg)
-            return f"**Error**: {error_msg}. Please ensure the stock analysis has been completed first."
         except Exception as e:
             error_msg = f"Error generating portfolio recommendations: {str(e)}"
             logger.error(error_msg)
-            return f"**Error**: {error_msg}"
+            return json.dumps({"error": error_msg})
 
-    def save_stock_analysis_to_file(self, ticker: str, analysis_data: str) -> str:
+    def save_stock_analysis_to_memory(self, ticker: str, analysis_data: str) -> str:
         """
-        Save stock analysis data to text file.
+        Save stock analysis data to memory.
 
         Args:
             ticker: Stock ticker symbol (e.g., 'AAPL')
@@ -416,23 +484,19 @@ STOCK ANALYSIS DATA:
         Returns:
             Success/error message
         """
-        logger.info(f"Save stock analysis before compression: {analysis_data}")
-        # analysis_data = self._compress_response(analysis_data)
-        logger.info(f"Save stock analysis after compression: {analysis_data}")
         try:
-            logger.info(f"Saving stock analysis for {ticker} to file")
-            file_path = "stock_analysis_results.txt"
+            logger.info(f"Saving stock analysis for {ticker} to memory")
 
-            # Prepare the analysis entry
+            # Store in memory dictionary
             timestamp = datetime.now().isoformat()
-            entry = f"\n{'='*50}\nTicker: {ticker}\nTimestamp: {timestamp}\n{'='*50}\n{analysis_data}\n"
+            self.stock_analysis_data[ticker] = {
+                "ticker": ticker,
+                "timestamp": timestamp,
+                "data": analysis_data
+            }
 
-            # Append to file
-            with open(file_path, 'a') as f:
-                f.write(entry)
-
-            logger.info(f"Successfully saved analysis for {ticker} to {file_path}")
-            return f"Successfully saved analysis for {ticker} to {file_path}"
+            logger.info(f"Successfully saved analysis for {ticker} to memory")
+            return f"Successfully saved analysis for {ticker} to memory"
 
         except Exception as e:
             error_msg = f"Error saving analysis for {ticker}: {e}"
@@ -597,157 +661,143 @@ STOCK ANALYSIS DATA:
 
     def convert_portfolio_analysis_to_html(self, text: str) -> str:
         """
-        Converts portfolio analysis text to HTML email-friendly format.
-        Removes markdown formatting (#, *, etc.) and applies proper HTML styling.
+        Converts portfolio analysis JSON to HTML email-friendly format.
+        Parses JSON format and applies proper HTML styling with color coding.
 
         Args:
-            text: The raw portfolio analysis text with markdown formatting
+            text: The portfolio analysis in JSON format
 
         Returns:
             HTML formatted string suitable for email body
         """
-        lines = text.strip().split('\n')
-        html_parts = []
+        try:
+            # Parse JSON input
+            data = json.loads(text)
 
-        # Start HTML with basic styling
-        html_parts.append('''<html>
+            html_parts = []
+
+            # Start HTML with basic styling
+            html_parts.append('''<html>
 <head>
 <style>
-body { font-family: Arial, sans-serif; line-height: 1.6; color: #333; max-width: 800px; margin: 0 auto; padding: 20px; }
-h1 { color: #2c3e50; border-bottom: 3px solid #3498db; padding-bottom: 10px; font-size: 24px; }
+body { font-family: Arial, sans-serif; line-height: 1.6; color: #333; max-width: 900px; margin: 0 auto; padding: 20px; background-color: #f5f5f5; }
+h1 { color: #2c3e50; border-bottom: 3px solid #3498db; padding-bottom: 10px; font-size: 24px; margin-top: 25px; }
 h2 { color: #34495e; margin-top: 30px; font-size: 20px; }
 h3 { color: #7f8c8d; margin-top: 20px; font-size: 16px; font-weight: bold; }
 .allocation { background-color: #ecf0f1; padding: 15px; border-radius: 5px; margin: 15px 0; }
-.stock-card { background-color: #f8f9fa; border-left: 4px solid #3498db; padding: 15px; margin: 15px 0; }
-.buy { border-left-color: #27ae60; }
-.hold { border-left-color: #f39c12; }
-.sell { border-left-color: #e74c3c; }
+.stock-card { background-color: #ffffff; border-left: 6px solid #3498db; padding: 15px 20px; margin: 15px 0; border-radius: 5px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
+.stock-card p { margin: 8px 0; line-height: 1.5; }
+.buy { border-left-color: #27ae60; background-color: #f0fcf4; }
+.hold { border-left-color: #f39c12; background-color: #fef9f0; }
+.sell { border-left-color: #e74c3c; background-color: #fef5f5; }
 .ticker { font-weight: bold; font-size: 18px; color: #2c3e50; }
-.recommendation { font-weight: bold; padding: 3px 8px; border-radius: 3px; display: inline-block; }
+.recommendation { font-weight: bold; padding: 5px 12px; border-radius: 4px; display: inline-block; font-size: 14px; letter-spacing: 0.5px; }
 .rec-buy { background-color: #27ae60; color: white; }
 .rec-hold { background-color: #f39c12; color: white; }
 .rec-sell { background-color: #e74c3c; color: white; }
 ul { margin: 10px 0; }
 li { margin: 8px 0; }
 .warning { background-color: #fff3cd; border-left: 4px solid #ffc107; padding: 15px; margin: 15px 0; }
+strong { color: #2c3e50; }
 </style>
 </head>
 <body>''')
 
-        i = 0
-        while i < len(lines):
-            line = lines[i].strip()
+            # Add Allocation Breakdown section
+            if 'allocation_breakdown' in data and data['allocation_breakdown']:
+                html_parts.append('<h1>ALLOCATION BREAKDOWN</h1>')
+                html_parts.append('<ul class="allocation">')
 
-            if not line:
-                i += 1
-                continue
+                for allocation in data['allocation_breakdown']:
+                    ticker = allocation.get('ticker', 'N/A')
+                    percentage = allocation.get('percentage', 'N/A')
+                    investment_amount = allocation.get('investment_amount', 'N/A')
+                    html_parts.append(f'<li><strong>{ticker}:</strong> {percentage} - {investment_amount}</li>')
 
-            # Handle headers (remove ### and #)
-            if line.startswith('###'):
-                header_text = line.replace('#', '').strip()
-                html_parts.append(f'<h1>{header_text}</h1>')
-            elif line.startswith('##'):
-                header_text = line.replace('#', '').strip()
-                html_parts.append(f'<h2>{header_text}</h2>')
+                html_parts.append('</ul>')
 
-            # Handle allocation breakdown bullets
-            elif line.startswith('-') and ('**' in line or 'VOO' in line or 'MSFT' in line or 'Total:' in line):
-                # Remove ** and - characters
-                clean_line = line.replace('**', '').replace('-', '').strip()
-                if 'Total:' in clean_line:
-                    # Close any open list before the total
-                    if '<ul' in ''.join(html_parts[-10:]) and '</ul>' not in ''.join(html_parts[-3:]):
-                        html_parts.append('</ul>')
-                    html_parts.append(f'<div class="allocation"><strong>{clean_line}</strong></div>')
-                else:
-                    if '<ul' not in ''.join(html_parts[-3:]):
-                        html_parts.append('<ul class="allocation">')
-                    html_parts.append(f'<li>{clean_line}</li>')
+            # Add Individual Stock Recommendations section
+            if 'individual_stock_recommendations' in data and data['individual_stock_recommendations']:
+                html_parts.append('<h1>INDIVIDUAL STOCK RECOMMENDATIONS</h1>')
 
-            # Handle stock recommendations
-            elif line.startswith('Ticker:'):
-                # Determine recommendation type
-                rec_type = 'hold'
-                rec_class = 'rec-hold'
-                if 'BUY' in line:
-                    rec_type = 'buy'
-                    rec_class = 'rec-buy'
-                elif 'SELL' in line:
-                    rec_type = 'sell'
-                    rec_class = 'rec-sell'
+                for stock in data['individual_stock_recommendations']:
+                    ticker = stock.get('ticker', 'N/A')
+                    recommendation = stock.get('recommendation', 'HOLD').upper()
+                    investment_amount = stock.get('investment_amount', '$0')
+                    key_metrics = stock.get('key_metrics', 'N/A')
+                    reasoning = stock.get('reasoning', 'No reasoning provided')
 
-                # Extract ticker and recommendation
-                parts = line.split(' - RECOMMENDATION')
-                ticker = parts[0].replace('Ticker:', '').replace('**', '').strip()
-                recommendation = parts[1].replace('(', '').replace(')', '').strip() if len(parts) > 1 else 'HOLD'
+                    # Determine card styling based on recommendation
+                    rec_type = 'hold'
+                    rec_class = 'rec-hold'
+                    if recommendation == 'BUY':
+                        rec_type = 'buy'
+                        rec_class = 'rec-buy'
+                    elif recommendation == 'SELL':
+                        rec_type = 'sell'
+                        rec_class = 'rec-sell'
 
-                html_parts.append(f'<div class="stock-card {rec_type}">')
-                html_parts.append(f'<span class="ticker">{ticker}</span> - <span class="recommendation {rec_class}">{recommendation}</span>')
+                    html_parts.append(f'<div class="stock-card {rec_type}">')
+                    html_parts.append(f'<span class="ticker">{ticker}</span> - <span class="recommendation {rec_class}">{recommendation}</span>')
 
-                # Collect all related lines
-                i += 1
-                while i < len(lines) and lines[i].strip() and not lines[i].strip().startswith('Ticker:') and not lines[i].strip().startswith('###') and not lines[i].strip().startswith('**'):
-                    detail_line = lines[i].strip()
-                    if detail_line.startswith('Investment Amount:'):
-                        clean = detail_line.replace('**', '')
-                        html_parts.append(f'<p><strong>{clean}</strong></p>')
-                    elif detail_line.startswith('Key Metrics:'):
-                        clean = detail_line.replace('**', '')
-                        html_parts.append(f'<p><strong>{clean}</strong></p>')
-                    elif detail_line.startswith('Reasoning:'):
-                        clean = detail_line.replace('**', '')
-                        html_parts.append(f'<p><strong>Reasoning:</strong> {clean.replace("Reasoning:", "").strip()}</p>')
-                    else:
-                        # Capture any other detail lines (like continued reasoning text)
-                        clean = detail_line.replace('**', '')
-                        html_parts.append(f'<p>{clean}</p>')
-                    i += 1
+                    if recommendation == 'BUY':
+                        html_parts.append(f'<p><strong>Investment Amount: {investment_amount}</strong></p>')
 
-                html_parts.append('</div>')
-                continue
+                    html_parts.append(f'<p><strong>Key Metrics:</strong> {key_metrics}</p>')
+                    html_parts.append(f'<p><strong>Reasoning:</strong> {reasoning}</p>')
+                    html_parts.append('</div>')
 
-            # Handle section headers like "BUY Recommendations"
-            elif 'Recommendations' in line or 'ALLOCATION BREAKDOWN' in line:
-                # Close any open list before the header
-                if '<ul' in ''.join(html_parts[-10:]) and '</ul>' not in ''.join(html_parts[-3:]):
-                    html_parts.append('</ul>')
-                clean_line = line.replace('**', '').strip()
-                html_parts.append(f'<h3>{clean_line}</h3>')
+            # Add Risk Warnings section
+            if 'risk_warnings' in data and data['risk_warnings']:
+                html_parts.append('<h1>RISK WARNINGS</h1>')
+                html_parts.append('<ul>')
 
-            # Handle regular paragraphs
-            elif line and not line.startswith('-'):
-                # Close any open list before a paragraph
-                if '<ul' in ''.join(html_parts[-10:]) and '</ul>' not in ''.join(html_parts[-3:]):
-                    html_parts.append('</ul>')
-                clean_line = line.replace('**', '').replace('*', '')
-                # Check if this is a risk warning section
-                if 'High Beta Stocks:' in line or 'Sector Concentration:' in line:
-                    if '<div class="warning">' not in ''.join(html_parts[-5:]):
-                        html_parts.append('<div class="warning">')
-                    html_parts.append(f'<p><strong>{clean_line}</strong></p>')
-                else:
-                    html_parts.append(f'<p>{clean_line}</p>')
+                for warning in data['risk_warnings']:
+                    html_parts.append(f'<li>{warning}</li>')
 
-            # Handle bullet points
-            elif line.startswith('-'):
-                clean_line = line.replace('-', '').replace('**', '').strip()
-                if '<ul' not in ''.join(html_parts[-3:]):
-                    html_parts.append('<ul>')
-                html_parts.append(f'<li>{clean_line}</li>')
+                html_parts.append('</ul>')
 
-            i += 1
+            # Close HTML
+            html_parts.append('</body></html>')
 
-        # Close any open tags
-        if '<ul>' in ''.join(html_parts[-10:]) and '</ul>' not in ''.join(html_parts[-5:]):
-            html_parts.append('</ul>')
+            return ''.join(html_parts)
 
-        if '<div class="warning">' in ''.join(html_parts[-20:]) and '</div>' not in ''.join(html_parts[-5:]):
-            html_parts.append('</div>')
-
-        # Close HTML
-        html_parts.append('</body></html>')
-
-        return ''.join(html_parts)
+        except json.JSONDecodeError as e:
+            logger.error(f"Failed to parse JSON in convert_portfolio_analysis_to_html: {e}")
+            # Fallback to simple HTML with error message
+            return f'''<html>
+<head>
+<style>
+body {{ font-family: Arial, sans-serif; padding: 20px; }}
+.error {{ color: #e74c3c; background-color: #fef5f5; padding: 15px; border-left: 4px solid #e74c3c; }}
+</style>
+</head>
+<body>
+<div class="error">
+<h2>Error Processing Portfolio Analysis</h2>
+<p>Failed to parse the portfolio analysis data. Please check the format.</p>
+<p>Error: {str(e)}</p>
+</div>
+<pre>{text}</pre>
+</body>
+</html>'''
+        except Exception as e:
+            logger.error(f"Unexpected error in convert_portfolio_analysis_to_html: {e}")
+            return f'''<html>
+<head>
+<style>
+body {{ font-family: Arial, sans-serif; padding: 20px; }}
+.error {{ color: #e74c3c; background-color: #fef5f5; padding: 15px; border-left: 4px solid #e74c3c; }}
+</style>
+</head>
+<body>
+<div class="error">
+<h2>Unexpected Error</h2>
+<p>An unexpected error occurred while processing the analysis.</p>
+<p>Error: {str(e)}</p>
+</div>
+</body>
+</html>'''
 
     def send_analysis_to_webhook(self, analysis_response: str, email_to: str, webhook_url: Optional[str] = None, username: Optional[str] = None, password: Optional[str] = None) -> str:
         """
@@ -810,6 +860,7 @@ li { margin: 8px 0; }
                 "analysis_response": html_content,
                 "email_to": email_to
             }
+            logger.info(f"html_payload: {html_payload}")
             logger.info(f"Headers: {json.dumps({k: v for k, v in headers.items() if k != 'Authorization'}, indent=2)}")
             logger.info(f"Auth: Basic {encoded_credentials[:10]}...")
             
@@ -871,6 +922,7 @@ li { margin: 8px 0; }
         """
         try:
             logger.info("Starting programmatic stock analysis flow")
+            logger.info(f"Analysis request received from user_id: {self.user_id if hasattr(self, 'user_id') else 'unknown'}, session_id: {self.session_id if hasattr(self, 'session_id') else 'unknown'}")
 
             # Step 1: Save portfolio analysis and extract investment details
             logger.info("Step 1: Saving portfolio analysis and extracting investment details")
@@ -893,6 +945,7 @@ li { margin: 8px 0; }
             all_stocks = existing_stocks + new_stocks
 
             logger.info(f"Extracted {len(existing_stocks)} existing stocks and {len(new_stocks)} new stocks")
+            logger.info(f"Context for analysis - User ID: {self.user_id}, Session ID: {self.session_id}, Email: {self.email_id}, Investment Amount: {self.investment_amount}")
 
             # Step 3: Save investment details to file
             logger.info("Step 3: Saving investment details to file")
@@ -909,22 +962,47 @@ li { margin: 8px 0; }
                     session = await self.stock_mcp_tool._mcp_session_manager.create_session()
                     stock_data = await session.call_tool("get_stock_info", arguments={"symbol": stock})
 
-                    # Save stock analysis result
-                    save_result = self.save_stock_analysis_to_file(stock, str(stock_data))
+                    # Save stock analysis result to memory
+                    save_result = self.save_stock_analysis_to_memory(stock, str(stock_data))
                     logger.info(f"Saved analysis for {stock}: {save_result}")
 
                 except Exception as stock_error:
                     logger.error(f"Error analyzing stock {stock}: {stock_error}")
                     # Continue with other stocks even if one fails
                     error_message = f"Error analyzing {stock}: {str(stock_error)}"
-                    self.save_stock_analysis_to_file(stock, error_message)
+                    self.save_stock_analysis_to_memory(stock, error_message)
 
             # Step 5: Get expert portfolio recommendations
             logger.info("Step 5: Generating expert portfolio recommendations")
-            recommendations = self.get_expert_portfolio_recommendations("stock_analysis_results.txt")
+            recommendations = self.get_expert_portfolio_recommendations()
 
-            # Step 6: Send analysis to webhook
-            logger.info("Step 6: Sending analysis to webhook")
+            # Step 6: Save recommendations to database
+            logger.info("Step 6: Saving recommendations to database")
+            try:
+                # Parse the recommendations JSON
+                recommendations_dict = json.loads(recommendations)
+
+                # Get database session and save
+                db = next(get_db())
+                try:
+                    saved_recommendation = save_stock_recommendation(
+                        db=db,
+                        session_id=self.session_id,
+                        user_id=self.user_id,
+                        recommendation=recommendations_dict
+                    )
+                    if saved_recommendation:
+                        logger.info(f"Successfully saved recommendations to database for session {self.session_id}")
+                    else:
+                        logger.error("Failed to save recommendations to database")
+                finally:
+                    db.close()
+            except Exception as db_error:
+                logger.error(f"Error saving recommendations to database: {db_error}")
+                # Continue with webhook even if database save fails
+
+            # Step 7: Send analysis to webhook
+            logger.info("Step 7: Sending analysis to webhook")
             webhook_result = self.send_analysis_to_webhook(
                 analysis_response=recommendations,
                 email_to=self.email_id
@@ -969,7 +1047,7 @@ The function will return a complete summary of the analysis that was performed."
                 self.execute_programmatic_flow_tool,
                 self.stock_mcp_tool,
                 self.extract_stocks_from_analysis_request_tool,
-                self.save_stock_analysis_to_file_tool,
+                self.save_stock_analysis_to_memory_tool,
                 self.save_portfolio_analysis_to_file_tool,
                 self.save_investment_details_to_file_tool,
                 self.get_expert_portfolio_recommendations_tool,

@@ -10,4 +10,7 @@ dependencies = [
     "python-dotenv",
     "uvicorn",
     "requests",
+    "psycopg2-binary>=2.9.11",
+    "perplexityai",
+    "openai>=1.0.0",
 ] 

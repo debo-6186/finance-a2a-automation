@@ -6,7 +6,7 @@ Handles session management, user tracking, and conversation state.
 import os
 from datetime import datetime
 from typing import Optional
-from sqlalchemy import create_engine, Column, String, Integer, Boolean, DateTime, Text, ForeignKey
+from sqlalchemy import create_engine, Column, String, Integer, Boolean, DateTime, Text, ForeignKey, JSON
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, Session, relationship
 from sqlalchemy.exc import SQLAlchemyError
@@ -16,7 +16,7 @@ import logging
 logger = logging.getLogger(__name__)
 
 # Database configuration
-DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://postgres:password@localhost:5432/finance_a2a")
+DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://debojyotichakraborty@localhost:5432/finance_a2a")
 FREE_USER_MESSAGE_LIMIT = int(os.getenv("FREE_USER_MESSAGE_LIMIT", "30"))
 
 # Create SQLAlchemy engine
@@ -82,16 +82,31 @@ class ConversationMessage(Base):
 class AgentState(Base):
     """State model for tracking agent-specific conversation state."""
     __tablename__ = "agent_states"
-    
+
     id = Column(String, primary_key=True, index=True)
     session_id = Column(String, ForeignKey("conversation_sessions.id"), nullable=False, index=True)
     agent_name = Column(String, nullable=False, index=True)
     state_data = Column(Text, nullable=False)  # JSON string of agent state
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
-    
+
     # Relationships
     session = relationship("ConversationSession", back_populates="agent_states")
+
+
+class StockRecommendation(Base):
+    """Model for storing stock analysis recommendations."""
+    __tablename__ = "stock_recommendations"
+
+    id = Column(String, primary_key=True, index=True)
+    session_id = Column(String, ForeignKey("conversation_sessions.id"), nullable=False, index=True)
+    user_id = Column(String, ForeignKey("users.id"), nullable=False, index=True)
+    recommendation = Column(JSON, nullable=False)  # JSON object containing the recommendation data
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+    # Relationships
+    session = relationship("ConversationSession")
+    user = relationship("User")
 
 
 def get_db() -> Session:
@@ -303,7 +318,7 @@ def mark_portfolio_statement_uploaded(db: Session, session_id: str) -> bool:
             ConversationSession.id == session_id,
             ConversationSession.is_active == True
         ).first()
-        
+
         if session:
             session.portfolio_statement_uploaded = True
             session.updated_at = datetime.utcnow()
@@ -318,3 +333,45 @@ def mark_portfolio_statement_uploaded(db: Session, session_id: str) -> bool:
         db.rollback()
         logger.error(f"Error marking portfolio statement as uploaded for session {session_id}: {e}")
         return False
+
+
+def save_stock_recommendation(db: Session, session_id: str, user_id: str, recommendation: dict) -> Optional[StockRecommendation]:
+    """Save stock recommendation to database."""
+    try:
+        stock_recommendation = StockRecommendation(
+            id=f"{session_id}_{user_id}_{datetime.utcnow().timestamp()}",
+            session_id=session_id,
+            user_id=user_id,
+            recommendation=recommendation
+        )
+        db.add(stock_recommendation)
+        db.commit()
+        db.refresh(stock_recommendation)
+        logger.info(f"Saved stock recommendation for session {session_id}, user {user_id}")
+        return stock_recommendation
+    except SQLAlchemyError as e:
+        db.rollback()
+        logger.error(f"Error saving stock recommendation for session {session_id}: {e}")
+        return None
+
+
+def get_stock_recommendation(db: Session, session_id: str) -> Optional[StockRecommendation]:
+    """Get stock recommendation for a session."""
+    try:
+        return db.query(StockRecommendation).filter(
+            StockRecommendation.session_id == session_id
+        ).order_by(StockRecommendation.created_at.desc()).first()
+    except SQLAlchemyError as e:
+        logger.error(f"Error getting stock recommendation for session {session_id}: {e}")
+        return None
+
+
+def get_user_stock_recommendations(db: Session, user_id: str) -> list:
+    """Get all stock recommendations for a user."""
+    try:
+        return db.query(StockRecommendation).filter(
+            StockRecommendation.user_id == user_id
+        ).order_by(StockRecommendation.created_at.desc()).all()
+    except SQLAlchemyError as e:
+        logger.error(f"Error getting stock recommendations for user {user_id}: {e}")
+        return []

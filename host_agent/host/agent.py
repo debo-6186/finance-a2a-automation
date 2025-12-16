@@ -59,6 +59,7 @@ class HostAgent:
         self.new_stocks: List[str] = []
         self.investment_amount: float = 0.0
         self.receiver_email_id: str = ""
+        self.diversification_preference: str = ""  # "keep_pattern" or "diversify"
         self.current_session_id = {"id": "", "is_file_uploaded": False}  # Store current session info
         self._agent = self.create_agent()
         self._user_id = "host_agent"
@@ -150,6 +151,7 @@ class HostAgent:
                         FunctionTool(self.check_file_upload_status),
                         FunctionTool(self.store_stock_report_response),
                         FunctionTool(self.store_investment_amount),
+                        FunctionTool(self.store_diversification_preference),
                         FunctionTool(self.store_receiver_email_id),
                         FunctionTool(self.get_investment_amount),
                         FunctionTool(self.add_existing_stocks),
@@ -214,27 +216,39 @@ class HostAgent:
 
         **STEP 4:** After user provides investment amount:
         - Store the investment amount using `store_investment_amount`
-        
-        - Ask user: "Do you want to invest in any other stocks? You can choose from automobile, technology, or financial sectors in India or USA, or specify any other sector. 
+
+        - Ask user: "What type of investor are you? Please describe your investment strategy. For example:
+          • 'I'm a long-term investor looking for stable growth over 5-10 years'
+          • 'I'm a short-term trader looking to make quick gains in 3-6 months'
+          • 'I only want to invest in healthcare and pharmaceutical stocks'
+          • 'I want high-risk, high-reward technology stocks'
+          • 'I prefer dividend-paying stocks for passive income'
+          • Or describe your own strategy"
+        - Wait for user response and store it using `store_diversification_preference`
+        - The user's investment strategy MUST be considered and highlighted in the final stock allocation analysis
+        - Store the complete strategy description to ensure stock analyser agent can tailor recommendations accordingly
+
+        **STEP 5:** After storing diversification preference:
+        - Ask user: "Do you want to invest in any other stocks? You can choose from automobile, technology, or financial sectors in India or USA, or specify any other sector."
         - Tell user that they can choose a specific stock or a sector. Tell user that you can give list of top stocks in a sector"
         - If user mentions a sector: Use `suggest_stocks_by_category` to get stocks from that sector, then add user selected stocks using `add_new_stocks`
         - ** You must show the stocks from the sector to the user, till user confirms the selection.**
         - If user mentions a specific stock: Add them using `add_new_stocks`
 
-        **STEP 5:** Ask user the email id to send the analysis to and store it using `store_receiver_email_id`
-        - When `store_receiver_email_id` is called and all prerequisites are met (portfolio uploaded, investment amount set, stocks selected), STEP 6 will be automatically triggered
+        **STEP 6:** Ask user the email id to send the analysis to and store it using `store_receiver_email_id`
+        - When `store_receiver_email_id` is called and all prerequisites are met (portfolio uploaded, investment amount set, diversification preference set, stocks selected), STEP 7 will be automatically triggered
         - The session will end with confirmation message: "Stock analysis in progress, we will email you the stock allocation report"
 
-        **STEP 6:** Prepare comprehensive analysis (automatically triggered by `store_receiver_email_id`):
+        **STEP 7:** Prepare comprehensive analysis (automatically triggered by `store_receiver_email_id`):
         - `store_receiver_email_id` will automatically call `analyze_all_stocks` to prepare the analysis request
         - When `store_receiver_email_id` returns a JSON string, return exactly that JSON string as your response
         - DO NOT WAIT for response from stock analyser agent - return the response from `store_receiver_email_id` immediately
 
         **CRITICAL RULES:**
         - NEVER skip any step
-        - ALWAYS wait for agent responses before proceeding (EXCEPT for stock_analyser_agent in STEP 6)
+        - ALWAYS wait for agent responses before proceeding (EXCEPT for stock_analyser_agent in STEP 7)
         - ALWAYS use the exact tools specified
-        - ALWAYS inform user about waiting times (EXCEPT in STEP 6 where analysis happens in background)
+        - ALWAYS inform user about waiting times (EXCEPT in STEP 7 where analysis happens in background)
 
         **AVAILABLE SECTORS:**
         * **ONLY suggest stocks from stock_data.json**: Never suggest sectors or stocks that aren't in the available data. The available categories are:
@@ -255,6 +269,7 @@ class HostAgent:
         * `check_file_upload_status`: Check if file has been uploaded for current session
         * `store_stock_report_response`: Manually store stock report response
         * `store_investment_amount`: Store the investment amount
+        * `store_diversification_preference`: Store user's choice to keep existing pattern or diversify
         * `store_receiver_email_id`: Store the email ID to send analysis to
         * `add_existing_stocks`: Add stocks from portfolio statement
         * `add_new_stocks`: Add new stocks user wants to consider
@@ -265,9 +280,9 @@ class HostAgent:
         * `test_agent_connection`: Test connection to a specific agent (for debugging)
 
         **Directives:**
-        * **FOLLOW THE STRICT WORKFLOW EXACTLY** - Do not deviate from the 6 steps outlined above
-        * **ALWAYS WAIT** for agent responses before proceeding to the next step (EXCEPT in STEP 6 with stock_analyser_agent)
-        * **ALWAYS INFORM** users about waiting times (about a minute), except in STEP 6 where analysis happens in background
+        * **FOLLOW THE STRICT WORKFLOW EXACTLY** - Do not deviate from the 7 steps outlined above
+        * **ALWAYS WAIT** for agent responses before proceeding to the next step (EXCEPT in STEP 7 with stock_analyser_agent)
+        * **ALWAYS INFORM** users about waiting times (about a minute), except in STEP 7 where analysis happens in background
         * **ONLY COORDINATE AND DELEGATE** - Do not perform any analysis yourself
         * Use the provided tools to create lists and delegate to other agents
         * Do not invent or assume any financial data
@@ -648,6 +663,28 @@ class HostAgent:
         logger.info(f"Stored investment amount: ${amount:,.2f}")
         return f"Investment amount stored successfully: ${amount:,.2f}"
 
+    def store_diversification_preference(self, preference: str):
+        """Stores the user's diversification preference.
+
+        Args:
+            preference: Either 'keep_pattern' to maintain existing investment pattern,
+                       or 'diversify' to minimize risk through diversification
+        """
+        preference_lower = preference.lower().strip()
+        if "keep" in preference_lower or "same" in preference_lower or "existing" in preference_lower or "current" in preference_lower:
+            self.diversification_preference = "keep_pattern"
+            logger.info("User chose to keep existing investment pattern")
+            return "Diversification preference stored: Keep existing investment pattern"
+        elif "divers" in preference_lower or "risk" in preference_lower or "different" in preference_lower:
+            self.diversification_preference = "diversify"
+            logger.info("User chose to diversify to minimize risk")
+            return "Diversification preference stored: Diversify to minimize risk"
+        else:
+            # Default to keep_pattern if unclear
+            self.diversification_preference = "keep_pattern"
+            logger.info("Unclear preference, defaulting to keep existing pattern")
+            return "Diversification preference stored: Keep existing investment pattern (default)"
+
     def store_receiver_email_id(self, email_id: str):
         """Stores the receiver email ID for sending stock analysis."""
         self.receiver_email_id = email_id
@@ -657,7 +694,8 @@ class HostAgent:
         has_portfolio = False
         has_investment_amount = self.investment_amount > 0
         has_stocks = len(self.existing_portfolio_stocks) > 0 or len(self.new_stocks) > 0
-        
+        has_diversification_pref = bool(self.diversification_preference)
+
         # Check if portfolio statement is uploaded
         try:
             session_id = self.current_session_id["id"]
@@ -670,9 +708,9 @@ class HostAgent:
         except Exception as e:
             logger.warning(f"Could not check portfolio upload status: {e}")
             has_portfolio = self.current_session_id.get("is_file_uploaded", False)
-        
+
         # If all conditions are met, trigger stock analysis and return end session message
-        if has_portfolio and has_investment_amount and has_stocks:
+        if has_portfolio and has_investment_amount and has_stocks and has_diversification_pref:
             logger.info(f"All prerequisites met for email {email_id}. Triggering stock analysis.")
             
             # Execute STEP 6: Prepare comprehensive analysis
@@ -711,8 +749,10 @@ class HostAgent:
                 missing.append("investment amount")
             if not has_stocks:
                 missing.append("stocks selection")
+            if not has_diversification_pref:
+                missing.append("diversification preference")
             logger.info(f"Prerequisites not met for {email_id}. Missing: {', '.join(missing)}")
-            
+
             return f"Receiver email ID stored successfully: {email_id}"
 
     def get_investment_amount(self):
@@ -887,10 +927,10 @@ Return ONLY a JSON array of uppercase ticker symbols. If a name is already a tic
     def analyze_all_stocks(self):
         """Creates a comprehensive list of stocks to analyze and prepares the delegation request."""
         all_stocks = self.existing_portfolio_stocks + self.new_stocks
-        
+
         if not all_stocks:
             return "No stocks available for analysis. Please add stocks to the lists first."
-        
+
         # Create the delegation request with the list of stocks to analyze
         # Include portfolio report if available, otherwise proceed without it
         portfolio_section = ""
@@ -904,7 +944,33 @@ Return ONLY a JSON array of uppercase ticker symbols. If a name is already a tic
         **PORTFOLIO REPORT:**
         No existing portfolio report available. Proceeding with analysis based on selected stocks only.
         """
-        
+
+        # Add user's investment strategy to the delegation request
+        strategy_instruction = ""
+        if self.diversification_preference and self.diversification_preference.strip():
+            strategy_instruction = f"""
+        **USER'S INVESTMENT STRATEGY:**
+        {self.diversification_preference}
+
+        **CRITICAL REQUIREMENT:**
+        - The stock allocation and recommendations MUST align with the user's investment strategy described above
+        - Highlight in your analysis how each recommendation fits the user's stated investment goals
+        - Tailor risk levels, time horizons, and sector preferences according to the user's strategy
+        - If the user specified sector preferences, prioritize those sectors
+        - If the user specified risk appetite (high/low risk), adjust recommendations accordingly
+        - If the user specified time horizon (long-term/short-term), factor that into your analysis
+        """
+        else:
+            # Default behavior if strategy not set
+            strategy_instruction = """
+        **INVESTMENT APPROACH:**
+        Provide balanced recommendations considering both growth and risk management.
+        """
+
+        # Include user ID and session ID in the delegation request
+        session_id = self.current_session_id.get("id", "unknown")
+        user_id = self._user_id
+
         delegation_request = f"""
         **STOCKS TO ANALYZE - DELEGATION REQUEST**
         {portfolio_section}
@@ -913,20 +979,27 @@ Return ONLY a JSON array of uppercase ticker symbols. If a name is already a tic
         - New Stocks to Consider: {', '.join(self.new_stocks) if self.new_stocks else 'None'}
         - Total Stocks for Analysis: {len(all_stocks)}
 
+        **USER ID:**
+        {user_id}
+
+        **SESSION ID:**
+        {session_id}
+
         **INVESTMENT AMOUNT:**
         {self.investment_amount}
 
         **RECEIVER EMAIL ID:**
         {self.receiver_email_id if self.receiver_email_id else 'Not specified'}
-
+        {strategy_instruction}
         **DELEGATION INSTRUCTIONS:**
         Please analyze all the stocks listed above and provide comprehensive recommendations.
         Consider the portfolio report for context and provide allocation suggestions.
         Consider the investment amount and provide allocation suggestions.
+        IMPORTANT: Follow the user's investment strategy requirements specified above and ensure your recommendations clearly demonstrate alignment with their stated goals.
         """
-        
-        logger.info(f"Created list of {len(all_stocks)} stocks to analyze")
-        
+
+        logger.info(f"Created list of {len(all_stocks)} stocks to analyze with diversification preference: {self.diversification_preference}")
+
         # Return the delegation request that should be sent to stock analyser agent
         return delegation_request.strip()
 

@@ -117,4 +117,21 @@ venv/
 .env
 
 # Firebase credentials
-*firebase-adminsdk*.json 
+*firebase-adminsdk*.json
+
+# Terraform
+**/.terraform/*
+*.tfstate
+*.tfstate.*
+*.tfvars
+!*.tfvars.example
+tfplan
+tfplan.json
+crash.log
+crash.*.log
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+.terraformrc
+terraform.rc

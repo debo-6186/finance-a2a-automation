@@ -1,0 +1,109 @@
+version: '3.8'
+
+services:
+  postgres:
+    image: postgres:15
+    container_name: finance_a2a_postgres
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-finance_a2a}
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d finance_a2a"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - finance_network
+
+  stockreport_analyser_agent:
+    build:
+      context: ./stockreport_analyser_agent
+      dockerfile: Dockerfile
+    container_name: stockreport_analyser_agent
+    environment:
+      - GOOGLE_API_KEY=${GOOGLE_API_KEY}
+      - GOOGLE_GENAI_USE_VERTEXAI=${GOOGLE_GENAI_USE_VERTEXAI:-FALSE}
+    ports:
+      - "10003:10003"
+    restart: unless-stopped
+    networks:
+      - finance_network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:10003/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  stockanalyser_agent:
+    build:
+      context: ./stockanalyser_agent
+      dockerfile: Dockerfile
+    container_name: stockanalyser_agent
+    environment:
+      - GOOGLE_API_KEY=${GOOGLE_API_KEY}
+      - GOOGLE_GENAI_USE_VERTEXAI=${GOOGLE_GENAI_USE_VERTEXAI:-FALSE}
+      - PERPLEXITY_API_KEY=${PERPLEXITY_API_KEY}
+      - ACTIVEPIECES_USERNAME=${ACTIVEPIECES_USERNAME}
+      - ACTIVEPIECES_PASSWORD=${ACTIVEPIECES_PASSWORD}
+      - ACTIVEPIECES_WEBHOOK_URL=${ACTIVEPIECES_WEBHOOK_URL}
+      - DATABASE_URL=postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-finance_a2a}
+    ports:
+      - "10002:10002"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      - finance_network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:10002/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  host_agent:
+    build:
+      context: ./host_agent
+      dockerfile: Dockerfile
+    container_name: host_agent
+    environment:
+      - GOOGLE_API_KEY=${GOOGLE_API_KEY}
+      - GOOGLE_GENAI_USE_VERTEXAI=${GOOGLE_GENAI_USE_VERTEXAI:-FALSE}
+      - DATABASE_URL=postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-finance_a2a}
+      - FIREBASE_PROJECT_ID=${FIREBASE_PROJECT_ID}
+      - FIREBASE_SERVICE_ACCOUNT_PATH=${FIREBASE_SERVICE_ACCOUNT_PATH}
+      - FREE_USER_MESSAGE_LIMIT=${FREE_USER_MESSAGE_LIMIT:-30}
+      - ACTIVEPIECES_USERNAME=${ACTIVEPIECES_USERNAME}
+      - ACTIVEPIECES_PASSWORD=${ACTIVEPIECES_PASSWORD}
+      - STOCK_ANALYSER_URL=http://stockanalyser_agent:10002
+      - STOCK_REPORT_ANALYSER_URL=http://stockreport_analyser_agent:10003
+    ports:
+      - "10001:10001"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      stockanalyser_agent:
+        condition: service_healthy
+      stockreport_analyser_agent:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      - finance_network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:10001/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+volumes:
+  postgres_data:
+
+networks:
+  finance_network:
+    driver: bridge
