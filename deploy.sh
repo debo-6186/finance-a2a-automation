@@ -51,7 +51,8 @@ print_info "AWS Account ID: $AWS_ACCOUNT_ID"
 # Step 1: Create ECR Repositories
 print_info "Step 1/6: Creating ECR repositories..."
 
-for repo in host-agent stockanalyser-agent stockreport-agent; do
+# Note: stockreport-agent removed - now integrated into host-agent
+for repo in host-agent stockanalyser-agent; do
     if aws ecr describe-repositories --repository-names ${PROJECT_NAME}/${repo} --region $AWS_REGION 2>/dev/null; then
         print_warning "ECR repository ${PROJECT_NAME}/${repo} already exists"
     else
@@ -72,24 +73,19 @@ aws ecr get-login-password --region $AWS_REGION | \
 
 # Build and push Host Agent
 print_info "Building Host Agent..."
-docker build -f host_agent/Dockerfile -t ${PROJECT_NAME}/host-agent:latest .
+docker build --platform linux/amd64 -f host_agent/Dockerfile -t ${PROJECT_NAME}/host-agent:latest .
 docker tag ${PROJECT_NAME}/host-agent:latest \
     ${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${PROJECT_NAME}/host-agent:latest
 docker push ${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${PROJECT_NAME}/host-agent:latest
 
 # Build and push Stock Analyser Agent
 print_info "Building Stock Analyser Agent..."
-docker build -f stockanalyser_agent/Dockerfile -t ${PROJECT_NAME}/stockanalyser-agent:latest .
+docker build --platform linux/amd64 -f stockanalyser_agent/Dockerfile -t ${PROJECT_NAME}/stockanalyser-agent:latest .
 docker tag ${PROJECT_NAME}/stockanalyser-agent:latest \
     ${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${PROJECT_NAME}/stockanalyser-agent:latest
 docker push ${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${PROJECT_NAME}/stockanalyser-agent:latest
 
-# Build and push Stock Report Agent
-print_info "Building Stock Report Analyser Agent..."
-docker build -f stockreport_analyser_agent/Dockerfile -t ${PROJECT_NAME}/stockreport-agent:latest .
-docker tag ${PROJECT_NAME}/stockreport-agent:latest \
-    ${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${PROJECT_NAME}/stockreport-agent:latest
-docker push ${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${PROJECT_NAME}/stockreport-agent:latest
+# Stock Report Agent removed - now integrated into Host Agent
 
 print_info "All images built and pushed successfully!"
 
@@ -121,7 +117,8 @@ fi
 # Step 5: Create CloudWatch Log Groups
 print_info "Step 5/6: Creating CloudWatch log groups..."
 
-for agent in host-agent stockanalyser-agent stockreport-agent; do
+# Note: stockreport-agent removed - now integrated into host-agent
+for agent in host-agent stockanalyser-agent; do
     LOG_GROUP="/ecs/${PROJECT_NAME}-${agent}"
     if aws logs describe-log-groups --log-group-name-prefix $LOG_GROUP --region $AWS_REGION --query 'logGroups[0]' 2>/dev/null | grep -q "$LOG_GROUP"; then
         print_warning "Log group $LOG_GROUP already exists"
@@ -154,6 +151,7 @@ ${YELLOW}Next Steps:${NC}
 4. Create and deploy ECS task definitions (see AWS_DEPLOYMENT_GUIDE.md)
 5. Create Application Load Balancer
 6. Create ECS services
+
 
 For detailed instructions, see: AWS_DEPLOYMENT_GUIDE.md
 

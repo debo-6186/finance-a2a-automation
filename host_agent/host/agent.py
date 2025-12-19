@@ -3,9 +3,11 @@ import json
 import uuid
 import os
 import time
+import threading
 from datetime import datetime
 from typing import Any, AsyncIterable, List
 
+import boto3
 import httpx
 import nest_asyncio
 from a2a.client import A2ACardResolver
@@ -17,8 +19,6 @@ from a2a.types import (
     SendMessageSuccessResponse,
     Task,
 )
-from google.cloud import storage
-from google.oauth2 import service_account
 from dotenv import load_dotenv
 from google.adk import Agent
 from google.adk.agents.readonly_context import ReadonlyContext
@@ -29,8 +29,18 @@ from google.adk.sessions import InMemorySessionService
 from google.adk.tools import FunctionTool
 from google.genai import types
 from .remote_agent_connection import RemoteAgentConnections
+from .pdf_analyzer import read_portfolio_statement, extract_stock_tickers_from_portfolio
 import logging
 from logging.handlers import RotatingFileHandler
+
+# Import database functions and models at the top
+try:
+    from database import get_db, get_session, mark_portfolio_statement_uploaded, User
+except ImportError:
+    # Handle case where database module is in parent directory
+    import sys
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    from database import get_db, get_session, mark_portfolio_statement_uploaded, User
 
 load_dotenv()
 nest_asyncio.apply()
@@ -60,7 +70,7 @@ class HostAgent:
         self.investment_amount: float = 0.0
         self.receiver_email_id: str = ""
         self.diversification_preference: str = ""  # "keep_pattern" or "diversify"
-        self.current_session_id = {"id": "", "is_file_uploaded": False}  # Store current session info
+        self.current_session_id = {"id": "", "user_id": "", "is_file_uploaded": False}  # Store current session info
         self._agent = self.create_agent()
         self._user_id = "host_agent"
         self._runner = Runner(
@@ -149,6 +159,7 @@ class HostAgent:
                         FunctionTool(self.send_message),
                         FunctionTool(self.store_portfolio_file),
                         FunctionTool(self.check_file_upload_status),
+                        FunctionTool(self.read_and_analyze_portfolio),
                         FunctionTool(self.store_stock_report_response),
                         FunctionTool(self.store_investment_amount),
                         FunctionTool(self.store_diversification_preference),
@@ -202,21 +213,22 @@ class HostAgent:
         - First tell user: "Please upload your latest portfolio statement (PDF format)."
         - Use `check_file_upload_status` tool to check if file has been uploaded
         - Once file IS uploaded, inform user: "Your portfolio statement has been uploaded"
-        - IMMEDIATELY use `send_message` to send portfolio statement to `stock_report_analyser_agent`
-        - The task message should include session ID for tracking: "Please analyze the portfolio statement. Session ID: [current_session_id]"
+        - IMMEDIATELY use `read_and_analyze_portfolio` tool with current session ID to analyze the portfolio locally
         - Tell user: "I'm analyzing your portfolio statement. This will take about a minute."
-        - WAIT for response from stock report analyser agent
+        - WAIT for response from read_and_analyze_portfolio tool
 
-        **STEP 2:** After getting response from stock report analyser agent:
-        - Store the response automatically
+        **STEP 2:** After getting response from read_and_analyze_portfolio tool:
+        - The response is automatically stored
         - Extract existing stocks from the response and add them using `add_existing_stocks`
         - Show user their existing stock list (no analysis, just the list)
 
-        **STEP 3:** Ask user: "How much do you want to invest?"
-
-        **STEP 4:** After user provides investment amount:
+        **STEP 3:** ONLY IF investment_amount is NOT set (check using get_investment_amount):
+        - Ask user: "How much do you want to invest?"
+        - WAIT for user response
         - Store the investment amount using `store_investment_amount`
+        - IMMEDIATELY proceed to STEP 4 - do NOT wait for additional user input
 
+        **STEP 4:** ONLY IF diversification_preference is NOT set:
         - Ask user: "What type of investor are you? Please describe your investment strategy. For example:
           • 'I'm a long-term investor looking for stable growth over 5-10 years'
           • 'I'm a short-term trader looking to make quick gains in 3-6 months'
@@ -224,31 +236,46 @@ class HostAgent:
           • 'I want high-risk, high-reward technology stocks'
           • 'I prefer dividend-paying stocks for passive income'
           • Or describe your own strategy"
-        - Wait for user response and store it using `store_diversification_preference`
-        - The user's investment strategy MUST be considered and highlighted in the final stock allocation analysis
-        - Store the complete strategy description to ensure stock analyser agent can tailor recommendations accordingly
+        - WAIT for user response
+        - Store it using `store_diversification_preference` - this stores the COMPLETE strategy text
+        - IMMEDIATELY proceed to STEP 5 - do NOT wait for additional user input
 
-        **STEP 5:** After storing diversification preference:
-        - Ask user: "Do you want to invest in any other stocks? You can choose from automobile, technology, or financial sectors in India or USA, or specify any other sector."
-        - Tell user that they can choose a specific stock or a sector. Tell user that you can give list of top stocks in a sector"
-        - If user mentions a sector: Use `suggest_stocks_by_category` to get stocks from that sector, then add user selected stocks using `add_new_stocks`
-        - ** You must show the stocks from the sector to the user, till user confirms the selection.**
+        **STEP 5:** ONLY IF no new stocks have been discussed yet:
+        - Ask user: "Do you want to invest in any other stocks besides your existing portfolio? You can:
+          • Choose from automobile, technology, or financial sectors in India or USA
+          • Specify a specific stock ticker
+          • Say 'no' if you only want to analyze your existing portfolio"
+        - If user mentions a sector: Use `suggest_stocks_by_category` to show stocks, wait for user to select specific tickers, then add using `add_new_stocks`
         - If user mentions a specific stock: Add them using `add_new_stocks`
+        - If user says 'no' or doesn't want additional stocks: Proceed to STEP 6 WITHOUT adding any new stocks
+        - AFTER stocks are added OR user declines, IMMEDIATELY proceed to STEP 6
 
-        **STEP 6:** Ask user the email id to send the analysis to and store it using `store_receiver_email_id`
-        - When `store_receiver_email_id` is called and all prerequisites are met (portfolio uploaded, investment amount set, diversification preference set, stocks selected), STEP 7 will be automatically triggered
-        - The session will end with confirmation message: "Stock analysis in progress, we will email you the stock allocation report"
+        **STEP 6:** ONLY IF receiver_email_id is NOT set (not yet asked):
+        - Ask user: "Please provide your email address so we can send you the detailed stock allocation report."
+        - WAIT for user response
+        - When user provides their email address, you MUST immediately execute: `store_receiver_email_id(email_id="<user's email>")`
+        - This is a FUNCTION CALL that you must EXECUTE - not describe, not simulate, EXECUTE IT
+        - DO NOT return any response until AFTER calling this tool
+        - Return EXACTLY what the tool returns without modification
+        - The tool will automatically trigger the stock analysis and return the completion message
 
-        **STEP 7:** Prepare comprehensive analysis (automatically triggered by `store_receiver_email_id`):
-        - `store_receiver_email_id` will automatically call `analyze_all_stocks` to prepare the analysis request
-        - When `store_receiver_email_id` returns a JSON string, return exactly that JSON string as your response
-        - DO NOT WAIT for response from stock analyser agent - return the response from `store_receiver_email_id` immediately
+        **CRITICAL REQUIREMENT**:
+        - If you skip calling `store_receiver_email_id`, the analysis will NEVER be sent to the user
+        - You CANNOT predict what the tool will return - you MUST call it to get the actual response
+        - NEVER generate text like "Stock analysis in progress" yourself - only the tool can return this
+        - After calling this tool, the conversation should END (the tool will return end_session signal)
 
         **CRITICAL RULES:**
-        - NEVER skip any step
-        - ALWAYS wait for agent responses before proceeding (EXCEPT for stock_analyser_agent in STEP 7)
+        - BEFORE asking for any information, check if you already have it stored:
+          * Use `get_investment_amount` to check if investment amount is set
+          * Use `get_stock_lists` to check current state of all stored information
+          * Check if you've already stored diversification_preference, receiver_email_id, etc.
+        - NEVER ask the same question twice - if information is already stored, skip that step
+        - Each step should only execute ONCE per session
+        - ALWAYS wait for agent responses before proceeding (EXCEPT for stock_analyser_agent in STEP 6)
         - ALWAYS use the exact tools specified
-        - ALWAYS inform user about waiting times (EXCEPT in STEP 7 where analysis happens in background)
+        - ALWAYS inform user about waiting times (EXCEPT in STEP 6 where analysis happens in background)
+        - After completing all steps and calling `store_receiver_email_id`, the session ENDS automatically
 
         **AVAILABLE SECTORS:**
         * **ONLY suggest stocks from stock_data.json**: Never suggest sectors or stocks that aren't in the available data. The available categories are:
@@ -264,9 +291,10 @@ class HostAgent:
         est diversification into sectors not in stock_data.json. Only work with the available data.
 
         **Available Tools:**
-        * `send_message`: Delegate tasks to other agents
+        * `send_message`: Delegate tasks to Stock Analyser Agent for comprehensive analysis
         * `store_portfolio_file`: Store uploaded portfolio file to Google Cloud Storage
         * `check_file_upload_status`: Check if file has been uploaded for current session
+        * `read_and_analyze_portfolio`: Analyze portfolio PDF locally and extract stock tickers
         * `store_stock_report_response`: Manually store stock report response
         * `store_investment_amount`: Store the investment amount
         * `store_diversification_preference`: Store user's choice to keep existing pattern or diversify
@@ -298,13 +326,13 @@ class HostAgent:
         """
 
     async def stream(
-        self, query: str, session_id: str
+        self, query: str, session_id: str, user_id: str = ""
     ) -> AsyncIterable[dict[str, Any]]:
         """
         Streams the agent's response to a given query.
         """
-        # Store the current session ID for use in tool functions
-        self.current_session_id = {"id": session_id, "is_file_uploaded": False}
+        # Store the current session ID and user ID for use in tool functions
+        self.current_session_id = {"id": session_id, "user_id": user_id, "is_file_uploaded": False}
         session = await self._runner.session_service.get_session(
             app_name=self._agent.name,
             user_id=self._user_id,
@@ -394,8 +422,11 @@ class HostAgent:
         )
         
         try:
-            logger.info(f"Sending message to {agent_name} with task length: {len(task)} characters")
-            
+            logger.info(f"========== ASYNC MESSAGE SEND STARTING ==========")
+            logger.info(f"Agent: {agent_name}, Task length: {len(task)} characters")
+            logger.info(f"Context ID: {context_id}, Message ID: {message_id}")
+            logger.info(f"Connection URL: {connection}")
+
             # Create a completely fresh httpx client and A2AClient for this request
             async with httpx.AsyncClient(
                 timeout=httpx.Timeout(300.0, connect=60.0, read=300.0, write=60.0),
@@ -553,46 +584,54 @@ class HostAgent:
         """Send message in background without blocking."""
         import threading
         import asyncio
-        
+
+        logger.info(f"========== SEND_MESSAGE_BACKGROUND CALLED ==========")
+        logger.info(f"========== AGENT: {agent_name} ==========")
+        logger.info(f"========== TASK LENGTH: {len(task)} characters ==========")
+
         def run_in_background():
             try:
+                logger.info(f"Background thread started for {agent_name}")
                 asyncio.run(self._send_message_async(agent_name, task))
+                logger.info(f"Background thread completed successfully for {agent_name}")
             except Exception as e:
-                logger.error(f"Background send_message failed: {e}")
-        
-        threading.Thread(target=run_in_background, daemon=True).start()
-        logger.info(f"Started background task to send message to {agent_name}")
+                logger.error(f"Background send_message failed for {agent_name}: {e}")
+                import traceback
+                logger.error(f"Traceback: {traceback.format_exc()}")
+
+        thread = threading.Thread(target=run_in_background, daemon=True)
+        thread.start()
+        logger.info(f"Started background task to send message to {agent_name} (thread: {thread.name})")
 
     def store_portfolio_file(self, user_name: str, file_path: str, session_id: str):
-        """Stores the uploaded portfolio file to Google Cloud Storage bucket."""
+        """Stores the uploaded portfolio file to AWS S3 bucket."""
         try:
             # Use provided session_id
             target_session_id = session_id
-            
+
             # Generate filename using the specified format
             filename = f"{user_name}_{target_session_id}_portfolio_statement.pdf"
-            
+
             logger.info(f"Portfolio file upload requested for user: {user_name}")
             logger.info(f"Source file path: {file_path}")
-            logger.info(f"Target GCS filename: {filename}")
+            logger.info(f"Target S3 filename: {filename}")
             logger.info(f"Session ID: {target_session_id}")
-            
-            # Load credentials from environment variable
-            credentials_path = os.getenv('FIREBASE_SERVICE_ACCOUNT_PATH')
-            if credentials_path:
-                credentials = service_account.Credentials.from_service_account_file(credentials_path)
-                client = storage.Client(credentials=credentials)
-            else:
-                client = storage.Client()  # Fall back to default credentials
-            
-            bucket = client.bucket('portfolio_statements')
-            blob = bucket.blob(filename)
-            blob.upload_from_filename(file_path)
-            
+
+            # Get S3 bucket name from environment
+            bucket_name = os.getenv('S3_BUCKET_NAME', 'finance-a2a-portfolio-statements')
+            logger.info(f"Using S3 bucket: {bucket_name}")
+
+            # Initialize S3 client
+            s3_client = boto3.client('s3')
+
+            # Upload file to S3
+            s3_client.upload_file(file_path, bucket_name, filename)
+
+            logger.info(f"File uploaded to S3: s3://{bucket_name}/{filename}")
+
             # Update database to mark portfolio statement as uploaded
             if target_session_id:
                 try:
-                    from database import get_db, mark_portfolio_statement_uploaded
                     db = next(get_db())
                     success = mark_portfolio_statement_uploaded(db, target_session_id)
                     if success:
@@ -603,9 +642,9 @@ class HostAgent:
                 except Exception as db_error:
                     logger.error(f"Error updating database for session {target_session_id}: {db_error}")
                     # Don't fail the upload if database update fails
-            
-            return f"Portfolio file stored successfully in Google Cloud Storage as: {filename}"
-            
+
+            return f"Portfolio file stored successfully in S3 as: {filename}"
+
         except Exception as e:
             error_msg = f"Error storing portfolio file: {e}"
             logger.error(error_msg)
@@ -621,7 +660,6 @@ class HostAgent:
             
             # Check database for actual upload status
             try:
-                from database import get_db, get_session
                 db = next(get_db())
                 session = get_session(db, session_id)
                 db.close()
@@ -664,29 +702,20 @@ class HostAgent:
         return f"Investment amount stored successfully: ${amount:,.2f}"
 
     def store_diversification_preference(self, preference: str):
-        """Stores the user's diversification preference.
+        """Stores the user's complete investment strategy.
 
         Args:
-            preference: Either 'keep_pattern' to maintain existing investment pattern,
-                       or 'diversify' to minimize risk through diversification
+            preference: The user's detailed investment strategy description
         """
-        preference_lower = preference.lower().strip()
-        if "keep" in preference_lower or "same" in preference_lower or "existing" in preference_lower or "current" in preference_lower:
-            self.diversification_preference = "keep_pattern"
-            logger.info("User chose to keep existing investment pattern")
-            return "Diversification preference stored: Keep existing investment pattern"
-        elif "divers" in preference_lower or "risk" in preference_lower or "different" in preference_lower:
-            self.diversification_preference = "diversify"
-            logger.info("User chose to diversify to minimize risk")
-            return "Diversification preference stored: Diversify to minimize risk"
-        else:
-            # Default to keep_pattern if unclear
-            self.diversification_preference = "keep_pattern"
-            logger.info("Unclear preference, defaulting to keep existing pattern")
-            return "Diversification preference stored: Keep existing investment pattern (default)"
+        # Store the FULL preference text, not a simplified version
+        self.diversification_preference = preference.strip()
+        logger.info(f"User's investment strategy stored: {self.diversification_preference[:100]}...")
+        return f"Investment strategy stored successfully: {preference[:100]}..."
 
     def store_receiver_email_id(self, email_id: str):
         """Stores the receiver email ID for sending stock analysis."""
+        logger.info(f"========== STORE_RECEIVER_EMAIL_ID FUNCTION CALLED ==========")
+        logger.info(f"========== EMAIL ID PARAMETER: {email_id} ==========")
         self.receiver_email_id = email_id
         logger.info(f"Stored receiver email ID: {email_id}")
         
@@ -696,18 +725,28 @@ class HostAgent:
         has_stocks = len(self.existing_portfolio_stocks) > 0 or len(self.new_stocks) > 0
         has_diversification_pref = bool(self.diversification_preference)
 
+        logger.info(f"========== PREREQUISITES CHECK ==========")
+        logger.info(f"Investment amount: ${self.investment_amount} (valid: {has_investment_amount})")
+        logger.info(f"Existing stocks count: {len(self.existing_portfolio_stocks)}")
+        logger.info(f"New stocks count: {len(self.new_stocks)}")
+        logger.info(f"Has stocks: {has_stocks}")
+        logger.info(f"Diversification preference: '{self.diversification_preference}' (valid: {has_diversification_pref})")
+
         # Check if portfolio statement is uploaded
         try:
             session_id = self.current_session_id["id"]
             if session_id:
-                from database import get_db, get_session
                 db = next(get_db())
                 session = get_session(db, session_id)
                 db.close()
                 has_portfolio = session and session.portfolio_statement_uploaded
+                logger.info(f"Portfolio uploaded (from DB): {has_portfolio} for session {session_id}")
         except Exception as e:
             logger.warning(f"Could not check portfolio upload status: {e}")
             has_portfolio = self.current_session_id.get("is_file_uploaded", False)
+            logger.info(f"Portfolio uploaded (fallback): {has_portfolio}")
+
+        logger.info(f"All prerequisites met: {has_portfolio and has_investment_amount and has_stocks and has_diversification_pref}")
 
         # If all conditions are met, trigger stock analysis and return end session message
         if has_portfolio and has_investment_amount and has_stocks and has_diversification_pref:
@@ -1054,6 +1093,68 @@ Return ONLY a JSON array of uppercase ticker symbols. If a name is already a tic
         logger.info(f"Connection test requested for {agent_name}")
         return result
 
+    def read_and_analyze_portfolio(self, session_id: str = "") -> str:
+        """
+        Reads portfolio PDF and extracts stock tickers locally (integrated PDF analyzer).
+        This replaces the remote Stock Report Analyser Agent call.
+
+        Args:
+            session_id: The current session ID for tracking
+
+        Returns:
+            Formatted string with stock tickers and allocation percentages
+        """
+        logger.info(f"Reading and analyzing portfolio locally for session {session_id}")
+
+        try:
+            # Use stored user_id from current_session_id if available
+            user_id = self.current_session_id.get("user_id", "")
+
+            if not user_id:
+                # Fallback to database query if user_id is not stored
+                logger.warning(f"User ID not found in current_session_id, falling back to database query")
+                db = next(get_db())
+                session = get_session(db, session_id)
+
+                if not session:
+                    db.close()
+                    return "Error: Session not found. Cannot retrieve portfolio file."
+
+                # Get user info - use user.id (not user.name) as it's what was used during upload
+                user = db.query(User).filter(User.id == session.user_id).first()
+                db.close()
+
+                if not user:
+                    return "Error: User information not found. Cannot retrieve portfolio file."
+
+                user_id = user.id
+
+            logger.info(f"Retrieved user_id: {user_id} for session {session_id}")
+
+            # Step 1: Read the PDF from S3
+            portfolio_text = read_portfolio_statement(session_id, user_id)
+
+            if portfolio_text.startswith("Error"):
+                logger.error(f"Error reading portfolio: {portfolio_text}")
+                return portfolio_text
+
+            logger.info(f"Successfully read portfolio text: {len(portfolio_text)} characters")
+
+            # Step 2: Extract tickers from the text
+            result = extract_stock_tickers_from_portfolio(portfolio_text)
+
+            # Store the response automatically (same as before with remote agent)
+            if result and not result.startswith("Error"):
+                self.stock_report_response = result
+                logger.info(f"Automatically stored portfolio analysis result: {len(result)} characters")
+
+            return result
+
+        except Exception as e:
+            error_msg = f"Error in read_and_analyze_portfolio: {e}"
+            logger.error(error_msg)
+            return f"Error: {error_msg}"
+
     def suggest_stocks_by_category(self, category: str):
         """
         Retrieves a list of stocks from a specified category.
@@ -1106,7 +1207,7 @@ def _get_initialized_host_agent_sync():
     async def _async_main():
         agent_urls = [
             "http://localhost:10002",  # Stock Analyser Agent
-            "http://localhost:10003",  # Stock Report Analyser Agent
+            # Stock Report Analyser Agent removed - now integrated locally as a sub-agent
         ]
 
         logger.info("initializing host agent")

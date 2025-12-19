@@ -5,14 +5,18 @@ This module provides user management and profile functionality.
 
 from typing import List, Optional
 from datetime import datetime, timedelta
+import logging
 
 from fastapi import HTTPException
 from pydantic import BaseModel
 
 from database import (
-    get_db, get_or_create_user, get_user_message_count, 
+    get_db, get_or_create_user, get_user_message_count,
     can_user_send_message, User, ConversationSession, ConversationMessage
 )
+
+# Set up logging
+logger = logging.getLogger(__name__)
 
 
 class UserProfile(BaseModel):
@@ -54,12 +58,18 @@ class UserStats(BaseModel):
     last_message_date: Optional[datetime]
 
 
-def get_user_profile(user_id: str) -> UserProfile:
+def get_user_profile(user_id: str, email: Optional[str] = None) -> UserProfile:
     """Get complete user profile information."""
     db = next(get_db())
     try:
         user = db.query(User).filter(User.id == user_id).first()
-        
+
+        # If not found by ID, try by email as fallback (for users with changed Firebase UIDs)
+        if not user and email:
+            user = db.query(User).filter(User.email == email).first()
+            if user:
+                logger.info(f"User not found by ID {user_id}, but found by email {email}. User ID in DB: {user.id}")
+
         if not user:
             raise HTTPException(status_code=404, detail="User not found")
         
@@ -97,14 +107,20 @@ def get_user_profile(user_id: str) -> UserProfile:
         raise HTTPException(status_code=500, detail=f"Error getting user profile: {str(e)}")
 
 
-def update_user_profile(user_id: str, update_data: UserUpdate) -> UserProfile:
+def update_user_profile(user_id: str, update_data: UserUpdate, email: Optional[str] = None) -> UserProfile:
     """Update user profile information."""
     db = next(get_db())
     try:
-        user = db.query(User).filter(User.id == user_id).first()
-        
-        if not user:
-            raise HTTPException(status_code=404, detail="User not found")
+        # Get or create user - this handles first-time profile updates
+        user = get_or_create_user(
+            db,
+            user_id,
+            email=update_data.email or email,
+            name=update_data.name,
+            contact_number=update_data.contact_number,
+            country_code=update_data.country_code or '+1',
+            paid_user=update_data.paid_user or False
+        )
         
         # Update fields if provided
         if update_data.email is not None:

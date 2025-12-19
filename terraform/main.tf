@@ -186,7 +186,7 @@ resource "aws_security_group" "ecs_tasks" {
 
   ingress {
     from_port = 10001
-    to_port   = 10003
+    to_port   = 10002
     protocol  = "tcp"
     self      = true
   }
@@ -331,14 +331,7 @@ resource "aws_cloudwatch_log_group" "stockanalyser_agent" {
   }
 }
 
-resource "aws_cloudwatch_log_group" "stockreport_agent" {
-  name              = "/ecs/${var.project_name}-stockreport-agent"
-  retention_in_days = 7
-
-  tags = {
-    Name = "${var.project_name}-stockreport-agent-logs"
-  }
-}
+# Stock Report Agent CloudWatch Log Group removed - now integrated into Host Agent
 
 # Application Load Balancer
 resource "aws_lb" "main" {
@@ -415,20 +408,31 @@ resource "aws_service_discovery_service" "stockanalyser" {
   }
 }
 
-resource "aws_service_discovery_service" "stockreport" {
-  name = "stockreport-agent"
+# Stock Report Service Discovery removed - now integrated into Host Agent
 
-  dns_config {
-    namespace_id = aws_service_discovery_private_dns_namespace.main.id
+# S3 Bucket for Portfolio Statements
+resource "aws_s3_bucket" "portfolio_statements" {
+  bucket = "${var.project_name}-portfolio-statements"
 
-    dns_records {
-      ttl  = 60
-      type = "A"
-    }
+  tags = {
+    Name = "${var.project_name}-portfolio-statements"
   }
+}
 
-  health_check_custom_config {
-    failure_threshold = 1
+resource "aws_s3_bucket_versioning" "portfolio_statements" {
+  bucket = aws_s3_bucket.portfolio_statements.id
+  versioning_configuration {
+    status = "Enabled"
+  }
+}
+
+resource "aws_s3_bucket_server_side_encryption_configuration" "portfolio_statements" {
+  bucket = aws_s3_bucket.portfolio_statements.id
+
+  rule {
+    apply_server_side_encryption_by_default {
+      sse_algorithm = "AES256"
+    }
   }
 }
 
@@ -445,6 +449,47 @@ resource "aws_iam_role" "ecs_task_execution_role" {
         Principal = {
           Service = "ecs-tasks.amazonaws.com"
         }
+      }
+    ]
+  })
+}
+
+resource "aws_iam_role" "ecs_task_role" {
+  name = "${var.project_name}-task-role"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Action = "sts:AssumeRole"
+        Effect = "Allow"
+        Principal = {
+          Service = "ecs-tasks.amazonaws.com"
+        }
+      }
+    ]
+  })
+}
+
+resource "aws_iam_role_policy" "s3_access" {
+  name = "s3-access"
+  role = aws_iam_role.ecs_task_role.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect = "Allow"
+        Action = [
+          "s3:PutObject",
+          "s3:GetObject",
+          "s3:DeleteObject",
+          "s3:ListBucket"
+        ]
+        Resource = [
+          aws_s3_bucket.portfolio_statements.arn,
+          "${aws_s3_bucket.portfolio_statements.arn}/*"
+        ]
       }
     ]
   })
@@ -476,60 +521,7 @@ resource "aws_iam_role_policy" "secrets_access" {
   })
 }
 
-# ECS Task Definition - Stock Report Analyser
-resource "aws_ecs_task_definition" "stockreport_agent" {
-  family                   = "${var.project_name}-stockreport-agent"
-  network_mode             = "awsvpc"
-  requires_compatibilities = ["FARGATE"]
-  cpu                      = "512"
-  memory                   = "1024"
-  execution_role_arn       = aws_iam_role.ecs_task_execution_role.arn
-
-  container_definitions = jsonencode([
-    {
-      name      = "stockreport-agent"
-      image     = "156041436571.dkr.ecr.us-east-1.amazonaws.com/finance-a2a/stockreport-agent:latest"
-      essential = true
-      portMappings = [
-        {
-          containerPort = 10003
-          protocol      = "tcp"
-        }
-      ]
-      environment = [
-        {
-          name  = "GOOGLE_GENAI_USE_VERTEXAI"
-          value = "FALSE"
-        }
-      ]
-      secrets = [
-        {
-          name      = "GOOGLE_API_KEY"
-          valueFrom = "${aws_secretsmanager_secret.api_keys.arn}:GOOGLE_API_KEY::"
-        }
-      ]
-      logConfiguration = {
-        logDriver = "awslogs"
-        options = {
-          "awslogs-group"         = aws_cloudwatch_log_group.stockreport_agent.name
-          "awslogs-region"        = var.aws_region
-          "awslogs-stream-prefix" = "ecs"
-        }
-      }
-      healthCheck = {
-        command     = ["CMD-SHELL", "curl -f http://localhost:10003/health || exit 1"]
-        interval    = 30
-        timeout     = 5
-        retries     = 3
-        startPeriod = 60
-      }
-    }
-  ])
-
-  tags = {
-    Name = "${var.project_name}-stockreport-agent"
-  }
-}
+# Stock Report Agent ECS Task Definition removed - now integrated into Host Agent
 
 # ECS Task Definition - Stock Analyser
 resource "aws_ecs_task_definition" "stockanalyser_agent" {
@@ -558,7 +550,7 @@ resource "aws_ecs_task_definition" "stockanalyser_agent" {
         },
         {
           name  = "DATABASE_URL"
-          value = "postgresql://postgres:${var.db_password}@${aws_db_instance.postgres.endpoint}/finance_a2a"
+          value = "postgresql://postgres:${var.db_password}@${aws_db_instance.postgres.endpoint}/finance_a2a?sslmode=require"
         }
       ]
       secrets = [
@@ -602,6 +594,7 @@ resource "aws_ecs_task_definition" "host_agent" {
   cpu                      = "512"
   memory                   = "1024"
   execution_role_arn       = aws_iam_role.ecs_task_execution_role.arn
+  task_role_arn            = aws_iam_role.ecs_task_role.arn
 
   container_definitions = jsonencode([
     {
@@ -621,7 +614,7 @@ resource "aws_ecs_task_definition" "host_agent" {
         },
         {
           name  = "DATABASE_URL"
-          value = "postgresql://postgres:${var.db_password}@${aws_db_instance.postgres.endpoint}/finance_a2a"
+          value = "postgresql://postgres:${var.db_password}@${aws_db_instance.postgres.endpoint}/finance_a2a?sslmode=require"
         },
         {
           name  = "FREE_USER_MESSAGE_LIMIT"
@@ -632,8 +625,12 @@ resource "aws_ecs_task_definition" "host_agent" {
           value = "http://stockanalyser-agent.local:10002"
         },
         {
-          name  = "STOCK_REPORT_ANALYSER_URL"
-          value = "http://stockreport-agent.local:10003"
+          name  = "S3_BUCKET_NAME"
+          value = aws_s3_bucket.portfolio_statements.id
+        },
+        {
+          name  = "AWS_DEFAULT_REGION"
+          value = var.aws_region
         }
       ]
       secrets = [
@@ -669,30 +666,7 @@ resource "aws_ecs_task_definition" "host_agent" {
   }
 }
 
-# ECS Service - Stock Report Analyser
-resource "aws_ecs_service" "stockreport_agent" {
-  name            = "stockreport-agent"
-  cluster         = aws_ecs_cluster.main.id
-  task_definition = aws_ecs_task_definition.stockreport_agent.arn
-  desired_count   = 1
-  launch_type     = "FARGATE"
-
-  network_configuration {
-    subnets          = [aws_subnet.public_1.id, aws_subnet.public_2.id]
-    security_groups  = [aws_security_group.ecs_tasks.id]
-    assign_public_ip = true
-  }
-
-  service_registries {
-    registry_arn = aws_service_discovery_service.stockreport.arn
-  }
-
-  depends_on = [aws_lb_listener.http]
-
-  tags = {
-    Name = "${var.project_name}-stockreport-service"
-  }
-}
+# Stock Report Agent ECS Service removed - now integrated into Host Agent
 
 # ECS Service - Stock Analyser
 resource "aws_ecs_service" "stockanalyser_agent" {
@@ -712,7 +686,7 @@ resource "aws_ecs_service" "stockanalyser_agent" {
     registry_arn = aws_service_discovery_service.stockanalyser.arn
   }
 
-  depends_on = [aws_ecs_service.stockreport_agent]
+  depends_on = [aws_lb_listener.http]
 
   tags = {
     Name = "${var.project_name}-stockanalyser-service"
@@ -746,10 +720,73 @@ resource "aws_ecs_service" "host_agent" {
   }
 }
 
+# CloudFront Distribution for HTTPS
+resource "aws_cloudfront_distribution" "api" {
+  enabled             = true
+  comment             = "${var.project_name} API Distribution"
+  price_class         = "PriceClass_100"
+
+  origin {
+    domain_name = aws_lb.main.dns_name
+    origin_id   = "ALB"
+
+    custom_origin_config {
+      http_port              = 80
+      https_port             = 443
+      origin_protocol_policy = "http-only"
+      origin_ssl_protocols   = ["TLSv1.2"]
+    }
+  }
+
+  default_cache_behavior {
+    allowed_methods        = ["DELETE", "GET", "HEAD", "OPTIONS", "PATCH", "POST", "PUT"]
+    cached_methods         = ["GET", "HEAD", "OPTIONS"]
+    target_origin_id       = "ALB"
+    viewer_protocol_policy = "redirect-to-https"
+
+    forwarded_values {
+      query_string = true
+      headers      = ["Authorization", "Host", "Origin", "Accept", "Content-Type"]
+
+      cookies {
+        forward = "all"
+      }
+    }
+
+    min_ttl     = 0
+    default_ttl = 0
+    max_ttl     = 0
+  }
+
+  restrictions {
+    geo_restriction {
+      restriction_type = "none"
+    }
+  }
+
+  viewer_certificate {
+    cloudfront_default_certificate = true
+  }
+
+  tags = {
+    Name = "${var.project_name}-api-cdn"
+  }
+}
+
 # Outputs
 output "alb_dns_name" {
   description = "DNS name of the Application Load Balancer"
   value       = aws_lb.main.dns_name
+}
+
+output "cloudfront_domain_name" {
+  description = "CloudFront distribution domain name (use this for HTTPS)"
+  value       = aws_cloudfront_distribution.api.domain_name
+}
+
+output "cloudfront_url" {
+  description = "HTTPS URL to access the application via CloudFront"
+  value       = "https://${aws_cloudfront_distribution.api.domain_name}"
 }
 
 output "rds_endpoint" {

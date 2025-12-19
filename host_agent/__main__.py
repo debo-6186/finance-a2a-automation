@@ -101,7 +101,7 @@ host_agent_instance: Optional[HostAgent] = None
 # Agent URLs configuration
 AGENT_URLS = [
     "http://localhost:10002",  # Stock Analyser Agent
-    "http://localhost:10003",  # Stock Report Analyser Agent
+    # Stock Report Analyser Agent removed - now integrated locally as a sub-agent
 ]
 
 
@@ -297,7 +297,12 @@ app = FastAPI(
 # Add CORS middleware to allow frontend connections
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Configure this appropriately for production
+    allow_origins=[
+        "https://warm-rookery-461602-i8.web.app",
+        "https://warm-rookery-461602-i8.firebaseapp.com",
+        "http://localhost:3000",  # For local development
+        "https://localhost:3000",  # For local development with HTTPS
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -361,7 +366,7 @@ async def health_check():
     }
 
 
-@app.post("/chats", response_model=ChatResponse)
+@app.post("/api/chats", response_model=ChatResponse)
 async def chat(request: Request, current_user: dict = Depends(get_current_user)):
     """
     Send a message to the host agent and get a complete response.
@@ -477,7 +482,7 @@ async def chat(request: Request, current_user: dict = Depends(get_current_user))
                 
                 try:
                     # Update host agent's current session ID for consistency
-                    host_agent_instance.current_session_id = {"id": session_id, "is_file_uploaded": False}
+                    host_agent_instance.current_session_id = {"id": session_id, "user_id": final_user_id, "is_file_uploaded": False}
                     
                     # Use the existing store_portfolio_file method with explicit session_id
                     result = host_agent_instance.store_portfolio_file(final_user_id, temp_file_path, session_id)
@@ -520,7 +525,8 @@ async def chat(request: Request, current_user: dict = Depends(get_current_user))
         
         async for response_chunk in host_agent_instance.stream(
             query=final_message,
-            session_id=session_id
+            session_id=session_id,
+            user_id=final_user_id
         ):
             response_count += 1
             logger.info(f"Received response chunk {response_count}: {response_chunk}")
@@ -593,7 +599,7 @@ async def chat(request: Request, current_user: dict = Depends(get_current_user))
             raise HTTPException(status_code=500, detail=f"Error processing message: {str(e)}")
 
 
-@app.post("/chats/stream")
+@app.post("/api/chats/stream")
 async def chat_stream(request: Request):
     """
     Send a message to the host agent and stream the response.
@@ -693,7 +699,7 @@ async def chat_stream(request: Request):
                 
                 try:
                     # Update host agent's current session ID for consistency
-                    host_agent_instance.current_session_id = {"id": session_id, "is_file_uploaded": False}
+                    host_agent_instance.current_session_id = {"id": session_id, "user_id": final_user_id, "is_file_uploaded": False}
                     
                     # Use the existing store_portfolio_file method with explicit session_id
                     result = host_agent_instance.store_portfolio_file(final_user_id, temp_file_path, session_id)
@@ -730,7 +736,8 @@ async def chat_stream(request: Request):
             end_session = False
             async for response_chunk in host_agent_instance.stream(
                 query=final_message,
-                session_id=session_id
+                session_id=session_id,
+                user_id=final_user_id
             ):
                 content = response_chunk.get("content", "")
                 if response_chunk.get("is_task_complete", False):
@@ -976,9 +983,19 @@ async def get_user_sessions(user_id: str):
 
 
 # User-level API endpoints
+@app.get("/api/profile", response_model=UserProfile)
+def get_current_user_profile(current_user: dict = Depends(get_current_user)):
+    """Get current authenticated user's profile information."""
+    return get_user_profile(current_user['uid'], current_user.get('email'))
+
+
 @app.get("/api/users/{user_id}/profile", response_model=UserProfile)
-def get_user_profile_endpoint(user_id: str):
+def get_user_profile_endpoint(user_id: str, current_user: dict = Depends(get_current_user)):
     """Get complete user profile information."""
+    # Ensure user can only access their own profile
+    if current_user['uid'] != user_id:
+        raise HTTPException(status_code=403, detail="You can only access your own profile")
+
     return get_user_profile(user_id)
 
 
@@ -988,8 +1005,9 @@ def update_user_profile_endpoint(user_id: str, update_data: UserUpdate, current_
     # Ensure user can only update their own profile
     if current_user['uid'] != user_id:
         raise HTTPException(status_code=403, detail="You can only update your own profile")
-    
-    return update_user_profile(user_id, update_data)
+
+    # Pass email from JWT token for user creation if needed
+    return update_user_profile(user_id, update_data, email=current_user.get('email'))
 
 
 @app.get("/api/users/{user_id}/statistics", response_model=UserStats)
@@ -1080,7 +1098,7 @@ def main():
 
         logger.info(f"GOOGLE_API_KEY: {os.getenv("GOOGLE_API_KEY")}")
         
-        host = "localhost"
+        host = "0.0.0.0"  # Listen on all interfaces to accept external connections
         port = 10001  # Different port from other agents
         
         logger.info(f"Starting Host Agent API server on {host}:{port}")
@@ -1095,6 +1113,7 @@ def main():
         logger.info("  GET /sessions/{session_id}/messages - Get session messages")
         logger.info("  GET /users/{user_id} - Get user information")
         logger.info("  GET /users/{user_id}/sessions - Get user sessions")
+        logger.info("  GET /api/profile - Get current user's profile (authenticated)")
         logger.info("  GET /users/{user_id}/profile - Get complete user profile")
         logger.info("  PUT /users/{user_id}/profile - Update user profile")
         logger.info("  GET /users/{user_id}/statistics - Get user statistics")
@@ -1108,7 +1127,7 @@ def main():
             app,
             host=host,
             port=port,
-            reload=False,  # Set to True for development
+            reload=True,  # Auto-reload on code changes for development
             log_level="info"
         )
         

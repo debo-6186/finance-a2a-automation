@@ -81,7 +81,22 @@ def main():
             agent_card=agent_card, http_handler=request_handler
         )
 
-        uvicorn.run(server.build(), host=host, port=port)
+        # Build the Starlette app
+        app = server.build()
+
+        # Add custom health check endpoint
+        from starlette.responses import JSONResponse
+        from starlette.routing import Route
+
+        async def health_check(request):
+            return JSONResponse({"status": "healthy", "service": "Stock Analyser Agent"})
+
+        # Add health route to the app
+        app.routes.insert(0, Route("/health", health_check))
+
+        logger.info("Added custom /health endpoint")
+
+        uvicorn.run(app, host=host, port=port)
     except MissingAPIKeyError as e:
         logger.error(f"Error: {e}")
         exit(1)

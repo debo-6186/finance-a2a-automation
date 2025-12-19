@@ -9,7 +9,7 @@ from typing import Optional
 from sqlalchemy import create_engine, Column, String, Integer, Boolean, DateTime, Text, ForeignKey, JSON
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, Session, relationship
-from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.exc import SQLAlchemyError, IntegrityError
 import logging
 
 # Set up logging
@@ -19,8 +19,12 @@ logger = logging.getLogger(__name__)
 DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://debojyotichakraborty@localhost:5432/finance_a2a")
 FREE_USER_MESSAGE_LIMIT = int(os.getenv("FREE_USER_MESSAGE_LIMIT", "30"))
 
-# Create SQLAlchemy engine
-engine = create_engine(DATABASE_URL, echo=False)
+# Create SQLAlchemy engine with SSL support for RDS
+connect_args = {}
+if "rds.amazonaws.com" in DATABASE_URL:
+    connect_args = {"sslmode": "require"}
+
+engine = create_engine(DATABASE_URL, echo=False, connect_args=connect_args)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
 # Create base class for models
@@ -170,13 +174,50 @@ def get_or_create_user(db: Session, user_id: str, email: Optional[str] = None, n
             if name and user.name != name:
                 user.name = name
                 updated = True
-                
+
             if updated:
                 db.commit()
                 logger.info(f"Updated user {user_id}")
             return user
         else:
             return create_user(db, user_id, email, name, contact_number, country_code, paid_user)
+    except IntegrityError as e:
+        # Handle duplicate email constraint violation
+        db.rollback()
+        logger.warning(f"IntegrityError for user {user_id}: {e}. Attempting to find existing user by email.")
+
+        # Try to find user by email if provided
+        if email:
+            existing_user = db.query(User).filter(User.email == email).first()
+            if existing_user:
+                # Check if it's a different user_id
+                if existing_user.id != user_id:
+                    logger.warning(f"Found user with email {email} but different ID. Updating ID from {existing_user.id} to {user_id}")
+                    # Update the user's ID to match the Firebase UID
+                    existing_user.id = user_id
+                    existing_user.paid_user = paid_user
+                    if name:
+                        existing_user.name = name
+                    try:
+                        db.commit()
+                        db.refresh(existing_user)
+                        logger.info(f"Updated user ID to {user_id}")
+                        return existing_user
+                    except Exception as update_error:
+                        db.rollback()
+                        logger.error(f"Failed to update user ID: {update_error}")
+                        raise
+                else:
+                    logger.info(f"Found existing user with email {email} and matching ID {existing_user.id}")
+                    return existing_user
+
+        # If we still can't find the user, try by ID one more time
+        user = db.query(User).filter(User.id == user_id).first()
+        if user:
+            return user
+
+        logger.error(f"Could not create or find user {user_id} with email {email}")
+        raise
     except SQLAlchemyError as e:
         logger.error(f"Error getting/creating user {user_id}: {e}")
         raise

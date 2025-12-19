@@ -6,9 +6,9 @@ A comprehensive financial analysis and automation system with multiple specializ
 
 ```
 finance-a2a-automation/
-├── host_agent/                 # Main host agent for coordination
+├── host_agent/                 # Main host agent for coordination (includes PDF analysis sub-agent)
 ├── stockanalyser_agent/        # Stock analysis and allocation management
-├── stockreport_analyser_agent/ # Portfolio report analysis
+├── stockreport_analyser_agent/ # [DEPRECATED] Portfolio report analysis (now integrated into host_agent)
 └── README.md                   # This file
 ```
 
@@ -69,13 +69,7 @@ Before starting the agents, you need to set up the required API keys:
    uv run --active .
    ```
 
-4. **Set up Stock Report Analyser Agent:**
-   ```bash
-   cd ../stockreport_analyser_agent
-   uv venv
-   source .venv/bin/activate
-   uv run --active .
-   ```
+**Note:** The Stock Report Analyser Agent has been integrated into the Host Agent as a sub-agent for better performance. You no longer need to run it separately.
 
 ## 📋 Detailed Setup Instructions
 
@@ -119,38 +113,25 @@ source .venv/bin/activate
 uv run --active .
 ```
 
-### Step 3: Stock Report Analyser Agent Setup
-
-```bash
-# Navigate to stock report analyser agent directory
-cd stockreport_analyser_agent
-
-# Create virtual environment
-uv venv
-
-# Activate virtual environment
-source .venv/bin/activate
-
-# Run the stock report analyser agent
-uv run --active .
-```
+**Note:** The Stock Report Analyser Agent has been integrated into the Host Agent as a sub-agent and no longer needs to be run separately.
 
 ## 🤖 Agent Descriptions
 
 ### Host Agent
 - **Purpose**: Main coordination agent for the A2A automation system
 - **Port**: 10001 (HTTP REST API)
-- **Features**: 
+- **Features**:
   - REST API with `/chats` endpoint for user conversations
   - Coordinates between different agents
   - Manages agent communication
   - Handles routing and task distribution
   - Streaming and non-streaming chat responses
   - Session management for conversations
+  - **Integrated PDF Analysis Sub-Agent** for portfolio statement processing (local, no network overhead)
 
 ### Stock Analyser Agent
 - **Purpose**: Comprehensive stock analysis and allocation management
-- **Port**: Default A2A port
+- **Port**: 10002 (A2A protocol)
 - **Features**:
   - Technical stock analysis with indicators (RSI, MACD, Bollinger Bands)
   - Stock suggestions by country and sector
@@ -158,15 +139,13 @@ uv run --active .
   - Portfolio-level insights
   - Real-time stock data analysis
 
-### Stock Report Analyser Agent
-- **Purpose**: Portfolio report and financial document analysis
-- **Port**: Default A2A port
-- **Features**:
-  - PDF portfolio statement analysis
-  - Financial metrics evaluation
-  - Earnings report analysis
-  - Investment recommendations
-  - Risk assessment
+### Stock Report Analyser Agent (DEPRECATED)
+- **Status**: Now integrated into Host Agent as a sub-agent
+- **Migration**: PDF analysis functionality moved to Host Agent for:
+  - Reduced network latency (no HTTP calls)
+  - Simpler deployment (2 services instead of 3)
+  - Better performance for lightweight PDF parsing
+  - Maintained isolation for heavy compute tasks (Stock Analyser remains separate)
 
 ## 🔧 Configuration
 
@@ -228,12 +207,14 @@ Agent: Processes portfolio statement and provides investment insights
 
 ## 🔄 Workflow
 
-1. **Start all agents** using the setup instructions above
+1. **Start required agents**:
+   - Host Agent (port 10001) - includes integrated PDF analysis sub-agent
+   - Stock Analyser Agent (port 10002) - for comprehensive stock analysis
 2. **Use the Host Agent REST API** at `http://localhost:10001` for user conversations
 3. **Send messages via `/chats` endpoint** to interact with the coordination system
-4. **Use stock analyser** for individual stock analysis and allocation management (via host agent)
-5. **Use stock report analyser** for portfolio and document analysis (via host agent)
-6. **All communication** now goes through the `/chats` API instead of ADK web UI
+4. **Portfolio analysis** is now handled locally within Host Agent (no separate service needed)
+5. **Stock analysis** is delegated to Stock Analyser Agent via A2A protocol
+6. **All communication** goes through the `/chats` API
 
 ## 📡 Host Agent API Documentation
 
@@ -289,7 +270,7 @@ Check if the Host Agent API is healthy.
 {
   "status": "healthy",
   "message": "Host Agent is running",
-  "connected_agents": ["Stock Analyser Agent", "Stock Report Analyser Agent"]
+  "connected_agents": ["Stock Analyser Agent"]
 }
 ```
 
@@ -393,6 +374,7 @@ host_agent/
 ├── host/
 │   ├── __init__.py
 │   ├── agent.py
+│   ├── pdf_analyzer.py           # Integrated PDF analysis sub-agent
 │   └── remote_agent_connection.py
 ├── pyproject.toml
 └── uv.lock
@@ -412,17 +394,19 @@ stockanalyser_agent/
 └── uv.lock
 ```
 
-### Stock Report Analyser Agent
+### Stock Report Analyser Agent (DEPRECATED - functionality moved to Host Agent)
 ```
 stockreport_analyser_agent/
 ├── __init__.py
 ├── __main__.py
-├── agent.py
-├── agent_executor.py
-├── portfolio_statement.pdf  # Sample portfolio document
+├── agent.py                 # Deprecated - see host_agent/host/pdf_analyzer.py
+├── agent_executor.py        # Deprecated
+├── portfolio_statement.pdf  # Still used by integrated PDF analyzer
 ├── pyproject.toml
 └── uv.lock
 ```
+
+**Note:** This agent is no longer run as a separate service. Its PDF analysis functionality has been integrated into the Host Agent for better performance.
 
 ## 🤝 Contributing
 
