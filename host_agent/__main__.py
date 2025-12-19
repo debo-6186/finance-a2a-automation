@@ -1127,7 +1127,7 @@ def main():
             app,
             host=host,
             port=port,
-            reload=True,  # Auto-reload on code changes for development
+            reload=False,  # Reload disabled for production
             log_level="info"
         )
         
