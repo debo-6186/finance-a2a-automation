@@ -12,17 +12,28 @@ from sqlalchemy.orm import sessionmaker, Session, relationship
 from sqlalchemy.exc import SQLAlchemyError, IntegrityError
 import logging
 
+# Import configuration
+from config import current_config
+
 # Set up logging
 logger = logging.getLogger(__name__)
 
-# Database configuration
-DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://debojyotichakraborty@localhost:5432/finance_a2a")
-FREE_USER_MESSAGE_LIMIT = int(os.getenv("FREE_USER_MESSAGE_LIMIT", "30"))
+# Set up logging with absolute path
+logger = logging.getLogger("host_agent_api")
+logger.setLevel(logging.INFO)
 
-# Create SQLAlchemy engine with SSL support for RDS
+# Database configuration from environment-based config
+DATABASE_URL = current_config.DATABASE_URL
+FREE_USER_MESSAGE_LIMIT = current_config.FREE_USER_MESSAGE_LIMIT
+
+logger.info(f"Database configuration loaded for {current_config.ENVIRONMENT} environment")
+logger.info(f"Database URL: {DATABASE_URL.split('@')[0]}@***")  # Log without exposing credentials
+
+# Create SQLAlchemy engine with SSL support for RDS (production only)
 connect_args = {}
-if "rds.amazonaws.com" in DATABASE_URL:
+if current_config.is_production() and "rds.amazonaws.com" in DATABASE_URL:
     connect_args = {"sslmode": "require"}
+    logger.info("Using SSL connection for RDS")
 
 engine = create_engine(DATABASE_URL, echo=False, connect_args=connect_args)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
@@ -299,6 +310,7 @@ def can_user_send_message(db: Session, user_id: str) -> bool:
         
         # Free users limited by environment variable
         message_count = get_user_message_count(db, user_id)
+        logger.info(f"Number of messages: {message_count}")
         return message_count < FREE_USER_MESSAGE_LIMIT
     except SQLAlchemyError as e:
         logger.error(f"Error checking user message limit for {user_id}: {e}")

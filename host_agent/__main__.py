@@ -24,9 +24,9 @@ from firebase_admin import credentials, auth as firebase_auth
 
 from host.agent import HostAgent
 from database import (
-    get_db, get_or_create_user, create_session, get_session, 
+    get_db, get_or_create_user, create_session, get_session,
     add_message, can_user_send_message, get_user_message_count,
-    User, ConversationSession, ConversationMessage
+    User, ConversationSession, ConversationMessage, FREE_USER_MESSAGE_LIMIT
 )
 from user_api import (
     get_user_profile, update_user_profile, get_user_statistics,
@@ -36,10 +36,15 @@ from user_api import (
 
 load_dotenv()
 
-# Set up logging
+# Set up logging with absolute path
 logger = logging.getLogger("host_agent_api")
 logger.setLevel(logging.INFO)
-handler = RotatingFileHandler("host_agent_api.log", maxBytes=5*1024*1024, backupCount=3)
+
+# Get the project root directory (one level up from host_agent/__main__.py)
+project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+log_file_path = os.path.join(project_root, "host_agent", "host_agent_api.log")
+
+handler = RotatingFileHandler(log_file_path, maxBytes=5*1024*1024, backupCount=3)
 formatter = logging.Formatter('%(asctime)s %(levelname)s %(name)s: %(message)s')
 handler.setFormatter(formatter)
 logger.addHandler(handler)
@@ -452,8 +457,8 @@ async def chat(request: Request, current_user: dict = Depends(get_current_user))
         if not can_user_send_message(db, final_user_id):
             message_count = get_user_message_count(db, final_user_id)
             raise HTTPException(
-                status_code=429, 
-                detail=f"Message limit reached. Free users are limited to 30 messages. You have sent {message_count} messages. Upgrade to paid to continue."
+                status_code=429,
+                detail=f"Message limit reached. Free users are limited to {FREE_USER_MESSAGE_LIMIT} messages. You have sent {message_count} messages. Upgrade to paid to continue."
             )
         
         # Get or create session
@@ -669,8 +674,8 @@ async def chat_stream(request: Request):
         if not can_user_send_message(db, final_user_id):
             message_count = get_user_message_count(db, final_user_id)
             raise HTTPException(
-                status_code=429, 
-                detail=f"Message limit reached. Free users are limited to 19 messages. You have sent {message_count} messages. Upgrade to paid to continue."
+                status_code=429,
+                detail=f"Message limit reached. Free users are limited to {FREE_USER_MESSAGE_LIMIT} messages. You have sent {message_count} messages. Upgrade to paid to continue."
             )
         
         # Get or create session
@@ -930,7 +935,7 @@ async def get_user_info(user_id: str):
             "total_sessions": len(sessions),
             "total_messages": message_count,
             "can_send_messages": can_user_send_message(db, user_id),
-            "message_limit": "unlimited" if user.paid_user else "19 messages"
+            "message_limit": "unlimited" if user.paid_user else f"{FREE_USER_MESSAGE_LIMIT} messages"
         }
         
     except HTTPException:

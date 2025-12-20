@@ -17,6 +17,7 @@ COPY host_agent/pyproject.toml ./
 COPY host_agent/__init__.py ./
 COPY host_agent/__main__.py ./
 COPY host_agent/database.py ./
+COPY host_agent/config.py ./
 COPY host_agent/user_api.py ./
 COPY host_agent/host/ ./host/
 COPY host_agent/migrations/ ./migrations/
