@@ -40,14 +40,23 @@ load_dotenv()
 logger = logging.getLogger("host_agent_api")
 logger.setLevel(logging.INFO)
 
-# Get the project root directory (one level up from host_agent/__main__.py)
-project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-log_file_path = os.path.join(project_root, "host_agent", "host_agent_api.log")
-
-handler = RotatingFileHandler(log_file_path, maxBytes=5*1024*1024, backupCount=3)
+# Setup file logging (optional - mainly for local development)
+# In production, logs go to CloudWatch
 formatter = logging.Formatter('%(asctime)s %(levelname)s %(name)s: %(message)s')
-handler.setFormatter(formatter)
-logger.addHandler(handler)
+try:
+    # Get the project root directory (one level up from host_agent/__main__.py)
+    project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    log_dir = os.path.join(project_root, "host_agent")
+    # Create log directory if it doesn't exist
+    os.makedirs(log_dir, exist_ok=True)
+    log_file_path = os.path.join(log_dir, "host_agent_api.log")
+    handler = RotatingFileHandler(log_file_path, maxBytes=5*1024*1024, backupCount=3)
+    handler.setFormatter(formatter)
+    logger.addHandler(handler)
+except (FileNotFoundError, PermissionError, OSError) as e:
+    # File logging not available (e.g., in Docker without mounted volumes)
+    # This is fine - logs will go to stdout/CloudWatch
+    logger.warning(f"File logging not available: {e}. Logging to stdout only.")
 
 # Console handler for immediate feedback
 console_handler = logging.StreamHandler()
