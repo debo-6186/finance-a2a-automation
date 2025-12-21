@@ -4,6 +4,7 @@ import uuid
 import os
 import time
 import threading
+import shutil
 from datetime import datetime
 from typing import Any, AsyncIterable, List
 
@@ -31,27 +32,24 @@ from google.genai import types
 from .remote_agent_connection import RemoteAgentConnections
 from .pdf_analyzer import read_portfolio_statement, extract_stock_tickers_from_portfolio
 import logging
-from logging.handlers import RotatingFileHandler
 
 # Import database functions and models at the top
 try:
-    from database import get_db, get_session, mark_portfolio_statement_uploaded, User
+    from database import get_db, get_session, mark_portfolio_statement_uploaded, get_agent_state, update_agent_state, User
+    from config import current_config
 except ImportError:
     # Handle case where database module is in parent directory
     import sys
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-    from database import get_db, get_session, mark_portfolio_statement_uploaded, User
+    from database import get_db, get_session, mark_portfolio_statement_uploaded, get_agent_state, update_agent_state, User
+    from config import current_config
 
 load_dotenv()
 nest_asyncio.apply()
 
-# Set up rotating file logger
-logger = logging.getLogger("host_agent")
+# Set up logger - will use parent logger's handlers (host_agent_api)
+logger = logging.getLogger("host_agent_api.host_agent")
 logger.setLevel(logging.INFO)
-handler = RotatingFileHandler("host_agent.log", maxBytes=5*1024*1024, backupCount=3)
-formatter = logging.Formatter('%(asctime)s %(levelname)s %(name)s: %(message)s')
-handler.setFormatter(formatter)
-logger.addHandler(handler)
 
 
 class HostAgent:
@@ -63,13 +61,7 @@ class HostAgent:
         self.remote_agent_connections: dict[str, RemoteAgentConnections] = {}
         self.cards: dict[str, AgentCard] = {}
         self.agents: str = ""
-        # New instance variables for stock management
-        self.stock_report_response: str = ""
-        self.existing_portfolio_stocks: List[str] = []
-        self.new_stocks: List[str] = []
-        self.investment_amount: float = 0.0
-        self.receiver_email_id: str = ""
-        self.diversification_preference: str = ""  # "keep_pattern" or "diversify"
+        # Keep only session tracking in memory - all other state goes to database
         self.current_session_id = {"id": "", "user_id": "", "is_file_uploaded": False}  # Store current session info
         self._agent = self.create_agent()
         self._user_id = "host_agent"
@@ -144,6 +136,65 @@ class HostAgent:
         await instance._async_init_components(remote_agent_addresses)
         return instance
 
+    def _load_state(self) -> dict:
+        """Load conversation state from database for current session."""
+        session_id = self.current_session_id.get("id")
+        if not session_id:
+            logger.warning("No session_id available, returning empty state")
+            return {
+                "stock_report_response": "",
+                "existing_portfolio_stocks": [],
+                "new_stocks": [],
+                "investment_amount": 0.0,
+                "receiver_email_id": "",
+                "diversification_preference": ""
+            }
+
+        try:
+            db = next(get_db())
+            agent_state = get_agent_state(db, session_id, "host_agent")
+            db.close()
+
+            if agent_state and agent_state.state_data:
+                state = json.loads(agent_state.state_data)
+                logger.info(f"Loaded state for session {session_id}")
+                return state
+            else:
+                logger.info(f"No existing state for session {session_id}, returning defaults")
+                return {
+                    "stock_report_response": "",
+                    "existing_portfolio_stocks": [],
+                    "new_stocks": [],
+                    "investment_amount": 0.0,
+                    "receiver_email_id": "",
+                    "diversification_preference": ""
+                }
+        except Exception as e:
+            logger.error(f"Error loading state for session {session_id}: {e}")
+            return {
+                "stock_report_response": "",
+                "existing_portfolio_stocks": [],
+                "new_stocks": [],
+                "investment_amount": 0.0,
+                "receiver_email_id": "",
+                "diversification_preference": ""
+            }
+
+    def _save_state(self, state: dict):
+        """Save conversation state to database for current session."""
+        session_id = self.current_session_id.get("id")
+        if not session_id:
+            logger.warning("No session_id available, cannot save state")
+            return
+
+        try:
+            db = next(get_db())
+            update_agent_state(db, session_id, "host_agent", json.dumps(state))
+            db.close()
+            logger.info(f"Saved state for session {session_id}")
+        except Exception as e:
+            logger.error(f"Error saving state for session {session_id}: {e}")
+
     def create_agent(self) -> Agent:
         max_retries = 5  # Increased retries for API reliability
         base_delay = 2   # Base delay in seconds
@@ -198,125 +249,123 @@ class HostAgent:
         # Access context to satisfy linter requirement
         _ = context
         return f"""
-        **Role:** You are a stock list coordinator and delegation agent. Your ONLY job is to:
-        1. Collect stocks from user's portfolio (via stock report analyser agent)
-        2. Collect additional stocks the user wants to analyze
-        3. Create a comprehensive list of "stocks to analyze"
-        4. Delegate the analysis to the stock analyser agent
-        5. Present the results to the user
-        
-        **YOU DO NOT PERFORM ANY ANALYSIS YOURSELF** - You only coordinate and delegate.
+        **Role:** You are a stock portfolio coordinator agent. Your job is to:
+        1. Analyze the user's portfolio
+        2. Collect investment preferences
+        3. Coordinate stock analysis
+        4. Send results to the user via email
 
-        **STRICT WORKFLOW - FOLLOW EXACTLY:**
+        **YOU DO NOT PERFORM ANY FINANCIAL ANALYSIS YOURSELF** - You only coordinate and delegate to the Stock Analyser Agent.
 
-        **STEP 1:** When user asks for stock allocation based on portfolio:
-        - First tell user: "Please upload your latest portfolio statement (PDF format)."
-        - Use `check_file_upload_status` tool to check if file has been uploaded
-        - Once file IS uploaded, inform user: "Your portfolio statement has been uploaded"
-        - IMMEDIATELY use `read_and_analyze_portfolio` tool with current session ID to analyze the portfolio locally
-        - Tell user: "I'm analyzing your portfolio statement. This will take about a minute."
-        - WAIT for response from read_and_analyze_portfolio tool
+        **WORKFLOW - FOLLOW THESE STEPS IN ORDER:**
 
-        **STEP 2:** After getting response from read_and_analyze_portfolio tool:
-        - The response is automatically stored
+        **STEP 1: Analyze Portfolio**
+        - When user starts the conversation, tell them: "Please upload your latest portfolio statement (PDF format)."
+        - Use `check_file_upload_status` to check if file has been uploaded
+        - Once file IS uploaded, inform user: "Your portfolio statement has been uploaded. I'm analyzing it now. This will take about a minute."
+        - Use `read_and_analyze_portfolio` tool with current session ID to analyze the portfolio
+        - WAIT for the response from the tool
         - Extract existing stocks from the response and add them using `add_existing_stocks`
-        - Show user their existing stock list (no analysis, just the list)
+        - Show user their existing stock list from the portfolio
 
-        **STEP 3:** ONLY IF investment_amount is NOT set (check using get_investment_amount):
-        - Ask user: "How much do you want to invest?"
+        **STEP 2: Get Investment Amount**
+        - BEFORE asking, check if investment amount is already set using `get_investment_amount`
+        - If NOT set, ask: "How much do you want to invest?"
         - WAIT for user response
-        - Store the investment amount using `store_investment_amount`
-        - IMMEDIATELY proceed to STEP 4 - do NOT wait for additional user input
+        - Store the amount using `store_investment_amount`
+        - Proceed immediately to STEP 3
 
-        **STEP 4:** ONLY IF diversification_preference is NOT set:
-        - Ask user: "What type of investor are you? Please describe your investment strategy. For example:
-          • 'I'm a long-term investor looking for stable growth over 5-10 years'
-          • 'I'm a short-term trader looking to make quick gains in 3-6 months'
-          • 'I only want to invest in healthcare and pharmaceutical stocks'
-          • 'I want high-risk, high-reward technology stocks'
-          • 'I prefer dividend-paying stocks for passive income'
+        **STEP 3: Get Investment Preference**
+        - BEFORE asking, check `get_stock_lists` to see if diversification_preference is already set
+        - If NOT set, ask: "What type of investor are you? Please describe your investment strategy. For example:
+          • 'Long-term investor looking for stable growth over 5-10 years'
+          • 'Short-term trader looking for quick gains in 3-6 months'
+          • 'Only interested in technology and healthcare stocks'
+          • 'High-risk, high-reward investments'
+          • 'Dividend-paying stocks for passive income'
           • Or describe your own strategy"
         - WAIT for user response
-        - Store it using `store_diversification_preference` - this stores the COMPLETE strategy text
-        - IMMEDIATELY proceed to STEP 5 - do NOT wait for additional user input
+        - Store the COMPLETE response using `store_diversification_preference`
+        - Proceed immediately to STEP 4
 
-        **STEP 5:** ONLY IF no new stocks have been discussed yet:
-        - Ask user: "Do you want to invest in any other stocks besides your existing portfolio? You can:
-          • Choose from automobile, technology, or financial sectors in India or USA
-          • Specify a specific stock ticker
+        **STEP 4: Check for Additional Stocks**
+        - BEFORE asking, check `get_stock_lists` to see if new stocks have been discussed
+        - If NOT discussed yet, ask: "Do you want to invest in any other stocks besides your existing portfolio?
+          • Say 'yes' to add more stocks from specific sectors (Technology, Financial, or Automobile for USA/India)
+          • Specify stock tickers directly (e.g., 'AAPL', 'TSLA', 'RELIANCE.NS')
           • Say 'no' if you only want to analyze your existing portfolio"
-        - If user mentions a sector: Use `suggest_stocks_by_category` to show stocks, wait for user to select specific tickers, then add using `add_new_stocks`
-        - If user mentions a specific stock: Add them using `add_new_stocks`
-        - If user says 'no' or doesn't want additional stocks: Proceed to STEP 6 WITHOUT adding any new stocks
-        - AFTER stocks are added OR user declines, IMMEDIATELY proceed to STEP 6
-
-        **STEP 6:** ONLY IF receiver_email_id is NOT set (not yet asked):
-        - Ask user: "Please provide your email address so we can send you the detailed stock allocation report."
         - WAIT for user response
-        - When user provides their email address, you MUST immediately execute: `store_receiver_email_id(email_id="<user's email>")`
-        - This is a FUNCTION CALL that you must EXECUTE - not describe, not simulate, EXECUTE IT
-        - DO NOT return any response until AFTER calling this tool
-        - Return EXACTLY what the tool returns without modification
-        - The tool will automatically trigger the stock analysis and return the completion message
 
-        **CRITICAL REQUIREMENT**:
-        - If you skip calling `store_receiver_email_id`, the analysis will NEVER be sent to the user
-        - You CANNOT predict what the tool will return - you MUST call it to get the actual response
-        - NEVER generate text like "Stock analysis in progress" yourself - only the tool can return this
-        - After calling this tool, the conversation should END (the tool will return end_session signal)
+        **If user wants to add more stocks:**
+        - If user mentions a sector: Use `suggest_stocks_by_category` with the appropriate category name:
+          * USA_TOP_TECHNOLOGY_STOCKS
+          * USA_TOP_FINANCIAL_STOCKS
+          * USA_TOP_AUTOMOBILE_STOCKS
+          * INDIA_TOP_TECHNOLOGY_STOCKS
+          * INDIA_TOP_FINANCIAL_STOCKS
+          * INDIA_TOP_AUTOMOBILE_STOCKS
+        - Show the stocks from that category
+        - Ask user to select specific tickers from the list
+        - WAIT for user to select tickers
+        - Add selected stocks using `add_new_stocks`
+        - Ask: "Would you like to add stocks from another sector?" and repeat if yes
 
-        **CRITICAL RULES:**
-        - BEFORE asking for any information, check if you already have it stored:
-          * Use `get_investment_amount` to check if investment amount is set
-          * Use `get_stock_lists` to check current state of all stored information
-          * Check if you've already stored diversification_preference, receiver_email_id, etc.
-        - NEVER ask the same question twice - if information is already stored, skip that step
-        - Each step should only execute ONCE per session
-        - ALWAYS wait for agent responses before proceeding (EXCEPT for stock_analyser_agent in STEP 6)
-        - ALWAYS use the exact tools specified
-        - ALWAYS inform user about waiting times (EXCEPT in STEP 6 where analysis happens in background)
-        - After completing all steps and calling `store_receiver_email_id`, the session ENDS automatically
+        **If user mentions specific stock tickers:**
+        - Add them directly using `add_new_stocks`
+        - Ask: "Would you like to add any more stocks?" and repeat if yes
+
+        **If user says 'no':**
+        - Proceed immediately to STEP 5
+
+        - After all stocks are added, proceed immediately to STEP 5
+
+        **STEP 5: Get Email and Trigger Analysis**
+        - BEFORE asking, check `get_stock_lists` to see if receiver_email_id is already set
+        - If NOT set, ask: "Please provide your email address so we can send you the detailed stock allocation report."
+        - WAIT for user response
+        - When user provides email, IMMEDIATELY EXECUTE: `store_receiver_email_id(email_id="<user's email>")`
+        - This is a FUNCTION CALL that MUST be EXECUTED
+        - Return EXACTLY what the tool returns without any modification
+        - The tool will automatically trigger stock analysis and send it in the background
+        - After calling this tool, the conversation ENDS (tool returns end_session signal)
+
+        **CRITICAL REQUIREMENTS:**
+        - ALWAYS check if information is already stored before asking (use `get_investment_amount` and `get_stock_lists`)
+        - NEVER ask the same question twice
+        - Each step executes ONCE per session
+        - ALWAYS wait for user responses and tool responses
+        - In STEP 5, you MUST call `store_receiver_email_id` tool - do NOT generate the response yourself
+        - The `store_receiver_email_id` tool automatically triggers the analysis and returns the completion message
 
         **AVAILABLE SECTORS:**
-        * **ONLY suggest stocks from stock_data.json**: Never suggest sectors or stocks that aren't in the available data. The available categories are:
-          - USA_TOP_FINANCIAL_STOCKS
-          - USA_TOP_AUTOMOBILE_STOCKS  
-          - USA_TOP_TECHNOLOGY_STOCKS
-          - INDIA_TOP_FINANCIAL_STOCKS
-          - INDIA_TOP_AUTOMOBILE_STOCKS
-          - INDIA_TOP_TECHNOLOGY_STOCKS
-        * **Ask for specific sectors**: When user wants to invest in other sectors, ask: "Which sector would you like to consider? Available options are: Technology, Financial, or Automobile for USA/India."
-        * **Consider existing portfolio stocks**: When analyzing allocation, include stocks from the user's current portfolio if they are good candidates for the new allocation.
-        * **No assumptions**: Don't sugg
-        est diversification into sectors not in stock_data.json. Only work with the available data.
+        Only suggest stocks from these categories in stock_data.json:
+        - USA_TOP_FINANCIAL_STOCKS
+        - USA_TOP_AUTOMOBILE_STOCKS
+        - USA_TOP_TECHNOLOGY_STOCKS
+        - INDIA_TOP_FINANCIAL_STOCKS
+        - INDIA_TOP_AUTOMOBILE_STOCKS
+        - INDIA_TOP_TECHNOLOGY_STOCKS
 
         **Available Tools:**
-        * `send_message`: Delegate tasks to Stock Analyser Agent for comprehensive analysis
-        * `store_portfolio_file`: Store uploaded portfolio file to Google Cloud Storage
-        * `check_file_upload_status`: Check if file has been uploaded for current session
-        * `read_and_analyze_portfolio`: Analyze portfolio PDF locally and extract stock tickers
-        * `store_stock_report_response`: Manually store stock report response
-        * `store_investment_amount`: Store the investment amount
-        * `store_diversification_preference`: Store user's choice to keep existing pattern or diversify
-        * `store_receiver_email_id`: Store the email ID to send analysis to
+        * `check_file_upload_status`: Check if portfolio file has been uploaded
+        * `read_and_analyze_portfolio`: Analyze portfolio PDF and extract stock tickers
         * `add_existing_stocks`: Add stocks from portfolio statement
         * `add_new_stocks`: Add new stocks user wants to consider
-        * `get_stock_lists`: View current state of all lists
-        * `analyze_all_stocks`: Create list of stocks to analyze and prepare delegation request
-        * `suggest_stocks_by_category`: Get stocks from specific categories (e.g., 'USA_TOP_TECHNOLOGY_STOCKS')
-        * `get_agent_status`: Check status of connected agents (for debugging)
-        * `test_agent_connection`: Test connection to a specific agent (for debugging)
+        * `store_investment_amount`: Store the investment amount
+        * `store_diversification_preference`: Store user's investment strategy
+        * `store_receiver_email_id`: Store email ID and trigger stock analysis
+        * `get_investment_amount`: Check if investment amount is set
+        * `get_stock_lists`: View current state of all stored information
+        * `suggest_stocks_by_category`: Get stocks from specific categories
+        * `analyze_all_stocks`: Create comprehensive analysis request
+        * `send_message`: Delegate to Stock Analyser Agent
 
-        **Directives:**
-        * **FOLLOW THE STRICT WORKFLOW EXACTLY** - Do not deviate from the 7 steps outlined above
-        * **ALWAYS WAIT** for agent responses before proceeding to the next step (EXCEPT in STEP 7 with stock_analyser_agent)
-        * **ALWAYS INFORM** users about waiting times (about a minute), except in STEP 7 where analysis happens in background
-        * **ONLY COORDINATE AND DELEGATE** - Do not perform any analysis yourself
-        * Use the provided tools to create lists and delegate to other agents
-        * Do not invent or assume any financial data
-        * Your responses must be clear, concise, and easy to understand
-        * When suggesting diversification, only mention sectors available in stock_data.json
-        * Use the `suggest_stocks_by_category` tool directly to get stocks from specific categories
+        **Key Points:**
+        * Be clear and concise in your responses
+        * Only coordinate and delegate - do not perform financial analysis
+        * Follow the workflow strictly in the order specified
+        * Check what information is already stored before asking questions
+        * The stock analysis happens in the background after you call `store_receiver_email_id`
 
         **Today's Date (YYYY-MM-DD):** {datetime.now().strftime("%Y-%m-%d")}
 
@@ -487,9 +536,11 @@ class HostAgent:
                         response_text += part.get("text", "")
                     elif isinstance(part, str):
                         response_text += part
-                
+
                 if response_text:
-                    self.stock_report_response = response_text
+                    state = self._load_state()
+                    state["stock_report_response"] = response_text
+                    self._save_state(state)
                     logger.info(f"Automatically stored response from {agent_name}: {len(response_text)} characters")
             
             # Log when we're about to return the response to the host agent
@@ -604,7 +655,7 @@ class HostAgent:
         logger.info(f"Started background task to send message to {agent_name} (thread: {thread.name})")
 
     def store_portfolio_file(self, user_name: str, file_path: str, session_id: str):
-        """Stores the uploaded portfolio file to AWS S3 bucket."""
+        """Stores the uploaded portfolio file to local storage or AWS S3 bucket depending on environment."""
         try:
             # Use provided session_id
             target_session_id = session_id
@@ -614,20 +665,39 @@ class HostAgent:
 
             logger.info(f"Portfolio file upload requested for user: {user_name}")
             logger.info(f"Source file path: {file_path}")
-            logger.info(f"Target S3 filename: {filename}")
+            logger.info(f"Target filename: {filename}")
             logger.info(f"Session ID: {target_session_id}")
+            logger.info(f"Environment: {current_config.ENVIRONMENT}")
 
-            # Get S3 bucket name from environment
-            bucket_name = os.getenv('S3_BUCKET_NAME', 'finance-a2a-portfolio-statements')
-            logger.info(f"Using S3 bucket: {bucket_name}")
+            # Check if local or production environment
+            if current_config.is_local():
+                # LOCAL STORAGE
+                storage_path = current_config.LOCAL_STORAGE_PATH
+                logger.info(f"Using local storage: {storage_path}")
 
-            # Initialize S3 client
-            s3_client = boto3.client('s3')
+                # Create directory if it doesn't exist
+                os.makedirs(storage_path, exist_ok=True)
 
-            # Upload file to S3
-            s3_client.upload_file(file_path, bucket_name, filename)
+                # Copy file to local storage
+                target_file_path = os.path.join(storage_path, filename)
+                shutil.copy2(file_path, target_file_path)
 
-            logger.info(f"File uploaded to S3: s3://{bucket_name}/{filename}")
+                logger.info(f"File uploaded to local storage: {target_file_path}")
+                storage_location = target_file_path
+
+            else:
+                # S3 STORAGE (Production)
+                bucket_name = current_config.S3_BUCKET_NAME
+                logger.info(f"Using S3 bucket: {bucket_name}")
+
+                # Initialize S3 client
+                s3_client = boto3.client('s3')
+
+                # Upload file to S3
+                s3_client.upload_file(file_path, bucket_name, filename)
+
+                logger.info(f"File uploaded to S3: s3://{bucket_name}/{filename}")
+                storage_location = f"s3://{bucket_name}/{filename}"
 
             # Update database to mark portfolio statement as uploaded
             if target_session_id:
@@ -643,7 +713,7 @@ class HostAgent:
                     logger.error(f"Error updating database for session {target_session_id}: {db_error}")
                     # Don't fail the upload if database update fails
 
-            return f"Portfolio file stored successfully in S3 as: {filename}"
+            return f"Portfolio file stored successfully at: {storage_location}"
 
         except Exception as e:
             error_msg = f"Error storing portfolio file: {e}"
@@ -691,13 +761,17 @@ class HostAgent:
 
     def store_stock_report_response(self, response: str):
         """Stores the response received from the stock report analyser agent."""
-        self.stock_report_response = response
+        state = self._load_state()
+        state["stock_report_response"] = response
+        self._save_state(state)
         logger.info(f"Stored stock report response: {len(response)} characters")
         return f"Stock report response stored successfully. Response length: {len(response)} characters"
 
     def store_investment_amount(self, amount: float):
         """Stores the investment amount for stock analysis."""
-        self.investment_amount = amount
+        state = self._load_state()
+        state["investment_amount"] = amount
+        self._save_state(state)
         logger.info(f"Stored investment amount: ${amount:,.2f}")
         return f"Investment amount stored successfully: ${amount:,.2f}"
 
@@ -708,29 +782,35 @@ class HostAgent:
             preference: The user's detailed investment strategy description
         """
         # Store the FULL preference text, not a simplified version
-        self.diversification_preference = preference.strip()
-        logger.info(f"User's investment strategy stored: {self.diversification_preference[:100]}...")
+        state = self._load_state()
+        state["diversification_preference"] = preference.strip()
+        self._save_state(state)
+        logger.info(f"User's investment strategy stored: {state['diversification_preference'][:100]}...")
         return f"Investment strategy stored successfully: {preference[:100]}..."
 
     def store_receiver_email_id(self, email_id: str):
         """Stores the receiver email ID for sending stock analysis."""
         logger.info(f"========== STORE_RECEIVER_EMAIL_ID FUNCTION CALLED ==========")
         logger.info(f"========== EMAIL ID PARAMETER: {email_id} ==========")
-        self.receiver_email_id = email_id
+
+        # Load state and update email
+        state = self._load_state()
+        state["receiver_email_id"] = email_id
+        self._save_state(state)
         logger.info(f"Stored receiver email ID: {email_id}")
-        
+
         # Check if all prerequisites are met for ending the session
         has_portfolio = False
-        has_investment_amount = self.investment_amount > 0
-        has_stocks = len(self.existing_portfolio_stocks) > 0 or len(self.new_stocks) > 0
-        has_diversification_pref = bool(self.diversification_preference)
+        has_investment_amount = state["investment_amount"] > 0
+        has_stocks = len(state["existing_portfolio_stocks"]) > 0 or len(state["new_stocks"]) > 0
+        has_diversification_pref = bool(state["diversification_preference"])
 
         logger.info(f"========== PREREQUISITES CHECK ==========")
-        logger.info(f"Investment amount: ${self.investment_amount} (valid: {has_investment_amount})")
-        logger.info(f"Existing stocks count: {len(self.existing_portfolio_stocks)}")
-        logger.info(f"New stocks count: {len(self.new_stocks)}")
+        logger.info(f"Investment amount: ${state['investment_amount']} (valid: {has_investment_amount})")
+        logger.info(f"Existing stocks count: {len(state['existing_portfolio_stocks'])}")
+        logger.info(f"New stocks count: {len(state['new_stocks'])}")
         logger.info(f"Has stocks: {has_stocks}")
-        logger.info(f"Diversification preference: '{self.diversification_preference}' (valid: {has_diversification_pref})")
+        logger.info(f"Diversification preference: '{state['diversification_preference']}' (valid: {has_diversification_pref})")
 
         # Check if portfolio statement is uploaded
         try:
@@ -760,7 +840,7 @@ class HostAgent:
                 
                 if analysis_request and not analysis_request.startswith("No stocks") and not analysis_request.startswith("Error"):
                     # Send message to stock_analyser_agent
-                    task_with_email = f"{analysis_request} Email ID: {self.receiver_email_id}"
+                    task_with_email = f"{analysis_request} Email ID: {email_id}"
                     logger.info(f"Sending analysis request to stock_analyser_agent for email {email_id}")
                     
                     # Send the message asynchronously (don't wait for response)
@@ -796,25 +876,29 @@ class HostAgent:
 
     def get_investment_amount(self):
         """Returns the stored investment amount."""
-        if self.investment_amount > 0:
-            return f"Current investment amount: ${self.investment_amount:,.2f}"
+        state = self._load_state()
+        if state["investment_amount"] > 0:
+            return f"Current investment amount: ${state['investment_amount']:,.2f}"
         else:
             return "No investment amount has been set yet."
 
     def add_existing_stocks(self, stocks: List[str]):
         """Adds existing portfolio stocks to the list."""
+        state = self._load_state()
         for stock in stocks:
             stock_upper = stock.upper().strip()
-            if stock_upper not in self.existing_portfolio_stocks:
-                self.existing_portfolio_stocks.append(stock_upper)
-        logger.info(f"Added {len(stocks)} existing stocks. Total: {len(self.existing_portfolio_stocks)}")
-        return f"Added {len(stocks)} existing portfolio stocks. Current list: {', '.join(self.existing_portfolio_stocks)}"
+            if stock_upper not in state["existing_portfolio_stocks"]:
+                state["existing_portfolio_stocks"].append(stock_upper)
+        self._save_state(state)
+        logger.info(f"Added {len(stocks)} existing stocks. Total: {len(state['existing_portfolio_stocks'])}")
+        return f"Added {len(stocks)} existing portfolio stocks. Current list: {', '.join(state['existing_portfolio_stocks'])}"
 
     def add_new_stocks(self, stocks: List[str]):
         """Adds new stocks to the list, converting stock names to tickers using LLM."""
         from google import genai
         from google.genai.types import GenerateContentConfig
 
+        state = self._load_state()
         logger.info(f"Using LLM to find stock tickers for: {stocks}")
 
         # Create the client with proper configuration
@@ -828,10 +912,11 @@ class HostAgent:
                 # Fallback to original behavior
                 for stock in stocks:
                     stock_upper = stock.upper().strip()
-                    if stock_upper not in self.new_stocks:
-                        self.new_stocks.append(stock_upper)
-                logger.info(f"Added {len(stocks)} new stocks (fallback mode). Total: {len(self.new_stocks)}")
-                return f"Added {len(stocks)} new stocks (API key missing). Current list: {', '.join(self.new_stocks)}"
+                    if stock_upper not in state["new_stocks"]:
+                        state["new_stocks"].append(stock_upper)
+                self._save_state(state)
+                logger.info(f"Added {len(stocks)} new stocks (fallback mode). Total: {len(state['new_stocks'])}")
+                return f"Added {len(stocks)} new stocks (API key missing). Current list: {', '.join(state['new_stocks'])}"
             client = genai.Client(api_key=api_key)
             logger.info("Using Google AI API for ticker lookup")
 
@@ -905,67 +990,71 @@ Return ONLY a JSON array of uppercase ticker symbols. If a name is already a tic
             added_count = 0
             for ticker in tickers:
                 ticker_upper = ticker.upper().strip()
-                if ticker_upper not in self.new_stocks:
-                    self.new_stocks.append(ticker_upper)
+                if ticker_upper not in state["new_stocks"]:
+                    state["new_stocks"].append(ticker_upper)
                     added_count += 1
 
-            logger.info(f"Added {added_count} new stocks. Total: {len(self.new_stocks)}")
-            return f"Added {added_count} new stocks (tickers: {', '.join(tickers)}). Current list: {', '.join(self.new_stocks)}"
+            self._save_state(state)
+            logger.info(f"Added {added_count} new stocks. Total: {len(state['new_stocks'])}")
+            return f"Added {added_count} new stocks (tickers: {', '.join(tickers)}). Current list: {', '.join(state['new_stocks'])}"
 
         except Exception as e:
             logger.error(f"Error in LLM ticker lookup: {e}")
             # Fallback to original behavior if LLM call fails
             for stock in stocks:
                 stock_upper = stock.upper().strip()
-                if stock_upper not in self.new_stocks:
-                    self.new_stocks.append(stock_upper)
-            logger.info(f"Added {len(stocks)} new stocks (fallback mode). Total: {len(self.new_stocks)}")
-            return f"Added {len(stocks)} new stocks (using input as-is due to error: {str(e)}). Current list: {', '.join(self.new_stocks)}"
+                if stock_upper not in state["new_stocks"]:
+                    state["new_stocks"].append(stock_upper)
+            self._save_state(state)
+            logger.info(f"Added {len(stocks)} new stocks (fallback mode). Total: {len(state['new_stocks'])}")
+            return f"Added {len(stocks)} new stocks (using input as-is due to error: {str(e)}). Current list: {', '.join(state['new_stocks'])}"
 
     def get_stock_lists(self):
         """Returns the current stock lists, investment amount, and report response."""
+        state = self._load_state()
         result = "**Current Investment Information:**\n\n"
-        
+
         # Add investment amount
         result += f"**Investment Amount:**\n"
-        if self.investment_amount > 0:
-            result += f"${self.investment_amount:,.2f}\n\n"
+        if state["investment_amount"] > 0:
+            result += f"${state['investment_amount']:,.2f}\n\n"
         else:
             result += "Not set yet.\n\n"
-        
+
         # Add receiver email ID
         result += f"**Receiver Email ID:**\n"
-        if self.receiver_email_id:
-            result += f"{self.receiver_email_id}\n\n"
+        if state["receiver_email_id"]:
+            result += f"{state['receiver_email_id']}\n\n"
         else:
             result += "Not set yet.\n\n"
-        
-        result += f"**Existing Portfolio Stocks ({len(self.existing_portfolio_stocks)}):**\n"
-        if self.existing_portfolio_stocks:
-            for i, stock in enumerate(self.existing_portfolio_stocks, 1):
+
+        result += f"**Existing Portfolio Stocks ({len(state['existing_portfolio_stocks'])}):**\n"
+        if state["existing_portfolio_stocks"]:
+            for i, stock in enumerate(state["existing_portfolio_stocks"], 1):
                 result += f"{i}. {stock}\n"
         else:
             result += "No existing portfolio stocks added yet.\n"
-        
-        result += f"\n**New Stocks ({len(self.new_stocks)}):**\n"
-        if self.new_stocks:
-            for i, stock in enumerate(self.new_stocks, 1):
+
+        result += f"\n**New Stocks ({len(state['new_stocks'])}):**\n"
+        if state["new_stocks"]:
+            for i, stock in enumerate(state["new_stocks"], 1):
                 result += f"{i}. {stock}\n"
         else:
             result += "No new stocks added yet.\n"
-        
+
         result += f"\n**Stock Report Response:**\n"
-        if self.stock_report_response:
-            result += f"Response stored ({len(self.stock_report_response)} characters)\n"
-            result += f"Preview: {self.stock_report_response[:200]}...\n"
+        if state["stock_report_response"]:
+            result += f"Response stored ({len(state['stock_report_response'])} characters)\n"
+            result += f"Preview: {state['stock_report_response'][:200]}...\n"
         else:
             result += "No stock report response stored yet.\n"
-        
+
         return result
 
     def analyze_all_stocks(self):
         """Creates a comprehensive list of stocks to analyze and prepares the delegation request."""
-        all_stocks = self.existing_portfolio_stocks + self.new_stocks
+        state = self._load_state()
+        all_stocks = state["existing_portfolio_stocks"] + state["new_stocks"]
 
         if not all_stocks:
             return "No stocks available for analysis. Please add stocks to the lists first."
@@ -973,10 +1062,10 @@ Return ONLY a JSON array of uppercase ticker symbols. If a name is already a tic
         # Create the delegation request with the list of stocks to analyze
         # Include portfolio report if available, otherwise proceed without it
         portfolio_section = ""
-        if self.stock_report_response:
+        if state["stock_report_response"]:
             portfolio_section = f"""
         **PORTFOLIO REPORT (for context):**
-        {self.stock_report_response}
+        {state['stock_report_response']}
         """
         else:
             portfolio_section = """
@@ -986,10 +1075,10 @@ Return ONLY a JSON array of uppercase ticker symbols. If a name is already a tic
 
         # Add user's investment strategy to the delegation request
         strategy_instruction = ""
-        if self.diversification_preference and self.diversification_preference.strip():
+        if state["diversification_preference"] and state["diversification_preference"].strip():
             strategy_instruction = f"""
         **USER'S INVESTMENT STRATEGY:**
-        {self.diversification_preference}
+        {state['diversification_preference']}
 
         **CRITICAL REQUIREMENT:**
         - The stock allocation and recommendations MUST align with the user's investment strategy described above
@@ -1014,8 +1103,8 @@ Return ONLY a JSON array of uppercase ticker symbols. If a name is already a tic
         **STOCKS TO ANALYZE - DELEGATION REQUEST**
         {portfolio_section}
         **COMPLETE LIST OF STOCKS TO ANALYZE:**
-        - Existing Portfolio Stocks: {', '.join(self.existing_portfolio_stocks) if self.existing_portfolio_stocks else 'None'}
-        - New Stocks to Consider: {', '.join(self.new_stocks) if self.new_stocks else 'None'}
+        - Existing Portfolio Stocks: {', '.join(state['existing_portfolio_stocks']) if state['existing_portfolio_stocks'] else 'None'}
+        - New Stocks to Consider: {', '.join(state['new_stocks']) if state['new_stocks'] else 'None'}
         - Total Stocks for Analysis: {len(all_stocks)}
 
         **USER ID:**
@@ -1025,10 +1114,10 @@ Return ONLY a JSON array of uppercase ticker symbols. If a name is already a tic
         {session_id}
 
         **INVESTMENT AMOUNT:**
-        {self.investment_amount}
+        {state['investment_amount']}
 
         **RECEIVER EMAIL ID:**
-        {self.receiver_email_id if self.receiver_email_id else 'Not specified'}
+        {state['receiver_email_id'] if state['receiver_email_id'] else 'Not specified'}
         {strategy_instruction}
         **DELEGATION INSTRUCTIONS:**
         Please analyze all the stocks listed above and provide comprehensive recommendations.
@@ -1037,7 +1126,7 @@ Return ONLY a JSON array of uppercase ticker symbols. If a name is already a tic
         IMPORTANT: Follow the user's investment strategy requirements specified above and ensure your recommendations clearly demonstrate alignment with their stated goals.
         """
 
-        logger.info(f"Created list of {len(all_stocks)} stocks to analyze with diversification preference: {self.diversification_preference}")
+        logger.info(f"Created list of {len(all_stocks)} stocks to analyze with diversification preference: {state['diversification_preference']}")
 
         # Return the delegation request that should be sent to stock analyser agent
         return delegation_request.strip()
@@ -1145,7 +1234,9 @@ Return ONLY a JSON array of uppercase ticker symbols. If a name is already a tic
 
             # Store the response automatically (same as before with remote agent)
             if result and not result.startswith("Error"):
-                self.stock_report_response = result
+                state = self._load_state()
+                state["stock_report_response"] = result
+                self._save_state(state)
                 logger.info(f"Automatically stored portfolio analysis result: {len(result)} characters")
 
             return result
