@@ -35,13 +35,13 @@ import logging
 
 # Import database functions and models at the top
 try:
-    from database import get_db, get_session, mark_portfolio_statement_uploaded, get_agent_state, update_agent_state, User
+    from database import get_db, get_session, mark_portfolio_statement_uploaded, get_agent_state, update_agent_state, get_conversation_history, User
     from config import current_config
 except ImportError:
     # Handle case where database module is in parent directory
     import sys
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-    from database import get_db, get_session, mark_portfolio_statement_uploaded, get_agent_state, update_agent_state, User
+    from database import get_db, get_session, mark_portfolio_statement_uploaded, get_agent_state, update_agent_state, get_conversation_history, User
     from config import current_config
 
 load_dotenv()
@@ -140,7 +140,8 @@ class HostAgent:
         """Load conversation state from database for current session."""
         session_id = self.current_session_id.get("id")
         if not session_id:
-            logger.warning("No session_id available, returning empty state")
+            logger.warning("⚠️ No session_id available in current_session_id, returning empty state")
+            logger.warning(f"   current_session_id = {self.current_session_id}")
             return {
                 "stock_report_response": "",
                 "existing_portfolio_stocks": [],
@@ -151,16 +152,22 @@ class HostAgent:
             }
 
         try:
+            logger.info(f"📖 Loading state for session {session_id}...")
             db = next(get_db())
             agent_state = get_agent_state(db, session_id, "host_agent")
             db.close()
 
             if agent_state and agent_state.state_data:
                 state = json.loads(agent_state.state_data)
-                logger.info(f"Loaded state for session {session_id}")
+                logger.info(f"✓ Loaded existing state for session {session_id}")
+                logger.info(f"   State keys: {list(state.keys())}")
+                logger.info(f"   investment_amount: {state.get('investment_amount', 0)}")
+                logger.info(f"   diversification_preference: {state.get('diversification_preference', 'NOT SET')[:50]}...")
+                logger.info(f"   existing_portfolio_stocks count: {len(state.get('existing_portfolio_stocks', []))}")
+                logger.info(f"   new_stocks count: {len(state.get('new_stocks', []))}")
                 return state
             else:
-                logger.info(f"No existing state for session {session_id}, returning defaults")
+                logger.info(f"ℹ️ No existing state found in database for session {session_id}, returning defaults")
                 return {
                     "stock_report_response": "",
                     "existing_portfolio_stocks": [],
@@ -170,7 +177,9 @@ class HostAgent:
                     "diversification_preference": ""
                 }
         except Exception as e:
-            logger.error(f"Error loading state for session {session_id}: {e}")
+            logger.error(f"✗ Error loading state for session {session_id}: {e}")
+            import traceback
+            logger.error(f"   Traceback: {traceback.format_exc()}")
             return {
                 "stock_report_response": "",
                 "existing_portfolio_stocks": [],
@@ -184,16 +193,26 @@ class HostAgent:
         """Save conversation state to database for current session."""
         session_id = self.current_session_id.get("id")
         if not session_id:
-            logger.warning("No session_id available, cannot save state")
+            logger.warning("⚠️ No session_id available in current_session_id, cannot save state")
+            logger.warning(f"   current_session_id = {self.current_session_id}")
             return
 
         try:
+            logger.info(f"💾 Saving state for session {session_id}...")
+            logger.info(f"   State keys: {list(state.keys())}")
+            logger.info(f"   investment_amount: {state.get('investment_amount', 0)}")
+            logger.info(f"   diversification_preference: {state.get('diversification_preference', 'NOT SET')[:50]}...")
+            logger.info(f"   existing_portfolio_stocks count: {len(state.get('existing_portfolio_stocks', []))}")
+            logger.info(f"   new_stocks count: {len(state.get('new_stocks', []))}")
+
             db = next(get_db())
             update_agent_state(db, session_id, "host_agent", json.dumps(state))
             db.close()
-            logger.info(f"Saved state for session {session_id}")
+            logger.info(f"✓ Successfully saved state for session {session_id}")
         except Exception as e:
-            logger.error(f"Error saving state for session {session_id}: {e}")
+            logger.error(f"✗ Error saving state for session {session_id}: {e}")
+            import traceback
+            logger.error(f"   Traceback: {traceback.format_exc()}")
 
     def create_agent(self) -> Agent:
         max_retries = 5  # Increased retries for API reliability
@@ -382,12 +401,25 @@ class HostAgent:
         """
         # Store the current session ID and user ID for use in tool functions
         self.current_session_id = {"id": session_id, "user_id": user_id, "is_file_uploaded": False}
+
+        # Load existing state at the start of each conversation turn
+        # This ensures the agent has access to previously saved data
+        logger.info(f"🔄 Starting conversation turn for session {session_id}")
+        existing_state = self._load_state()
+        logger.info(f"   Loaded state has {len(existing_state.get('existing_portfolio_stocks', []))} existing stocks, "
+                   f"{len(existing_state.get('new_stocks', []))} new stocks, "
+                   f"investment amount: {existing_state.get('investment_amount', 0)}")
+
         session = await self._runner.session_service.get_session(
             app_name=self._agent.name,
             user_id=self._user_id,
             session_id=session_id,
         )
         content = types.Content(role="user", parts=[types.Part.from_text(text=query)])
+
+        # Track if this is a new session
+        is_new_session = session is None
+
         if session is None:
             session = await self._runner.session_service.create_session(
                 app_name=self._agent.name,
@@ -395,6 +427,43 @@ class HostAgent:
                 state={},
                 session_id=session_id,
             )
+
+        # Load conversation history from database if this is a new in-memory session
+        # This ensures the agent has context from previous conversation turns
+        if is_new_session:
+            try:
+                logger.info(f"📚 Loading conversation history from database for session {session_id}")
+                db = next(get_db())
+                history_messages = get_conversation_history(db, session_id, limit=50)
+                db.close()
+
+                if history_messages:
+                    logger.info(f"   Found {len(history_messages)} historical messages")
+
+                    # Build conversation history by adding messages to the session
+                    # We need to access the session's internal history storage
+                    if hasattr(session, 'contents'):
+                        # Add historical messages to session contents
+                        for msg in history_messages:
+                            # Convert database message to Google ADK Content format
+                            role = "user" if msg.message_type == "user" else "model"
+                            msg_content = types.Content(
+                                role=role,
+                                parts=[types.Part.from_text(text=msg.content)]
+                            )
+                            session.contents.append(msg_content)
+
+                        logger.info(f"✓ Successfully loaded {len(history_messages)} messages into session history")
+                    else:
+                        logger.warning(f"⚠️ Session object doesn't have 'contents' attribute. Cannot populate history.")
+                        logger.info(f"   Session type: {type(session)}, attributes: {dir(session)}")
+                else:
+                    logger.info(f"   No historical messages found for session {session_id}")
+
+            except Exception as e:
+                logger.error(f"✗ Error loading conversation history: {e}")
+                import traceback
+                logger.error(f"   Traceback: {traceback.format_exc()}")
         try:
             async for event in self._runner.run_async(
                 user_id=self._user_id, session_id=session.id, new_message=content
@@ -769,10 +838,11 @@ class HostAgent:
 
     def store_investment_amount(self, amount: float):
         """Stores the investment amount for stock analysis."""
+        logger.info(f"🔧 TOOL CALLED: store_investment_amount(amount={amount})")
         state = self._load_state()
         state["investment_amount"] = amount
         self._save_state(state)
-        logger.info(f"Stored investment amount: ${amount:,.2f}")
+        logger.info(f"✓ Stored investment amount: ${amount:,.2f}")
         return f"Investment amount stored successfully: ${amount:,.2f}"
 
     def store_diversification_preference(self, preference: str):
@@ -781,11 +851,12 @@ class HostAgent:
         Args:
             preference: The user's detailed investment strategy description
         """
+        logger.info(f"🔧 TOOL CALLED: store_diversification_preference(preference='{preference[:100]}...')")
         # Store the FULL preference text, not a simplified version
         state = self._load_state()
         state["diversification_preference"] = preference.strip()
         self._save_state(state)
-        logger.info(f"User's investment strategy stored: {state['diversification_preference'][:100]}...")
+        logger.info(f"✓ User's investment strategy stored: {state['diversification_preference'][:100]}...")
         return f"Investment strategy stored successfully: {preference[:100]}..."
 
     def store_receiver_email_id(self, email_id: str):
@@ -884,17 +955,19 @@ class HostAgent:
 
     def add_existing_stocks(self, stocks: List[str]):
         """Adds existing portfolio stocks to the list."""
+        logger.info(f"🔧 TOOL CALLED: add_existing_stocks(stocks={stocks})")
         state = self._load_state()
         for stock in stocks:
             stock_upper = stock.upper().strip()
             if stock_upper not in state["existing_portfolio_stocks"]:
                 state["existing_portfolio_stocks"].append(stock_upper)
         self._save_state(state)
-        logger.info(f"Added {len(stocks)} existing stocks. Total: {len(state['existing_portfolio_stocks'])}")
+        logger.info(f"✓ Added {len(stocks)} existing stocks. Total: {len(state['existing_portfolio_stocks'])}")
         return f"Added {len(stocks)} existing portfolio stocks. Current list: {', '.join(state['existing_portfolio_stocks'])}"
 
     def add_new_stocks(self, stocks: List[str]):
         """Adds new stocks to the list, converting stock names to tickers using LLM."""
+        logger.info(f"🔧 TOOL CALLED: add_new_stocks(stocks={stocks})")
         from google import genai
         from google.genai.types import GenerateContentConfig
 
@@ -1188,11 +1261,16 @@ Return ONLY a JSON array of uppercase ticker symbols. If a name is already a tic
         This replaces the remote Stock Report Analyser Agent call.
 
         Args:
-            session_id: The current session ID for tracking
+            session_id: The current session ID for tracking (optional, will use current session if not provided)
 
         Returns:
             Formatted string with stock tickers and allocation percentages
         """
+        # If no session_id provided or it looks like a filename, use the current session ID
+        if not session_id or session_id.endswith('.pdf'):
+            session_id = self.current_session_id.get("id", "")
+            logger.info(f"Using current session ID: {session_id}")
+
         logger.info(f"Reading and analyzing portfolio locally for session {session_id}")
 
         try:

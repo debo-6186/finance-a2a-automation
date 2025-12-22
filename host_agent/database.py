@@ -286,6 +286,18 @@ def add_message(db: Session, session_id: str, user_id: str, message_type: str, c
         raise
 
 
+def get_conversation_history(db: Session, session_id: str, limit: int = 50):
+    """Get conversation history for a session in chronological order."""
+    try:
+        messages = db.query(ConversationMessage).filter(
+            ConversationMessage.session_id == session_id
+        ).order_by(ConversationMessage.timestamp.asc()).limit(limit).all()
+        return messages
+    except SQLAlchemyError as e:
+        logger.error(f"Error getting conversation history for session {session_id}: {e}")
+        return []
+
+
 def get_user_message_count(db: Session, user_id: str) -> int:
     """Get the total number of user messages for a user."""
     try:
