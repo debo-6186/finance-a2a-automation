@@ -415,7 +415,6 @@ class HostAgent:
             user_id=self._user_id,
             session_id=session_id,
         )
-        content = types.Content(role="user", parts=[types.Part.from_text(text=query)])
 
         # Track if this is a new session
         is_new_session = session is None
@@ -429,7 +428,8 @@ class HostAgent:
             )
 
         # Load conversation history from database if this is a new in-memory session
-        # This ensures the agent has context from previous conversation turns
+        # Add it as context to the current message instead of trying to modify the session
+        conversation_context = ""
         if is_new_session:
             try:
                 logger.info(f"📚 Loading conversation history from database for session {session_id}")
@@ -440,23 +440,14 @@ class HostAgent:
                 if history_messages:
                     logger.info(f"   Found {len(history_messages)} historical messages")
 
-                    # Build conversation history by adding messages to the session
-                    # We need to access the session's internal history storage
-                    if hasattr(session, 'contents'):
-                        # Add historical messages to session contents
-                        for msg in history_messages:
-                            # Convert database message to Google ADK Content format
-                            role = "user" if msg.message_type == "user" else "model"
-                            msg_content = types.Content(
-                                role=role,
-                                parts=[types.Part.from_text(text=msg.content)]
-                            )
-                            session.contents.append(msg_content)
+                    # Build conversation history as a text summary
+                    history_lines = []
+                    for msg in history_messages:
+                        role = "User" if msg.message_type == "user" else "Assistant"
+                        history_lines.append(f"{role}: {msg.content}")
 
-                        logger.info(f"✓ Successfully loaded {len(history_messages)} messages into session history")
-                    else:
-                        logger.warning(f"⚠️ Session object doesn't have 'contents' attribute. Cannot populate history.")
-                        logger.info(f"   Session type: {type(session)}, attributes: {dir(session)}")
+                    conversation_context = "\n".join(history_lines)
+                    logger.info(f"✓ Loaded {len(history_messages)} messages as conversation context")
                 else:
                     logger.info(f"   No historical messages found for session {session_id}")
 
@@ -464,6 +455,15 @@ class HostAgent:
                 logger.error(f"✗ Error loading conversation history: {e}")
                 import traceback
                 logger.error(f"   Traceback: {traceback.format_exc()}")
+
+        # Prepend conversation history to the current query if we have it
+        if conversation_context:
+            original_query = query
+            query = f"[Previous conversation context - DO NOT repeat these questions, continue from where we left off]:\n{conversation_context}\n\n[Current user message]:\n{original_query}"
+            logger.info(f"   Added conversation context to query ({len(history_messages)} previous messages)")
+
+        # Create content AFTER modifying query with conversation history
+        content = types.Content(role="user", parts=[types.Part.from_text(text=query)])
         try:
             async for event in self._runner.run_async(
                 user_id=self._user_id, session_id=session.id, new_message=content
