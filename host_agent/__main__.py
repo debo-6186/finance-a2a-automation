@@ -26,6 +26,7 @@ from host.agent import HostAgent
 from database import (
     get_db, get_or_create_user, create_session, get_session,
     add_message, can_user_send_message, get_user_message_count,
+    update_agent_state, get_agent_state,
     User, ConversationSession, ConversationMessage, FREE_USER_MESSAGE_LIMIT
 )
 from user_api import (
@@ -385,11 +386,14 @@ async def chat(request: Request, current_user: dict = Depends(get_current_user))
     """
     Send a message to the host agent and get a complete response.
     This endpoint waits for the full response before returning.
-    
+
     Supports two input formats:
     1. JSON payload with Content-Type: application/json
     2. Form data with Content-Type: multipart/form-data (for file uploads)
     """
+    logger.info("=" * 80)
+    logger.info("🔔 DUMMY LOG: /api/chats endpoint has been called!")
+    logger.info("=" * 80)
     logger.info(f"[CHAT] /chats endpoint called successfully")
     logger.info(f"[CHAT] Authenticated user: {current_user.get('uid', 'unknown')} ({current_user.get('email', 'no-email')})")
     
@@ -453,15 +457,15 @@ async def chat(request: Request, current_user: dict = Depends(get_current_user))
     session_id = final_session_id or str(uuid.uuid4())
     logger.info(f"[CHAT] Final session ID: {session_id}")
     
+    # Get database session
+    db = next(get_db())
+
     try:
         logger.info(f"Processing chat message in session {session_id} for user {final_user_id}: {final_message[:100]}...")
-        
-        # Get database session
-        db = next(get_db())
-        
+
         # Get or create user
         get_or_create_user(db, final_user_id, paid_user=final_paid_user)
-        
+
         # Check if user can send more messages
         if not can_user_send_message(db, final_user_id):
             message_count = get_user_message_count(db, final_user_id)
@@ -469,7 +473,7 @@ async def chat(request: Request, current_user: dict = Depends(get_current_user))
                 status_code=429,
                 detail=f"Message limit reached. Free users are limited to {FREE_USER_MESSAGE_LIMIT} messages. You have sent {message_count} messages. Upgrade to paid to continue."
             )
-        
+
         # Get or create session
         session = get_session(db, session_id)
         if not session:
@@ -577,9 +581,40 @@ async def chat(request: Request, current_user: dict = Depends(get_current_user))
         # Add agent response to database
         if full_response:
             add_message(db, session_id, final_user_id, "agent", full_response, "host_agent")
-        
+
+        # Save agent state to database after conversation turn
+        # Note: State should have been saved during tool calls, but we reload and save
+        # here to ensure persistence even if tools weren't called
+        try:
+            import json
+            # Get current state from host agent (loads from DB what was saved during tool calls)
+            current_state = host_agent_instance._load_state()
+
+            # Log the state values for debugging
+            logger.info(f"Current state after conversation turn for session {session_id}:")
+            logger.info(f"  - investment_amount: {current_state.get('investment_amount', 0)}")
+            logger.info(f"  - diversification_preference: {current_state.get('diversification_preference', 'NOT SET')[:50]}...")
+            logger.info(f"  - receiver_email_id: {current_state.get('receiver_email_id', 'NOT SET')}")
+            logger.info(f"  - existing_portfolio_stocks: {len(current_state.get('existing_portfolio_stocks', []))} stocks")
+            logger.info(f"  - new_stocks: {len(current_state.get('new_stocks', []))} stocks")
+
+            # Save state to database
+            update_agent_state(db, session_id, "host_agent", json.dumps(current_state))
+            logger.info(f"Agent state persisted to database for session {session_id}")
+
+            # Verify the save by reading it back
+            saved_state = get_agent_state(db, session_id, "host_agent")
+            if saved_state:
+                logger.info(f"✓ Verified: Agent state exists in database for session {session_id}")
+            else:
+                logger.error(f"✗ Warning: Agent state was NOT saved to database for session {session_id}")
+        except Exception as e:
+            logger.error(f"Error saving agent state for session {session_id}: {e}")
+            import traceback
+            logger.error(f"Traceback: {traceback.format_exc()}")
+
         logger.info(f"Chat response completed for session {session_id}")
-        
+
         # Check if file has been uploaded for this session (either in current request or previously)
         session_has_file_uploaded = file_uploaded  # Current request upload
         if not session_has_file_uploaded:
@@ -587,7 +622,7 @@ async def chat(request: Request, current_user: dict = Depends(get_current_user))
             session_obj = get_session(db, session_id)
             if session_obj and session_obj.portfolio_statement_uploaded:
                 session_has_file_uploaded = True
-        
+
         return ChatResponse(
             response=full_response,
             session_id=session_id,
@@ -595,7 +630,7 @@ async def chat(request: Request, current_user: dict = Depends(get_current_user))
             is_file_uploaded=session_has_file_uploaded,
             end_session=end_session
         )
-        
+
     except HTTPException:
         raise
     except Exception as e:
@@ -611,6 +646,10 @@ async def chat(request: Request, current_user: dict = Depends(get_current_user))
             )
         else:
             raise HTTPException(status_code=500, detail=f"Error processing message: {str(e)}")
+    finally:
+        # Always close the database session
+        db.close()
+        logger.info(f"Database session closed for session {session_id}")
 
 
 @app.post("/api/chats/stream")
@@ -669,13 +708,13 @@ async def chat_stream(request: Request):
     
     # Generate session ID if not provided
     session_id = final_session_id or str(uuid.uuid4())
-    
+
+    # Get database session
+    db = next(get_db())
+
     try:
         logger.info(f"Processing streaming chat message in session {session_id} for user {final_user_id}: {final_message[:100]}...")
-        
-        # Get database session
-        db = next(get_db())
-        
+
         # Get or create user
         get_or_create_user(db, final_user_id, paid_user=final_paid_user)
         
@@ -744,59 +783,97 @@ async def chat_stream(request: Request):
         
         # Add user message to database
         add_message(db, session_id, final_user_id, "user", final_message)
-        
+
         async def generate_response():
-            full_response = ""
-            end_session = False
-            async for response_chunk in host_agent_instance.stream(
-                query=final_message,
-                session_id=session_id,
-                user_id=final_user_id
-            ):
-                content = response_chunk.get("content", "")
-                if response_chunk.get("is_task_complete", False):
-                    # Check if content is a JSON string with message and end_session
-                    try:
-                        import json
-                        if isinstance(content, str) and content.strip().startswith('{') and content.strip().endswith('}'):
-                            parsed_content = json.loads(content.strip())
-                            if isinstance(parsed_content, dict) and "message" in parsed_content:
-                                full_response = parsed_content["message"]
-                                end_session = parsed_content.get("end_session", False)
-                                final_content = parsed_content["message"]
+            try:
+                full_response = ""
+                end_session = False
+                async for response_chunk in host_agent_instance.stream(
+                    query=final_message,
+                    session_id=session_id,
+                    user_id=final_user_id
+                ):
+                    content = response_chunk.get("content", "")
+                    if response_chunk.get("is_task_complete", False):
+                        # Check if content is a JSON string with message and end_session
+                        try:
+                            import json
+                            if isinstance(content, str) and content.strip().startswith('{') and content.strip().endswith('}'):
+                                parsed_content = json.loads(content.strip())
+                                if isinstance(parsed_content, dict) and "message" in parsed_content:
+                                    full_response = parsed_content["message"]
+                                    end_session = parsed_content.get("end_session", False)
+                                    final_content = parsed_content["message"]
+                                else:
+                                    full_response = content
+                                    final_content = content
                             else:
                                 full_response = content
                                 final_content = content
-                        else:
+                        except (json.JSONDecodeError, ValueError):
+                            # If parsing fails, treat as regular string
                             full_response = content
                             final_content = content
-                    except (json.JSONDecodeError, ValueError):
-                        # If parsing fails, treat as regular string
-                        full_response = content
+
+                        # Add agent response to database
+                        if full_response:
+                            add_message(db, session_id, final_user_id, "agent", full_response, "host_agent")
+
+                        # Save agent state to database after conversation turn
+                        # Note: State should have been saved during tool calls, but we reload and save
+                        # here to ensure persistence even if tools weren't called
+                        try:
+                            import json
+                            # Get current state from host agent (loads from DB what was saved during tool calls)
+                            current_state = host_agent_instance._load_state()
+
+                            # Log the state values for debugging
+                            logger.info(f"Current state after conversation turn for session {session_id}:")
+                            logger.info(f"  - investment_amount: {current_state.get('investment_amount', 0)}")
+                            logger.info(f"  - diversification_preference: {current_state.get('diversification_preference', 'NOT SET')[:50]}...")
+                            logger.info(f"  - receiver_email_id: {current_state.get('receiver_email_id', 'NOT SET')}")
+                            logger.info(f"  - existing_portfolio_stocks: {len(current_state.get('existing_portfolio_stocks', []))} stocks")
+                            logger.info(f"  - new_stocks: {len(current_state.get('new_stocks', []))} stocks")
+
+                            # Save state to database
+                            update_agent_state(db, session_id, "host_agent", json.dumps(current_state))
+                            logger.info(f"Agent state persisted to database for session {session_id}")
+
+                            # Verify the save by reading it back
+                            saved_state = get_agent_state(db, session_id, "host_agent")
+                            if saved_state:
+                                logger.info(f"✓ Verified: Agent state exists in database for session {session_id}")
+                            else:
+                                logger.error(f"✗ Warning: Agent state was NOT saved to database for session {session_id}")
+                        except Exception as e:
+                            logger.error(f"Error saving agent state for session {session_id}: {e}")
+                            import traceback
+                            logger.error(f"Traceback: {traceback.format_exc()}")
+
+                    else:
                         final_content = content
-                    
-                    # Add agent response to database
-                    if full_response:
-                        add_message(db, session_id, final_user_id, "agent", full_response, "host_agent")
-                else:
-                    final_content = content
-                
-                # Check if file has been uploaded for this session (either in current request or previously)
-                session_has_file_uploaded = file_uploaded  # Current request upload
-                if not session_has_file_uploaded:
-                    # Check database for previous uploads in this session
-                    session_obj = get_session(db, session_id)
-                    if session_obj and session_obj.portfolio_statement_uploaded:
-                        session_has_file_uploaded = True
-                
-                yield ChatStreamResponse(
-                    content=final_content,
-                    updates=response_chunk.get("updates"),
-                    is_task_complete=response_chunk.get("is_task_complete", False),
-                    session_id=session_id,
-                    is_file_uploaded=session_has_file_uploaded,
-                    end_session=end_session
-                ).model_dump_json() + "\n"
+
+                    # Check if file has been uploaded for this session (either in current request or previously)
+                    session_has_file_uploaded = file_uploaded  # Current request upload
+                    if not session_has_file_uploaded:
+                        # Check database for previous uploads in this session
+                        session_obj = get_session(db, session_id)
+                        if session_obj and session_obj.portfolio_statement_uploaded:
+                            session_has_file_uploaded = True
+
+                    yield ChatStreamResponse(
+                        content=final_content,
+                        updates=response_chunk.get("updates"),
+                        is_task_complete=response_chunk.get("is_task_complete", False),
+                        session_id=session_id,
+                        is_file_uploaded=session_has_file_uploaded,
+                        end_session=end_session
+                    ).model_dump_json() + "\n"
+
+            finally:
+                # Close database session after streaming completes (or on error)
+                db.close()
+                logger.info(f"Database session closed for streaming session {session_id}")
         
         return StreamingResponse(
             generate_response(),
@@ -805,10 +882,23 @@ async def chat_stream(request: Request):
         )
         
     except HTTPException:
+        # Close db if generator hasn't started
+        try:
+            db.close()
+            logger.info(f"Database session closed (HTTPException) for session {session_id}")
+        except:
+            pass  # Already closed or doesn't exist
         raise
     except Exception as e:
         error_message = str(e)
         logger.error(f"Error processing streaming chat message in session {session_id}: {e}")
+
+        # Close db if generator hasn't started
+        try:
+            db.close()
+            logger.info(f"Database session closed (Exception) for session {session_id}")
+        except:
+            pass  # Already closed or doesn't exist
 
         # Check if it's a Google AI API error
         if any(code in error_message for code in ["500 INTERNAL", "503 UNAVAILABLE"]):

@@ -416,9 +416,6 @@ class HostAgent:
             session_id=session_id,
         )
 
-        # Track if this is a new session
-        is_new_session = session is None
-
         if session is None:
             session = await self._runner.session_service.create_session(
                 app_name=self._agent.name,
@@ -427,34 +424,34 @@ class HostAgent:
                 session_id=session_id,
             )
 
-        # Load conversation history from database if this is a new in-memory session
+        # Load conversation history from database on EVERY request
+        # This ensures the agent always has the full conversation context
         # Add it as context to the current message instead of trying to modify the session
         conversation_context = ""
-        if is_new_session:
-            try:
-                logger.info(f"📚 Loading conversation history from database for session {session_id}")
-                db = next(get_db())
-                history_messages = get_conversation_history(db, session_id, limit=50)
-                db.close()
+        try:
+            logger.info(f"📚 Loading conversation history from database for session {session_id}")
+            db = next(get_db())
+            history_messages = get_conversation_history(db, session_id, limit=50)
+            db.close()
 
-                if history_messages:
-                    logger.info(f"   Found {len(history_messages)} historical messages")
+            if history_messages:
+                logger.info(f"   Found {len(history_messages)} historical messages")
 
-                    # Build conversation history as a text summary
-                    history_lines = []
-                    for msg in history_messages:
-                        role = "User" if msg.message_type == "user" else "Assistant"
-                        history_lines.append(f"{role}: {msg.content}")
+                # Build conversation history as a text summary
+                history_lines = []
+                for msg in history_messages:
+                    role = "User" if msg.message_type == "user" else "Assistant"
+                    history_lines.append(f"{role}: {msg.content}")
 
-                    conversation_context = "\n".join(history_lines)
-                    logger.info(f"✓ Loaded {len(history_messages)} messages as conversation context")
-                else:
-                    logger.info(f"   No historical messages found for session {session_id}")
+                conversation_context = "\n".join(history_lines)
+                logger.info(f"✓ Loaded {len(history_messages)} messages as conversation context")
+            else:
+                logger.info(f"   No historical messages found for session {session_id}")
 
-            except Exception as e:
-                logger.error(f"✗ Error loading conversation history: {e}")
-                import traceback
-                logger.error(f"   Traceback: {traceback.format_exc()}")
+        except Exception as e:
+            logger.error(f"✗ Error loading conversation history: {e}")
+            import traceback
+            logger.error(f"   Traceback: {traceback.format_exc()}")
 
         # Prepend conversation history to the current query if we have it
         if conversation_context:
