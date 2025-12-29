@@ -34,7 +34,7 @@ class MissingAPIKeyError(Exception):
 
 def main():
     """Starts the agent server."""
-    host = "localhost"
+    host = "0.0.0.0"  # Listen on all interfaces to accept connections from other containers
     port = 10002
     try:
         # Check for API key only if Vertex AI is not configured
@@ -52,10 +52,12 @@ def main():
             tags=["stock", "analysis"],
             examples=["Analyse AAPL"],
         )
+        # Use service discovery hostname in AWS, localhost for local development
+        agent_url = os.getenv("AGENT_URL", f"http://{host}:{port}/")
         agent_card = AgentCard(
             name="Stock Analyser Agent",
             description="An agent that analyse US stocks and give recommendations for buying or selling.",
-            url=f"http://{host}:{port}/",
+            url=agent_url,
             version="1.0.0",
             defaultInputModes=["text/plain"],
             defaultOutputModes=["text/plain"],

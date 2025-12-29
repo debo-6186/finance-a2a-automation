@@ -135,3 +135,13 @@ override.tf.json
 *_override.tf.json
 .terraformrc
 terraform.rc
+
+# Local file storage (development only)
+local_storage/
+# Output files
+terraform/migration_response.json
+stockanalyser_agent/stock_analysis_results.txt
+
+# MCP servers (separate repository)
+finhub-mcp/
+terraform/*.zip

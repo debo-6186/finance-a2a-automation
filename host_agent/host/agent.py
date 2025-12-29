@@ -30,7 +30,7 @@ from google.adk.sessions import InMemorySessionService
 from google.adk.tools import FunctionTool
 from google.genai import types
 from .remote_agent_connection import RemoteAgentConnections
-from .pdf_analyzer import read_portfolio_statement, extract_stock_tickers_from_portfolio
+from .document_analyzer import read_portfolio_document, extract_stock_tickers_from_text
 import logging
 
 # Import database functions and models at the top
@@ -230,6 +230,7 @@ class HostAgent:
                         FunctionTool(self.store_portfolio_file),
                         FunctionTool(self.check_file_upload_status),
                         FunctionTool(self.read_and_analyze_portfolio),
+                        FunctionTool(self.analyze_text_portfolio),
                         FunctionTool(self.store_stock_report_response),
                         FunctionTool(self.store_investment_amount),
                         FunctionTool(self.store_diversification_preference),
@@ -279,13 +280,28 @@ class HostAgent:
         **WORKFLOW - FOLLOW THESE STEPS IN ORDER:**
 
         **STEP 1: Analyze Portfolio**
-        - When user starts the conversation, tell them: "Please upload your latest portfolio statement (PDF format)."
-        - Use `check_file_upload_status` to check if file has been uploaded
-        - Once file IS uploaded, inform user: "Your portfolio statement has been uploaded. I'm analyzing it now. This will take about a minute."
+        - When user starts the conversation, tell them: "To analyze your portfolio, you can provide your portfolio information in any of these ways:
+          1. Upload a PDF statement
+          2. Upload a screenshot/image of your portfolio
+          3. Type your stock holdings and allocation percentages directly (e.g., 'AAPL 30%, GOOGL 20%, MSFT 50%')"
+
+        - Use `check_file_upload_status` to check if portfolio data has been provided (via file or text)
+
+        **If file is uploaded (PDF or image):**
+        - Inform user: "Your portfolio has been uploaded. I'm analyzing it now. This will take about a minute."
         - Use `read_and_analyze_portfolio` tool with current session ID to analyze the portfolio
         - WAIT for the response from the tool
         - Extract existing stocks from the response and add them using `add_existing_stocks`
         - Show user their existing stock list from the portfolio
+
+        **If user provides portfolio as text:**
+        - Identify when user types portfolio data (stock tickers with/without percentages)
+        - Use `analyze_text_portfolio` tool with the user's text input
+        - WAIT for the response from the tool
+        - Extract existing stocks from the response and add them using `add_existing_stocks`
+        - Show user their existing stock list from the portfolio
+
+        - Once portfolio is analyzed (regardless of format), proceed to STEP 2
 
         **STEP 2: Get Investment Amount**
         - BEFORE asking, check if investment amount is already set using `get_investment_amount`
@@ -367,7 +383,8 @@ class HostAgent:
 
         **Available Tools:**
         * `check_file_upload_status`: Check if portfolio file has been uploaded
-        * `read_and_analyze_portfolio`: Analyze portfolio PDF and extract stock tickers
+        * `read_and_analyze_portfolio`: Analyze portfolio document (PDF or image) and extract stock tickers
+        * `analyze_text_portfolio`: Analyze portfolio data provided as text input
         * `add_existing_stocks`: Add stocks from portfolio statement
         * `add_new_stocks`: Add new stocks user wants to consider
         * `store_investment_amount`: Store the investment amount
@@ -721,17 +738,31 @@ class HostAgent:
         logger.info(f"Started background task to send message to {agent_name} (thread: {thread.name})")
 
     def store_portfolio_file(self, user_name: str, file_path: str, session_id: str):
-        """Stores the uploaded portfolio file to local storage or AWS S3 bucket depending on environment."""
+        """Stores the uploaded portfolio file to local storage or AWS S3 bucket depending on environment.
+        Supports PDF and image file formats.
+        """
         try:
             # Use provided session_id
             target_session_id = session_id
 
-            # Generate filename using the specified format
-            filename = f"{user_name}_{target_session_id}_portfolio_statement.pdf"
+            # Get file extension from source file
+            file_ext = os.path.splitext(file_path)[1]
+
+            # Determine input format type
+            if file_ext.lower() == '.pdf':
+                input_format = 'pdf'
+            elif file_ext.lower() in ['.jpg', '.jpeg', '.png', '.gif', '.bmp', '.tiff', '.webp']:
+                input_format = 'image'
+            else:
+                input_format = 'unknown'
+
+            # Generate filename using the specified format with correct extension
+            filename = f"{user_name}_{target_session_id}_portfolio_statement{file_ext}"
 
             logger.info(f"Portfolio file upload requested for user: {user_name}")
             logger.info(f"Source file path: {file_path}")
             logger.info(f"Target filename: {filename}")
+            logger.info(f"File format: {input_format}")
             logger.info(f"Session ID: {target_session_id}")
             logger.info(f"Environment: {current_config.ENVIRONMENT}")
 
@@ -765,13 +796,13 @@ class HostAgent:
                 logger.info(f"File uploaded to S3: s3://{bucket_name}/{filename}")
                 storage_location = f"s3://{bucket_name}/{filename}"
 
-            # Update database to mark portfolio statement as uploaded
+            # Update database to mark portfolio statement as uploaded with format type
             if target_session_id:
                 try:
                     db = next(get_db())
-                    success = mark_portfolio_statement_uploaded(db, target_session_id)
+                    success = mark_portfolio_statement_uploaded(db, target_session_id, input_format=input_format)
                     if success:
-                        logger.info(f"Database updated: portfolio_statement_uploaded = True for session {target_session_id}")
+                        logger.info(f"Database updated: portfolio_statement_uploaded = True ({input_format}) for session {target_session_id}")
                     else:
                         logger.warning(f"Failed to update database for session {target_session_id}")
                     db.close()
@@ -1254,8 +1285,8 @@ Return ONLY a JSON array of uppercase ticker symbols. If a name is already a tic
 
     def read_and_analyze_portfolio(self, session_id: str = "") -> str:
         """
-        Reads portfolio PDF and extracts stock tickers locally (integrated PDF analyzer).
-        This replaces the remote Stock Report Analyser Agent call.
+        Reads portfolio document (PDF or image) and extracts stock tickers locally.
+        Supports multiple document formats.
 
         Args:
             session_id: The current session ID for tracking (optional, will use current session if not provided)
@@ -1263,10 +1294,14 @@ Return ONLY a JSON array of uppercase ticker symbols. If a name is already a tic
         Returns:
             Formatted string with stock tickers and allocation percentages
         """
-        # If no session_id provided or it looks like a filename, use the current session ID
-        if not session_id or session_id.endswith('.pdf'):
-            session_id = self.current_session_id.get("id", "")
-            logger.info(f"Using current session ID: {session_id}")
+        # Always use the stored current_session_id if available (prevents LLM from using extracted filenames)
+        current_id = self.current_session_id.get("id", "")
+        if current_id:
+            logger.info(f"Using stored current session ID: {current_id} (ignoring parameter: {session_id})")
+            session_id = current_id
+        elif not session_id or session_id.endswith('.pdf'):
+            logger.error(f"No valid session ID available. Provided: {session_id}")
+            return "Error: No valid session ID available to retrieve portfolio file."
 
         logger.info(f"Reading and analyzing portfolio locally for session {session_id}")
 
@@ -1286,26 +1321,36 @@ Return ONLY a JSON array of uppercase ticker symbols. If a name is already a tic
 
                 # Get user info - use user.id (not user.name) as it's what was used during upload
                 user = db.query(User).filter(User.id == session.user_id).first()
+
+                # Get the input format from session
+                input_format = session.input_format if session.input_format else 'pdf'
+
                 db.close()
 
                 if not user:
                     return "Error: User information not found. Cannot retrieve portfolio file."
 
                 user_id = user.id
+            else:
+                # Try to get input format from database
+                db = next(get_db())
+                session = get_session(db, session_id)
+                input_format = session.input_format if session and session.input_format else 'pdf'
+                db.close()
 
-            logger.info(f"Retrieved user_id: {user_id} for session {session_id}")
+            logger.info(f"Retrieved user_id: {user_id}, format: {input_format} for session {session_id}")
 
-            # Step 1: Read the PDF from S3
-            portfolio_text = read_portfolio_statement(session_id, user_id)
+            # Step 1: Read the document (PDF or image) from storage
+            portfolio_text, actual_format = read_portfolio_document(session_id, user_id, input_format)
 
             if portfolio_text.startswith("Error"):
                 logger.error(f"Error reading portfolio: {portfolio_text}")
                 return portfolio_text
 
-            logger.info(f"Successfully read portfolio text: {len(portfolio_text)} characters")
+            logger.info(f"Successfully read portfolio text ({actual_format}): {len(portfolio_text)} characters")
 
             # Step 2: Extract tickers from the text
-            result = extract_stock_tickers_from_portfolio(portfolio_text)
+            result = extract_stock_tickers_from_text(portfolio_text)
 
             # Store the response automatically (same as before with remote agent)
             if result and not result.startswith("Error"):
@@ -1318,6 +1363,56 @@ Return ONLY a JSON array of uppercase ticker symbols. If a name is already a tic
 
         except Exception as e:
             error_msg = f"Error in read_and_analyze_portfolio: {e}"
+            logger.error(error_msg)
+            return f"Error: {error_msg}"
+
+    def analyze_text_portfolio(self, portfolio_text: str) -> str:
+        """
+        Analyzes portfolio data provided as text input by the user.
+        Supports formats like:
+        - "AAPL 30%, GOOGL 20%, MSFT 50%"
+        - "Apple 30%, Google 20%, Microsoft 50%"
+        - "My portfolio: AAPL, GOOGL, MSFT"
+
+        Args:
+            portfolio_text: The portfolio data as text
+
+        Returns:
+            Formatted string with stock tickers and allocation percentages
+        """
+        try:
+            logger.info(f"Analyzing text-based portfolio input: {len(portfolio_text)} characters")
+
+            if not portfolio_text or len(portfolio_text.strip()) < 3:
+                return "Error: Please provide portfolio data in text format."
+
+            # Extract tickers from the text using LLM
+            result = extract_stock_tickers_from_text(portfolio_text)
+
+            # Store the response automatically if successful
+            if result and not result.startswith("Error") and not result.startswith("No stock"):
+                state = self._load_state()
+                state["stock_report_response"] = result
+
+                # Mark portfolio statement as uploaded in text format
+                current_id = self.current_session_id.get("id", "")
+                if current_id:
+                    try:
+                        db = next(get_db())
+                        success = mark_portfolio_statement_uploaded(db, current_id, input_format='text')
+                        if success:
+                            logger.info(f"Marked portfolio as uploaded (text format) for session {current_id}")
+                        db.close()
+                    except Exception as db_error:
+                        logger.error(f"Error updating database: {db_error}")
+
+                self._save_state(state)
+                logger.info(f"Automatically stored text portfolio analysis result: {len(result)} characters")
+
+            return result
+
+        except Exception as e:
+            error_msg = f"Error in analyze_text_portfolio: {e}"
             logger.error(error_msg)
             return f"Error: {error_msg}"
 

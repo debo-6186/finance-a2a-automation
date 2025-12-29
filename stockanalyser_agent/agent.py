@@ -1,7 +1,6 @@
 from google.adk.agents import Agent
 from google.adk.tools.mcp_tool.mcp_toolset import (
     MCPToolset,
-    StdioServerParameters,
     StdioConnectionParams,
 )
 from mcp import StdioServerParameters
@@ -26,6 +25,7 @@ from google import genai
 from google.genai.types import GenerateContentConfig, HttpOptions
 from database import get_db, save_stock_recommendation
 from openai import OpenAI
+from config import current_config
 
 # Setup logging and get log file path
 log_file_path = setup_logging()
@@ -47,19 +47,26 @@ class StockAnalyzerAgent:
         self.stock_analysis_data = {}  # Store stock analysis data in memory
         
         # Initialize MCP tool
+        # Get MCP directory from config (environment-aware)
+        mcp_directory = current_config.MCP_DIRECTORY
+        logger.info(f"Using MCP directory: {mcp_directory}")
+
+        # Prepare environment variables for MCP server (no longer needs FINNHUB_API_KEY)
         mcp_env = {**os.environ}
         mcp_env["MCP_TIMEOUT"] = os.getenv("MCP_TIMEOUT", "30")  # Default 30 seconds
-        
+
+        # Use current Python interpreter (dependencies are now installed in stockanalyser_agent venv)
+        # This avoids the uv run overhead and virtual environment resolution issues
+        import sys
+        server_script = os.path.join(mcp_directory, "server.py")
+        command = sys.executable  # Use the current Python interpreter
+        args = [server_script]
+
         connection_params = StdioConnectionParams(
             server_params=StdioServerParameters(
-                command="uv",
-                args=[
-                    "--directory",
-                    "/Users/debojyotichakraborty/codebase/finhub-mcp",
-                    "run",
-                    "server.py"
-                ],
-                timeout=60,
+                command=command,
+                args=args,
+                env=mcp_env,
             )
         )
         self.stock_mcp_tool = MCPToolset(
@@ -285,7 +292,7 @@ SESSION_ID: sess456"""
             logger.info("Using Perplexity API with sonar-pro model for portfolio analysis")
 
             # Expert system prompt for portfolio recommendations
-            system_prompt = f"""You are a senior portfolio manager with 20+ years of experience in equity analysis and portfolio construction. Your role is to provide data-driven stock allocation recommendations with specific buy/sell/hold decisions.
+            system_prompt = f"""You are a senior portfolio manager with 20+ years of experience in equity analysis and portfolio construction. Your role is to provide data-driven stock allocation recommendations with specific buy/sell/hold decisions and INTELLIGENT WEIGHTED ALLOCATION.
 
 ANALYTICAL FRAMEWORK:
 1. Fundamental Analysis: Evaluate valuation metrics (P/E, P/B, PEG ratio), financial health (debt ratios, cash flow), growth metrics (revenue/earnings growth), and profitability margins
@@ -307,7 +314,7 @@ HOLD: Meets ANY of the following:
 - Already appropriately weighted in portfolio
 - Neutral analyst consensus or significant uncertainty
 
-SELL: Must meet ANY of the following:
+SELL: Meets ANY of the following:
 - Current price ≥15% above analyst mean target with deteriorating fundamentals
 - Declining revenue/earnings with high valuation (P/E >30 AND negative growth)
 - Significant negative news or fundamental deterioration
@@ -316,7 +323,36 @@ SELL: Must meet ANY of the following:
 PORTFOLIO CONSTRAINTS:
 - Total investment budget: ${self.investment_amount}
 - Maximum single stock allocation: 25% of total budget
+- Minimum single stock allocation: 5% of total budget (to ensure meaningful positions)
 - Ensure sector diversification: No more than 40% in any single sector
+
+INTELLIGENT ALLOCATION METHODOLOGY (CRITICAL - MUST FOLLOW):
+For each BUY recommendation, assign a CONVICTION LEVEL and allocate accordingly:
+
+HIGH CONVICTION (20-25% of budget): Stock meets ALL criteria:
+- Analyst consensus "Strong Buy" OR price target upside >25%
+- Strong fundamentals (P/E <20, revenue growth >20%, healthy margins >15%)
+- Positive technical momentum (price above both 50-day and 200-day MA)
+- Low risk (beta <1.2, strong balance sheet)
+
+MEDIUM CONVICTION (10-15% of budget): Stock meets MOST criteria:
+- Analyst consensus "Buy" OR price target upside 10-25%
+- Solid fundamentals (reasonable P/E, positive growth)
+- Neutral to positive technical signals
+- Moderate risk (beta 1.0-1.5)
+
+LOW CONVICTION (5-10% of budget): Stock meets MINIMUM criteria:
+- Analyst consensus "Hold/Buy" OR price target upside 10-15%
+- Acceptable fundamentals
+- Mixed technical signals
+- Higher risk (beta >1.5) OR smaller cap OR sector concerns
+
+ALLOCATION RULES:
+1. NEVER allocate $0 to a BUY recommendation - minimum is 5% of total budget
+2. Total BUY allocations MUST sum exactly to ${self.investment_amount}
+3. If fewer BUY opportunities, increase allocation to higher conviction stocks (up to 25% max)
+4. Distribute remaining budget across BUY recommendations proportionally by conviction
+5. For HOLD and SELL: investment_amount is always "$0"
 
 OUTPUT FORMAT (** STRICTLY FOLLOW THE BELOW JSON FORMAT **):
 You must return ONLY a valid JSON object with the following structure:
@@ -332,9 +368,10 @@ You must return ONLY a valid JSON object with the following structure:
         {{
             "ticker": "string",
             "recommendation": "string (BUY/HOLD/SELL)",
-            "investment_amount": "string (e.g., '$2500' for BUY, '$0' for HOLD/SELL)",
+            "conviction_level": "string (HIGH/MEDIUM/LOW for BUY, N/A for HOLD/SELL)",
+            "investment_amount": "string (NEVER $0 for BUY, always $0 for HOLD/SELL)",
             "key_metrics": "string (Current P/E [X], Target Upside [X%], Analyst Rating [X], Revenue Growth [X%])",
-            "reasoning": "string (2-3 sentences explaining the decision)"
+            "reasoning": "string (2-3 sentences explaining the decision and conviction level)"
         }}
     ],
     "risk_warnings": [
@@ -346,10 +383,11 @@ You must return ONLY a valid JSON object with the following structure:
 CRITICAL RULES:
 - Return ONLY valid JSON - no markdown, no extra text, no code blocks, no ```json wrapper
 - Base ALL decisions on the quantitative data provided, not general market knowledge
-- Be consistent: apply the same criteria to all stocks
-- Be objective: no bias toward popular stocks or sectors
-- Reference specific metrics that drove each decision in the reasoning field
-- Ensure total BUY allocations sum exactly to ${self.investment_amount}
+- NEVER return $0 for BUY recommendations - minimum 5% of budget
+- Always assign conviction_level to BUY recommendations
+- Ensure total BUY allocations sum EXACTLY to ${self.investment_amount}
+- Use weighted allocation based on conviction, NOT equal distribution
+- Reference specific metrics that justify the conviction level and allocation
 - IMPORTANT: If the request includes specific DIVERSIFICATION REQUIREMENTS or INVESTMENT PATTERN preferences, prioritize following those instructions
 - If user wants to DIVERSIFY: Focus heavily on sector diversification and risk minimization, potentially recommending lower allocation percentages to existing concentrated sectors
 - If user wants to MAINTAIN EXISTING PATTERN: Analyze and replicate the sector distribution from their existing portfolio"""

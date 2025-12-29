@@ -128,8 +128,27 @@ for agent in host-agent stockanalyser-agent; do
     fi
 done
 
-# Step 6: Summary
-print_info "Step 6/6: Deployment preparation complete!"
+# Step 6: Update ECS Services
+print_info "Step 6/7: Updating ECS services with new images..."
+
+# Check if services exist and update them
+for service in host-agent stockanalyser-agent; do
+    if aws ecs describe-services --cluster $CLUSTER_NAME --services $service --region $AWS_REGION --query 'services[0].status' --output text 2>/dev/null | grep -q "ACTIVE"; then
+        print_info "Forcing new deployment for service: $service"
+        aws ecs update-service \
+            --cluster $CLUSTER_NAME \
+            --service $service \
+            --force-new-deployment \
+            --region $AWS_REGION \
+            --no-cli-pager > /dev/null
+        print_info "✓ Deployment triggered for $service"
+    else
+        print_warning "Service $service does not exist yet. Skipping update."
+    fi
+done
+
+# Step 7: Summary
+print_info "Step 7/7: Deployment complete!"
 
 cat << EOF
 
@@ -139,28 +158,25 @@ Deployment Status
 
 ✓ ECR repositories created
 ✓ Docker images built and pushed
-✓ ECS cluster created: $CLUSTER_NAME
+✓ ECS cluster verified: $CLUSTER_NAME
 ✓ CloudWatch log groups created
+✓ ECS services updated (if they exist)
 
-${YELLOW}Next Steps:${NC}
-1. Create RDS PostgreSQL database (see AWS_DEPLOYMENT_GUIDE.md)
-2. Configure secrets in AWS Secrets Manager:
-   - ${PROJECT_NAME}/database
-   - ${PROJECT_NAME}/api-keys
-3. Set up VPC, subnets, and security groups (see AWS_DEPLOYMENT_GUIDE.md)
-4. Create and deploy ECS task definitions (see AWS_DEPLOYMENT_GUIDE.md)
-5. Create Application Load Balancer
-6. Create ECS services
+${YELLOW}Post-Deployment Tasks:${NC}
+1. Run database migration Lambda function to apply schema changes
+2. Update frontend environment variables with API CloudFront URL
+3. Deploy frontend to Firebase Hosting
 
+${GREEN}Useful Commands:${NC}
+# Monitor ECS services
+aws ecs describe-services --cluster $CLUSTER_NAME --services host-agent stockanalyser-agent --region $AWS_REGION
 
-For detailed instructions, see: AWS_DEPLOYMENT_GUIDE.md
+# View service logs
+aws logs tail /ecs/${PROJECT_NAME}-host-agent --follow --region $AWS_REGION
+aws logs tail /ecs/${PROJECT_NAME}-stockanalyser-agent --follow --region $AWS_REGION
 
-${GREEN}Quick Test Commands:${NC}
-# Check cluster status
-aws ecs describe-clusters --clusters $CLUSTER_NAME --region $AWS_REGION
-
-# View log groups
-aws logs describe-log-groups --log-group-name-prefix /ecs/${PROJECT_NAME} --region $AWS_REGION
+# Check CloudFront URL
+cd terraform && terraform output cloudfront_url
 
 # List ECR images
 aws ecr list-images --repository-name ${PROJECT_NAME}/host-agent --region $AWS_REGION

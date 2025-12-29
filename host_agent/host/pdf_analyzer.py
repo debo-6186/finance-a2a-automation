@@ -13,57 +13,86 @@ import logging
 from google import genai
 from google.genai.types import GenerateContentConfig
 
-# Import database functions at the top
+# Import database functions and config at the top
 try:
     from database import get_db, mark_portfolio_statement_uploaded
+    from config import current_config
 except ImportError:
     # Handle case where database module is in parent directory
     import sys
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     from database import get_db, mark_portfolio_statement_uploaded
+    from config import current_config
 
-logger = logging.getLogger("pdf_analyzer")
+# Configure logger - will use parent logger's handlers (host_agent_api)
+logger = logging.getLogger("host_agent_api.pdf_analyzer")
+logger.setLevel(logging.INFO)
 
 
 def read_portfolio_statement(session_id: str = "", user_name: str = "") -> str:
     """
-    Reads portfolio statement PDF from S3 and returns text content.
+    Reads portfolio statement PDF from local storage or S3 and returns text content.
 
     Args:
-        session_id: The session ID for tracking (used for database updates and S3 filename)
-        user_name: The user name (used for S3 filename)
+        session_id: The session ID for tracking (used for database updates and filename)
+        user_name: The user name (used for filename)
 
     Returns:
         Extracted text from the PDF or error message
     """
     try:
         if not session_id or not user_name:
-            return "Error: session_id and user_name are required to retrieve portfolio statement from S3"
+            return "Error: session_id and user_name are required to retrieve portfolio statement"
 
-        # Get S3 bucket name from environment
-        bucket_name = os.getenv('S3_BUCKET_NAME', 'finance-a2a-portfolio-statements')
-
-        # Construct S3 filename matching what was uploaded
+        # Construct filename matching what was uploaded
         filename = f"{user_name}_{session_id}_portfolio_statement.pdf"
 
-        logger.info(f"Attempting to download PDF from S3: s3://{bucket_name}/{filename}")
+        logger.info(f"Attempting to read PDF file: {filename}")
+        logger.info(f"Environment: {current_config.ENVIRONMENT}")
 
-        # Initialize S3 client and download file
-        s3_client = boto3.client('s3')
+        # Check if local or production environment
+        if current_config.is_local():
+            # LOCAL STORAGE
+            storage_path = current_config.LOCAL_STORAGE_PATH
+            file_path = os.path.join(storage_path, filename)
 
-        # Download file to memory
-        file_obj = io.BytesIO()
-        s3_client.download_fileobj(bucket_name, filename, file_obj)
-        file_obj.seek(0)
-        file_bytes = file_obj.read()
+            logger.info(f"Reading from local storage: {file_path}")
 
-        logger.info(f"Successfully downloaded {len(file_bytes)} bytes from S3")
+            if not os.path.exists(file_path):
+                return f"Error: Portfolio file not found in local storage. Expected: {file_path}"
 
-    except s3_client.exceptions.NoSuchKey:
-        return f"Error: Portfolio file not found in S3. Expected: s3://{bucket_name}/{filename}"
+            # Read file from local storage
+            with open(file_path, 'rb') as f:
+                file_bytes = f.read()
+
+            logger.info(f"Successfully read {len(file_bytes)} bytes from local storage")
+
+        else:
+            # S3 STORAGE (Production)
+            bucket_name = current_config.S3_BUCKET_NAME
+            logger.info(f"Attempting to download PDF from S3: s3://{bucket_name}/{filename}")
+
+            # Initialize S3 client and download file
+            s3_client = boto3.client('s3')
+
+            # Download file to memory
+            file_obj = io.BytesIO()
+            try:
+                s3_client.download_fileobj(bucket_name, filename, file_obj)
+                file_obj.seek(0)
+                file_bytes = file_obj.read()
+
+                logger.info(f"Successfully downloaded {len(file_bytes)} bytes from S3")
+
+            except s3_client.exceptions.NoSuchKey:
+                return f"Error: Portfolio file not found in S3. Expected: s3://{bucket_name}/{filename}"
+            except Exception as e:
+                logger.error(f"Error downloading PDF from S3: {e}")
+                return f"Error reading PDF file from S3: {e}"
+
     except Exception as e:
-        logger.error(f"Error downloading PDF from S3: {e}")
-        return f"Error reading PDF file from S3: {e}"
+        logger.error(f"Error reading portfolio file: {e}")
+        return f"Error reading PDF file: {e}"
 
     try:
         logger.info("Opening PDF with PyMuPDF...")

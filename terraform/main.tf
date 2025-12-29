@@ -52,6 +52,11 @@ variable "firebase_project_id" {
   type        = string
 }
 
+variable "bastion_public_key" {
+  description = "SSH public key for bastion host access"
+  type        = string
+}
+
 # VPC
 resource "aws_vpc" "main" {
   cidr_block           = "10.0.0.0/16"
@@ -203,6 +208,39 @@ resource "aws_security_group" "ecs_tasks" {
   }
 }
 
+resource "aws_security_group" "bastion" {
+  name        = "${var.project_name}-bastion-sg"
+  description = "Security group for Bastion host"
+  vpc_id      = aws_vpc.main.id
+
+  ingress {
+    from_port   = 22
+    to_port     = 22
+    protocol    = "tcp"
+    cidr_blocks = ["202.142.87.117/32"]
+    description = "SSH access from your IP"
+  }
+
+  ingress {
+    from_port   = 443
+    to_port     = 443
+    protocol    = "tcp"
+    cidr_blocks = ["202.142.87.117/32"]
+    description = "SSH access on port 443 from your IP"
+  }
+
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  tags = {
+    Name = "${var.project_name}-bastion-sg"
+  }
+}
+
 resource "aws_security_group" "rds" {
   name        = "${var.project_name}-rds-sg"
   description = "Security group for RDS database"
@@ -213,6 +251,14 @@ resource "aws_security_group" "rds" {
     to_port         = 5432
     protocol        = "tcp"
     security_groups = [aws_security_group.ecs_tasks.id]
+  }
+
+  ingress {
+    from_port       = 5432
+    to_port         = 5432
+    protocol        = "tcp"
+    security_groups = [aws_security_group.bastion.id]
+    description     = "PostgreSQL access from bastion host"
   }
 
   egress {
@@ -350,11 +396,12 @@ resource "aws_lb" "main" {
 
 # Target Group
 resource "aws_lb_target_group" "host_agent" {
-  name        = "${var.project_name}-host-tg"
-  port        = 10001
-  protocol    = "HTTP"
-  vpc_id      = aws_vpc.main.id
-  target_type = "ip"
+  name                 = "${var.project_name}-host-tg"
+  port                 = 10001
+  protocol             = "HTTP"
+  vpc_id               = aws_vpc.main.id
+  target_type          = "ip"
+  deregistration_delay = 120  # Allow 2 minutes for in-flight requests
 
   health_check {
     enabled             = true
@@ -545,8 +592,16 @@ resource "aws_ecs_task_definition" "stockanalyser_agent" {
       ]
       environment = [
         {
+          name  = "ENVIRONMENT"
+          value = "production"
+        },
+        {
           name  = "GOOGLE_GENAI_USE_VERTEXAI"
           value = "FALSE"
+        },
+        {
+          name  = "MCP_DIRECTORY"
+          value = "/app/finhub-mcp"
         },
         {
           name  = "DATABASE_URL"
@@ -561,6 +616,18 @@ resource "aws_ecs_task_definition" "stockanalyser_agent" {
         {
           name      = "PERPLEXITY_API_KEY"
           valueFrom = "${aws_secretsmanager_secret.api_keys.arn}:PERPLEXITY_API_KEY::"
+        },
+        {
+          name      = "FINNHUB_API_KEY"
+          valueFrom = "${aws_secretsmanager_secret.api_keys.arn}:FINNHUB_API_KEY::"
+        },
+        {
+          name      = "ACTIVEPIECES_USERNAME"
+          valueFrom = "${aws_secretsmanager_secret.api_keys.arn}:ACTIVEPIECES_USERNAME::"
+        },
+        {
+          name      = "ACTIVEPIECES_PASSWORD"
+          valueFrom = "${aws_secretsmanager_secret.api_keys.arn}:ACTIVEPIECES_PASSWORD::"
         }
       ]
       logConfiguration = {
@@ -609,6 +676,10 @@ resource "aws_ecs_task_definition" "host_agent" {
       ]
       environment = [
         {
+          name  = "ENVIRONMENT"
+          value = "production"
+        },
+        {
           name  = "GOOGLE_GENAI_USE_VERTEXAI"
           value = "FALSE"
         },
@@ -621,7 +692,7 @@ resource "aws_ecs_task_definition" "host_agent" {
           value = "30"
         },
         {
-          name  = "STOCK_ANALYSER_URL"
+          name  = "STOCK_ANALYSER_AGENT_URL"
           value = "http://stockanalyser-agent.local:10002"
         },
         {
@@ -731,10 +802,12 @@ resource "aws_cloudfront_distribution" "api" {
     origin_id   = "ALB"
 
     custom_origin_config {
-      http_port              = 80
-      https_port             = 443
-      origin_protocol_policy = "http-only"
-      origin_ssl_protocols   = ["TLSv1.2"]
+      http_port                = 80
+      https_port               = 443
+      origin_protocol_policy   = "http-only"
+      origin_ssl_protocols     = ["TLSv1.2"]
+      origin_read_timeout      = 120  # Increased to 2 minutes for Gemini Vision API
+      origin_keepalive_timeout = 60   # Keep connections alive longer
     }
   }
 
@@ -773,6 +846,88 @@ resource "aws_cloudfront_distribution" "api" {
   }
 }
 
+# Bastion Host
+data "aws_ami" "amazon_linux_2" {
+  most_recent = true
+  owners      = ["amazon"]
+
+  filter {
+    name   = "name"
+    values = ["amzn2-ami-hvm-*-x86_64-gp2"]
+  }
+
+  filter {
+    name   = "virtualization-type"
+    values = ["hvm"]
+  }
+}
+
+resource "aws_key_pair" "bastion" {
+  key_name   = "${var.project_name}-bastion-key"
+  public_key = var.bastion_public_key
+
+  tags = {
+    Name = "${var.project_name}-bastion-key"
+  }
+}
+
+resource "aws_iam_role" "bastion" {
+  name = "${var.project_name}-bastion-role"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Action = "sts:AssumeRole"
+        Effect = "Allow"
+        Principal = {
+          Service = "ec2.amazonaws.com"
+        }
+      }
+    ]
+  })
+
+  tags = {
+    Name = "${var.project_name}-bastion-role"
+  }
+}
+
+resource "aws_iam_role_policy_attachment" "bastion_ssm" {
+  role       = aws_iam_role.bastion.name
+  policy_arn = "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"
+}
+
+resource "aws_iam_instance_profile" "bastion" {
+  name = "${var.project_name}-bastion-profile"
+  role = aws_iam_role.bastion.name
+
+  tags = {
+    Name = "${var.project_name}-bastion-profile"
+  }
+}
+
+resource "aws_instance" "bastion" {
+  ami                         = data.aws_ami.amazon_linux_2.id
+  instance_type               = "t3.micro"
+  subnet_id                   = aws_subnet.public_1.id
+  vpc_security_group_ids      = [aws_security_group.bastion.id]
+  key_name                    = aws_key_pair.bastion.key_name
+  associate_public_ip_address = true
+  iam_instance_profile        = aws_iam_instance_profile.bastion.name
+
+  user_data = <<-EOF
+              #!/bin/bash
+              yum update -y
+              yum install -y postgresql
+              echo "Port 443" >> /etc/ssh/sshd_config
+              systemctl restart sshd
+              EOF
+
+  tags = {
+    Name = "${var.project_name}-bastion"
+  }
+}
+
 # Outputs
 output "alb_dns_name" {
   description = "DNS name of the Application Load Balancer"
@@ -802,4 +957,19 @@ output "ecs_cluster_name" {
 output "application_url" {
   description = "URL to access the application"
   value       = "http://${aws_lb.main.dns_name}"
+}
+
+output "bastion_public_ip" {
+  description = "Public IP address of the bastion host"
+  value       = aws_instance.bastion.public_ip
+}
+
+output "bastion_ssh_command" {
+  description = "SSH command to connect to bastion host"
+  value       = "ssh -i ~/.ssh/finance-a2a-bastion -p 443 ec2-user@${aws_instance.bastion.public_ip}"
+}
+
+output "database_tunnel_command" {
+  description = "SSH tunnel command for database access"
+  value       = "ssh -i ~/.ssh/finance-a2a-bastion -p 443 -L 5432:${aws_db_instance.postgres.address}:5432 ec2-user@${aws_instance.bastion.public_ip} -N"
 }

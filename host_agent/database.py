@@ -63,14 +63,15 @@ class User(Base):
 class ConversationSession(Base):
     """Session model for tracking conversation state across agents."""
     __tablename__ = "conversation_sessions"
-    
+
     id = Column(String, primary_key=True, index=True)
     user_id = Column(String, ForeignKey("users.id"), nullable=False, index=True)
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
     is_active = Column(Boolean, default=True, nullable=False)
     portfolio_statement_uploaded = Column(Boolean, default=False, nullable=False)
-    
+    input_format = Column(String, nullable=True)  # 'pdf', 'image', 'text', or None
+
     # Relationships
     user = relationship("User", back_populates="sessions")
     messages = relationship("ConversationMessage", back_populates="session", cascade="all, delete-orphan")
@@ -376,8 +377,14 @@ def get_agent_state(db: Session, session_id: str, agent_name: str) -> Optional[A
         return None
 
 
-def mark_portfolio_statement_uploaded(db: Session, session_id: str) -> bool:
-    """Mark portfolio statement as uploaded for a session."""
+def mark_portfolio_statement_uploaded(db: Session, session_id: str, input_format: str = 'pdf') -> bool:
+    """Mark portfolio statement as uploaded for a session.
+
+    Args:
+        db: Database session
+        session_id: Session ID
+        input_format: Format of input - 'pdf', 'image', or 'text'
+    """
     try:
         session = db.query(ConversationSession).filter(
             ConversationSession.id == session_id,
@@ -386,10 +393,11 @@ def mark_portfolio_statement_uploaded(db: Session, session_id: str) -> bool:
 
         if session:
             session.portfolio_statement_uploaded = True
+            session.input_format = input_format
             session.updated_at = datetime.utcnow()
             db.commit()
             db.refresh(session)
-            logger.info(f"Marked portfolio statement as uploaded for session {session_id}")
+            logger.info(f"Marked portfolio statement as uploaded ({input_format}) for session {session_id}")
             return True
         else:
             logger.warning(f"Session {session_id} not found or inactive")
@@ -403,6 +411,12 @@ def mark_portfolio_statement_uploaded(db: Session, session_id: str) -> bool:
 def save_stock_recommendation(db: Session, session_id: str, user_id: str, recommendation: dict) -> Optional[StockRecommendation]:
     """Save stock recommendation to database."""
     try:
+        # Ensure user exists before saving recommendation
+        user = get_or_create_user(db, user_id)
+        if not user:
+            logger.error(f"Failed to create/get user {user_id} for stock recommendation")
+            return None
+
         stock_recommendation = StockRecommendation(
             id=f"{session_id}_{user_id}_{datetime.utcnow().timestamp()}",
             session_id=session_id,

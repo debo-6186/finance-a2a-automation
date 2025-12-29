@@ -6,7 +6,8 @@ Handles environment-based settings for local vs production deployment.
 import os
 from dotenv import load_dotenv
 
-load_dotenv()
+# Load .env file but DON'T override existing environment variables (from ECS, Docker, etc.)
+load_dotenv(override=False)
 
 
 class Config:

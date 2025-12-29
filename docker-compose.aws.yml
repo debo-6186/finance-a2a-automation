@@ -42,8 +42,8 @@ services:
 
   stockanalyser_agent:
     build:
-      context: ./stockanalyser_agent
-      dockerfile: Dockerfile
+      context: .
+      dockerfile: stockanalyser_agent/Dockerfile
     container_name: stockanalyser_agent
     environment:
       - GOOGLE_API_KEY=${GOOGLE_API_KEY}
@@ -53,6 +53,8 @@ services:
       - ACTIVEPIECES_PASSWORD=${ACTIVEPIECES_PASSWORD}
       - ACTIVEPIECES_WEBHOOK_URL=${ACTIVEPIECES_WEBHOOK_URL}
       - DATABASE_URL=postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-finance_a2a}
+      - MCP_DIRECTORY=/app/finhub-mcp
+      - ENVIRONMENT=production
     ports:
       - "10002:10002"
     depends_on:
@@ -81,8 +83,8 @@ services:
       - FREE_USER_MESSAGE_LIMIT=${FREE_USER_MESSAGE_LIMIT:-30}
       - ACTIVEPIECES_USERNAME=${ACTIVEPIECES_USERNAME}
       - ACTIVEPIECES_PASSWORD=${ACTIVEPIECES_PASSWORD}
-      - STOCK_ANALYSER_URL=http://stockanalyser_agent:10002
-      - STOCK_REPORT_ANALYSER_URL=http://stockreport_analyser_agent:10003
+      - STOCK_ANALYSER_AGENT_URL=http://stockanalyser_agent:10002
+      - STOCK_REPORT_ANALYSER_AGENT_URL=http://stockreport_analyser_agent:10003
     ports:
       - "10001:10001"
     depends_on:

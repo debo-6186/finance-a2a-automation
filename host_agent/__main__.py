@@ -113,9 +113,12 @@ class LoginResponse(BaseModel):
 # Global variable to store the host agent instance
 host_agent_instance: Optional[HostAgent] = None
 
-# Agent URLs configuration
+# Import configuration
+from config import current_config as Config
+
+# Agent URLs configuration - read from environment via config
 AGENT_URLS = [
-    "http://localhost:10002",  # Stock Analyser Agent
+    Config.STOCK_ANALYSER_AGENT_URL,  # Stock Analyser Agent
     # Stock Report Analyser Agent removed - now integrated locally as a sub-agent
 ]
 
@@ -483,13 +486,23 @@ async def chat(request: Request, current_user: dict = Depends(get_current_user))
         file_uploaded = False
         if uploaded_file and hasattr(uploaded_file, 'filename') and uploaded_file.filename:
             try:
-                # Validate file type (should be PDF)
-                if not uploaded_file.filename.lower().endswith('.pdf'):
-                    raise HTTPException(status_code=400, detail="Only PDF files are allowed")
-                
-                # Create a temporary file path
+                # Validate file type (PDF or image formats)
+                filename_lower = uploaded_file.filename.lower()
+                allowed_extensions = ['.pdf', '.jpg', '.jpeg', '.png', '.gif', '.bmp', '.tiff', '.webp']
+
+                if not any(filename_lower.endswith(ext) for ext in allowed_extensions):
+                    raise HTTPException(
+                        status_code=400,
+                        detail="Only PDF and image files (JPG, PNG, GIF, BMP, TIFF, WEBP) are allowed"
+                    )
+
+                # Get file extension
+                import os
+                file_ext = os.path.splitext(uploaded_file.filename)[1]
+
+                # Create a temporary file path with appropriate extension
                 import tempfile
-                with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf') as temp_file:
+                with tempfile.NamedTemporaryFile(delete=False, suffix=file_ext) as temp_file:
                     # Read and write file content
                     if hasattr(uploaded_file, 'read'):
                         content = await uploaded_file.read()
@@ -735,13 +748,23 @@ async def chat_stream(request: Request):
         file_uploaded = False
         if uploaded_file and hasattr(uploaded_file, 'filename') and uploaded_file.filename:
             try:
-                # Validate file type (should be PDF)
-                if not uploaded_file.filename.lower().endswith('.pdf'):
-                    raise HTTPException(status_code=400, detail="Only PDF files are allowed")
-                
-                # Create a temporary file path
+                # Validate file type (PDF or image formats)
+                filename_lower = uploaded_file.filename.lower()
+                allowed_extensions = ['.pdf', '.jpg', '.jpeg', '.png', '.gif', '.bmp', '.tiff', '.webp']
+
+                if not any(filename_lower.endswith(ext) for ext in allowed_extensions):
+                    raise HTTPException(
+                        status_code=400,
+                        detail="Only PDF and image files (JPG, PNG, GIF, BMP, TIFF, WEBP) are allowed"
+                    )
+
+                # Get file extension
+                import os
+                file_ext = os.path.splitext(uploaded_file.filename)[1]
+
+                # Create a temporary file path with appropriate extension
                 import tempfile
-                with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf') as temp_file:
+                with tempfile.NamedTemporaryFile(delete=False, suffix=file_ext) as temp_file:
                     # Read and write file content
                     if hasattr(uploaded_file, 'read'):
                         content = await uploaded_file.read()
