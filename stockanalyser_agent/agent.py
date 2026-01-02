@@ -23,7 +23,7 @@ import asyncio
 from functools import wraps
 from google import genai
 from google.genai.types import GenerateContentConfig, HttpOptions
-from database import get_db, save_stock_recommendation
+from database import get_db, save_stock_recommendation, save_portfolio_analysis
 from openai import OpenAI
 from config import current_config
 
@@ -45,6 +45,8 @@ class StockAnalyzerAgent:
         self.user_id = ""
         self.session_id = ""
         self.stock_analysis_data = {}  # Store stock analysis data in memory
+        self.stock_current_prices = {}  # Store current prices separately for easier access
+        self.stock_share_counts = {}  # Store share counts for existing stocks
         
         # Initialize MCP tool
         # Get MCP directory from config (environment-aware)
@@ -78,8 +80,7 @@ class StockAnalyzerAgent:
         self.extract_stocks_from_analysis_request_tool = FunctionTool(self.extract_stocks_from_analysis_request)
         self.get_expert_portfolio_recommendations_tool = FunctionTool(self.get_expert_portfolio_recommendations)
         self.save_stock_analysis_to_memory_tool = FunctionTool(self.save_stock_analysis_to_memory)
-        self.save_portfolio_analysis_to_file_tool = FunctionTool(self.save_portfolio_analysis_to_file)
-        self.save_investment_details_to_file_tool = FunctionTool(self.save_investment_details_to_file)
+        self.save_portfolio_analysis_tool = FunctionTool(self.save_portfolio_analysis)
         self.send_analysis_to_webhook_tool = FunctionTool(self.send_analysis_to_webhook)
 
     def extract_stocks_from_analysis_request(self, analysis_request: str) -> str:
@@ -118,45 +119,60 @@ class StockAnalyzerAgent:
                 logger.info("Using Google AI API for stock extraction")
             
             # System prompt for stock extraction
-            system_prompt = """You are a stock ticker extraction specialist. Your sole task is to extract stock ticker symbols from analysis requests.
+            system_prompt = """You are a stock ticker extraction specialist. Your sole task is to extract stock ticker symbols and share counts from analysis requests.
 
 TASK:
 Extract stock tickers from the analysis request and categorize them as existing portfolio stocks or new stocks to analyze.
 If stock names (not tickers) are provided, identify and convert them to their corresponding ticker symbols.
+For existing stocks, also extract the number of shares owned if mentioned.
 
 RULES:
 - Extract ONLY valid stock ticker symbols (e.g., AAPL, GOOGL, TSLA)
 - If a company name is provided (e.g., "Apple", "Microsoft"), convert it to the ticker (AAPL, MSFT)
 - Categorize stocks as "existing" if they are mentioned as part of current portfolio
 - Categorize stocks as "new" if they are mentioned for potential investment or analysis
+- Extract share counts for existing stocks if mentioned (e.g., "10 shares of AAPL", "5.5 TSLA shares")
 - Also extract the investment amount, email ID, user ID, and session ID if present
 
 OUTPUT FORMAT (respond with ONLY these lines):
 EXISTING: TICKER1, TICKER2, TICKER3 (or NONE if no existing stocks)
 NEW: TICKER1, TICKER2, TICKER3 (or NONE if no new stocks)
+SHARES: TICKER1=10, TICKER2=5.5, TICKER3=20 (share counts for existing stocks, or NONE if not mentioned)
 INVESTMENT_AMOUNT: amount (numeric value only, or 0 if not found)
 EMAIL_ID: email@example.com (or not_found if not present)
 USER_ID: user_id (or not_found if not present)
 SESSION_ID: session_id (or not_found if not present)
 
 EXAMPLES:
-Input: "I have Apple and Microsoft in my portfolio. I want to invest $5000 in Tesla and Amazon. Email: john@example.com"
+Input: "I have 10 shares of Apple and 5 shares of Microsoft in my portfolio. I want to invest $5000 in Tesla and Amazon. Email: john@example.com"
 Output:
 EXISTING: AAPL, MSFT
 NEW: TSLA, AMZN
+SHARES: AAPL=10, MSFT=5
 INVESTMENT_AMOUNT: 5000
 EMAIL_ID: john@example.com
 USER_ID: not_found
 SESSION_ID: not_found
 
-Input: "Analyze NVDA, VOO and suggest new stocks PLTR, GOOGL for $10000. USER ID: user123 SESSION ID: sess456"
+Input: "Analyze my NVDA (20 shares), VOO (15.5 shares) and suggest new stocks PLTR, GOOGL for $10000. USER ID: user123 SESSION ID: sess456"
 Output:
 EXISTING: NVDA, VOO
 NEW: PLTR, GOOGL
+SHARES: NVDA=20, VOO=15.5
 INVESTMENT_AMOUNT: 10000
 EMAIL_ID: not_found
 USER_ID: user123
-SESSION_ID: sess456"""
+SESSION_ID: sess456
+
+Input: "I own Apple, Microsoft, Tesla. Want to invest $3000 in Amazon and Google."
+Output:
+EXISTING: AAPL, MSFT, TSLA
+NEW: AMZN, GOOGL
+SHARES: NONE
+INVESTMENT_AMOUNT: 3000
+EMAIL_ID: not_found
+USER_ID: not_found
+SESSION_ID: not_found"""
 
             # Generate stock extraction using LLM with retry logic
             logger.info("Generating stock extraction using LLM")
@@ -201,9 +217,10 @@ SESSION_ID: sess456"""
                         raise
 
             logger.info("Received LLM response for stock extraction")
-            
+
             existing_stocks = []
             new_stocks = []
+            self.stock_share_counts = {}  # Reset share counts
 
             if response and response.text:
                 # Parse the LLM response
@@ -222,6 +239,18 @@ SESSION_ID: sess456"""
                         stocks_text = line.replace("NEW:", "").strip()
                         if stocks_text and stocks_text.upper() != "NONE":
                             new_stocks = [s.strip().upper() for s in stocks_text.split(',') if s.strip()]
+                    elif line.startswith("SHARES:"):
+                        shares_text = line.replace("SHARES:", "").strip()
+                        if shares_text and shares_text.upper() != "NONE":
+                            # Parse share counts: AAPL=10, MSFT=5.5
+                            share_pairs = [s.strip() for s in shares_text.split(',') if s.strip()]
+                            for pair in share_pairs:
+                                if '=' in pair:
+                                    ticker, count = pair.split('=')
+                                    try:
+                                        self.stock_share_counts[ticker.strip().upper()] = float(count.strip())
+                                    except ValueError:
+                                        logger.warning(f"Could not parse share count for {ticker}: {count}")
                     elif line.startswith("INVESTMENT_AMOUNT:"):
                         self.investment_amount = line.replace("INVESTMENT_AMOUNT:", "").strip()
                     elif line.startswith("EMAIL_ID:"):
@@ -242,6 +271,7 @@ SESSION_ID: sess456"""
             }
 
             logger.info(f"LLM-powered stock extraction complete: {len(existing_stocks)} existing, {len(new_stocks)} new stocks")
+            logger.info(f"Share counts extracted: {self.stock_share_counts}")
             logger.info(f"Investment amount: {self.investment_amount}")
             logger.info(f"Email id: {self.email_id}")
             logger.info(f"User ID: {self.user_id}")
@@ -253,11 +283,14 @@ SESSION_ID: sess456"""
             logger.error(f"Error in LLM stock extraction: {str(e)}")
             return f"Error extracting stocks from analysis request: {e}"
 
-    def get_expert_portfolio_recommendations(self) -> str:
+    def get_expert_portfolio_recommendations(self, analysis_request: str = "") -> str:
         """
         Analyzes portfolio data from memory and provides comprehensive investment recommendations.
         Reads both portfolio analysis and individual stock data to make buy/sell/hold decisions.
         Uses Perplexity's sonar-pro model for analysis.
+
+        Args:
+            analysis_request: Original portfolio analysis request containing current holdings information
 
         Returns:
             JSON string with comprehensive portfolio analysis with specific investment recommendations and amounts
@@ -314,11 +347,33 @@ HOLD: Meets ANY of the following:
 - Already appropriately weighted in portfolio
 - Neutral analyst consensus or significant uncertainty
 
-SELL: Meets ANY of the following:
-- Current price ≥15% above analyst mean target with deteriorating fundamentals
-- Declining revenue/earnings with high valuation (P/E >30 AND negative growth)
-- Significant negative news or fundamental deterioration
-- Overweight position that increases portfolio concentration risk above 25% in any stock
+SELL: ⚠️ CRITICAL REQUIREMENT - Share count MUST be known for SELL recommendations
+- **PREREQUISITE:** Stock MUST have a known share count (check SHARE COUNTS section in request)
+- **IF SHARE COUNT IS NOT PROVIDED:** Mark as HOLD instead of SELL, with reasoning explaining share count is needed
+- **IF SHARE COUNT IS PROVIDED:** Can recommend SELL if it meets ANY of the following:
+  - Current price ≥15% above analyst mean target with deteriorating fundamentals
+  - Declining revenue/earnings with high valuation (P/E >30 AND negative growth)
+  - Significant negative news or fundamental deterioration
+  - Overweight position that increases portfolio concentration risk above 25% in any stock
+
+**SHARES TO SELL CALCULATION (CRITICAL - MUST INCLUDE FOR SELL RECOMMENDATIONS):**
+When recommending SELL, you MUST specify how many shares to sell:
+1. **COMPLETE EXIT (recommend "ALL"):** Use when:
+   - Fundamentals are severely deteriorating (negative growth, high debt, loss of competitive advantage)
+   - Stock is significantly overvalued (>20% above target with no growth prospects)
+   - Company facing existential risks (bankruptcy, regulatory shutdown, major fraud)
+   Example: shares_to_sell: "ALL (complete exit recommended due to deteriorating fundamentals)"
+
+2. **PARTIAL SELL (recommend specific number):** Use when:
+   - Stock is moderately overvalued but has some long-term potential
+   - Position is too large (trim to reduce concentration risk)
+   - Taking profits while maintaining some exposure
+   - Calculate: Determine how many shares to sell to achieve target allocation or risk reduction
+   Example: shares_to_sell: "PARTIAL: 5.5 shares (reduce position by 50% to lock in gains)"
+
+3. **POSITION SIZE CONTEXT:** Always reference the total shares owned from SHARE COUNTS section
+   Example: "You own 10.5 shares of AAPL. Recommend selling ALL due to overvaluation."
+   Example: "You own 20 shares of TSLA. Recommend selling PARTIAL: 10 shares to reduce concentration."
 
 PORTFOLIO CONSTRAINTS:
 - Total investment budget: ${self.investment_amount}
@@ -347,12 +402,32 @@ LOW CONVICTION (5-10% of budget): Stock meets MINIMUM criteria:
 - Mixed technical signals
 - Higher risk (beta >1.5) OR smaller cap OR sector concerns
 
-ALLOCATION RULES:
-1. NEVER allocate $0 to a BUY recommendation - minimum is 5% of total budget
-2. Total BUY allocations MUST sum exactly to ${self.investment_amount}
-3. If fewer BUY opportunities, increase allocation to higher conviction stocks (up to 25% max)
-4. Distribute remaining budget across BUY recommendations proportionally by conviction
-5. For HOLD and SELL: investment_amount is always "$0"
+ALLOCATION RULES (** CRITICAL - MUST FOLLOW **):
+1. ⚠️ NEVER EVER allocate $0 to a BUY recommendation - minimum is 5% of total budget
+2. ⚠️ If a stock CANNOT be allocated due to ANY constraint (sector limits, budget, etc.), mark it as HOLD, NOT BUY
+3. Total BUY allocations MUST sum exactly to ${self.investment_amount}
+4. If fewer BUY opportunities, increase allocation to higher conviction stocks (up to 25% max)
+5. Distribute remaining budget across BUY recommendations proportionally by conviction
+6. For HOLD and SELL: investment_amount is always "$0"
+
+IMPORTANT CLARIFICATION:
+- BUY = Stock gets money allocated (minimum 5%, maximum 25%)
+- HOLD = Stock has potential BUT cannot be allocated due to constraints (sector limits, budget exhausted, etc.) OR stock should be sold but share count is not available
+- SELL = Stock should be exited (ONLY if share count is known from SHARE COUNTS section)
+
+Examples:
+1. Sector constraint: If NFLX looks good but you already have 40% in Communication Services sector:
+   ❌ WRONG: {{"ticker": "NFLX", "recommendation": "BUY", "investment_amount": "$0"}}
+   ✅ CORRECT: {{"ticker": "NFLX", "recommendation": "HOLD", "investment_amount": "$0", "reasoning": "Strong fundamentals but sector concentration limit prevents allocation"}}
+
+2. Missing share count: If AAPL should be sold but share count is not provided:
+   ❌ WRONG: {{"ticker": "AAPL", "recommendation": "SELL", "investment_amount": "$0"}}
+   ✅ CORRECT: {{"ticker": "AAPL", "recommendation": "HOLD", "investment_amount": "$0", "reasoning": "Overvalued and should be sold, but share count not provided. Cannot make SELL recommendation without knowing position size."}}
+
+3. SELL with share count provided: If TSLA should be sold and you know user owns 20 shares:
+   ❌ WRONG: {{"ticker": "TSLA", "recommendation": "SELL", "investment_amount": "$0", "reasoning": "Overvalued"}}
+   ✅ CORRECT (Complete Exit): {{"ticker": "TSLA", "recommendation": "SELL", "investment_amount": "$0", "shares_to_sell": "ALL (20 shares)", "reasoning": "Significantly overvalued at 30% above analyst target with deteriorating fundamentals. Recommend complete exit of all 20 shares."}}
+   ✅ CORRECT (Partial): {{"ticker": "TSLA", "recommendation": "SELL", "investment_amount": "$0", "shares_to_sell": "PARTIAL: 10 shares", "reasoning": "Moderately overvalued. Recommend selling 50% (10 of 20 shares) to reduce concentration risk while maintaining some exposure."}}
 
 OUTPUT FORMAT (** STRICTLY FOLLOW THE BELOW JSON FORMAT **):
 You must return ONLY a valid JSON object with the following structure:
@@ -370,6 +445,7 @@ You must return ONLY a valid JSON object with the following structure:
             "recommendation": "string (BUY/HOLD/SELL)",
             "conviction_level": "string (HIGH/MEDIUM/LOW for BUY, N/A for HOLD/SELL)",
             "investment_amount": "string (NEVER $0 for BUY, always $0 for HOLD/SELL)",
+            "shares_to_sell": "string (ONLY for SELL: 'ALL' or specific number like '10.5 shares' or 'PARTIAL: 5 shares')",
             "key_metrics": "string (Current P/E [X], Target Upside [X%], Analyst Rating [X], Revenue Growth [X%])",
             "reasoning": "string (2-3 sentences explaining the decision and conviction level)"
         }}
@@ -383,19 +459,46 @@ You must return ONLY a valid JSON object with the following structure:
 CRITICAL RULES:
 - Return ONLY valid JSON - no markdown, no extra text, no code blocks, no ```json wrapper
 - Base ALL decisions on the quantitative data provided, not general market knowledge
-- NEVER return $0 for BUY recommendations - minimum 5% of budget
-- Always assign conviction_level to BUY recommendations
+- ⚠️ NEVER EVER return $0 for BUY recommendations - if you can't allocate, use HOLD instead
+- ⚠️ BUY means money is allocated, HOLD means good stock but constrained, SELL means avoid
+- ⚠️ ALL SELL recommendations MUST include shares_to_sell field (either "ALL" or "PARTIAL: X shares")
+- Always assign conviction_level to BUY recommendations (HIGH/MEDIUM/LOW)
 - Ensure total BUY allocations sum EXACTLY to ${self.investment_amount}
 - Use weighted allocation based on conviction, NOT equal distribution
 - Reference specific metrics that justify the conviction level and allocation
+- For SELL recommendations, clearly explain WHY selling ALL vs PARTIAL shares
 - IMPORTANT: If the request includes specific DIVERSIFICATION REQUIREMENTS or INVESTMENT PATTERN preferences, prioritize following those instructions
 - If user wants to DIVERSIFY: Focus heavily on sector diversification and risk minimization, potentially recommending lower allocation percentages to existing concentrated sectors
-- If user wants to MAINTAIN EXISTING PATTERN: Analyze and replicate the sector distribution from their existing portfolio"""
+- If user wants to MAINTAIN EXISTING PATTERN: Analyze and replicate the sector distribution from their existing portfolio
+
+VALIDATION CHECKLIST (Before returning JSON):
+✓ All BUY recommendations have investment_amount > $0 (minimum 5% of budget)?
+✓ All HOLD/SELL recommendations have investment_amount = "$0"?
+✓ All SELL recommendations have share counts provided in SHARE COUNTS section?
+✓ All SELL recommendations include shares_to_sell field (either "ALL" or "PARTIAL: X shares")?
+✓ Stocks needing SELL but without share counts are marked as HOLD with explanation?
+✓ Total of all BUY investment amounts = ${self.investment_amount}?
+✓ No single stock allocation > 25% of budget?
+✓ All JSON fields properly formatted with correct types?"""
+
+            # Format share counts for LLM
+            share_counts_text = ""
+            if self.stock_share_counts:
+                share_counts_text = "CURRENT HOLDINGS (Share Counts):\n"
+                for ticker, shares in self.stock_share_counts.items():
+                    share_counts_text += f"- {ticker}: {shares} shares\n"
+            else:
+                share_counts_text = "CURRENT HOLDINGS (Share Counts):\nNo share count information available. SELL recommendations cannot be made without this information.\n"
 
             # Prepare comprehensive data for analysis
             portfolio_summary = f"""
 INVESTMENT PORTFOLIO ANALYSIS REQUEST:
 Total Investment Budget: {self.investment_amount}
+
+{share_counts_text}
+
+ORIGINAL PORTFOLIO CONTEXT:
+{analysis_request if analysis_request else "No original context provided"}
 
 STOCK ANALYSIS DATA:
 {text_content}
@@ -405,6 +508,12 @@ STOCK ANALYSIS DATA:
             user_prompt = f"""Please analyze this complete investment portfolio and provide specific recommendations:
 
             {portfolio_summary}
+
+            CRITICAL INSTRUCTIONS:
+            1. Use the CURRENT HOLDINGS section above to see how many shares the user owns of each existing stock
+            2. For SELL recommendations, you MUST reference the share count from CURRENT HOLDINGS
+            3. Portfolio concentration analysis should consider the number of shares owned
+            4. If share counts are not available, you CANNOT make SELL recommendations (use HOLD instead)
 
             Provide actionable investment decisions with exact dollar amounts for each BUY recommendation, ensuring the total does not exceed ${self.investment_amount}."""
 
@@ -466,6 +575,35 @@ STOCK ANALYSIS DATA:
                                 if attempt == max_retries - 1:
                                     return json.dumps({"error": f"Invalid JSON response: missing fields {missing_fields}"})
                                 continue  # Retry
+
+                            # Business logic validation: Fix BUY recommendations with $0 allocation
+                            individual_recommendations = parsed_json.get("individual_stock_recommendations", [])
+                            fixed_count = 0
+                            for stock_rec in individual_recommendations:
+                                recommendation = stock_rec.get("recommendation", "")
+                                investment_amount = stock_rec.get("investment_amount", "")
+
+                                # Extract numeric value from investment_amount (handle "$0", "$0.00", "0", etc.)
+                                amount_value = 0.0
+                                if isinstance(investment_amount, str):
+                                    amount_str = investment_amount.replace("$", "").replace(",", "").strip()
+                                    try:
+                                        amount_value = float(amount_str)
+                                    except:
+                                        pass
+
+                                # If BUY recommendation has $0 allocation, convert to HOLD
+                                if recommendation == "BUY" and amount_value == 0.0:
+                                    logger.warning(f"Fixed BUY+$0 violation for {stock_rec.get('ticker', 'UNKNOWN')}: Converting to HOLD")
+                                    stock_rec["recommendation"] = "HOLD"
+                                    stock_rec["conviction_level"] = "N/A"
+                                    # Add note to reasoning if it exists
+                                    if "reasoning" in stock_rec:
+                                        stock_rec["reasoning"] = f"[Auto-corrected from BUY to HOLD due to allocation constraints] {stock_rec['reasoning']}"
+                                    fixed_count += 1
+
+                            if fixed_count > 0:
+                                logger.info(f"Auto-corrected {fixed_count} BUY+$0 violations to HOLD")
 
                             # Return the validated JSON string
                             logger.info(f"Successfully validated JSON response")
@@ -541,9 +679,9 @@ STOCK ANALYSIS DATA:
             logger.error(error_msg)
             return error_msg
 
-    def save_portfolio_analysis_to_file(self, portfolio_analysis: str) -> str:
+    def save_portfolio_analysis(self, portfolio_analysis: str) -> str:
         """
-        Save portfolio analysis data to text file and extract investment_amount and email_id.
+        Save portfolio analysis data to database and extract investment_amount and email_id.
 
         Args:
             portfolio_analysis (str): The portfolio analysis request containing investment amount and email
@@ -555,8 +693,7 @@ STOCK ANALYSIS DATA:
         # portfolio_analysis = self._compress_response(portfolio_analysis)
         logger.info(f"Portfolio analysis after compression: {portfolio_analysis}")
         try:
-            logger.info("Saving portfolio analysis to file and extracting investment details")
-            file_path = "stock_analysis_results.txt"
+            logger.info("Saving portfolio analysis to database and extracting investment details")
 
             if not portfolio_analysis.strip():
                 logger.warning("Portfolio analysis is empty, skipping save")
@@ -575,19 +712,23 @@ STOCK ANALYSIS DATA:
                 logger.info("Using default GenAI client for investment details extraction")
 
             # System prompt for extracting investment details
-            system_prompt = """Extract the investment amount and email ID from the analysis request.
+            system_prompt = """Extract the investment amount, email ID, user ID, and session ID from the analysis request.
 
             Rules:
             - Look for investment amount patterns like "$1000", "1000$", "invest 1000", etc.
             - Look for email patterns like "email@domain.com", "send to user@email.com", etc.
+            - Look for user ID patterns like "USER ID: user123", "user_id: abc", etc.
+            - Look for session ID patterns like "SESSION ID: sess456", "session_id: xyz", etc.
             - Extract only the numeric value for investment amount (remove $ symbols)
-            - Extract only the email address
+            - Extract only the email address, user ID, and session ID
 
-            Respond with ONLY these two lines in this exact format:
+            Respond with ONLY these four lines in this exact format:
             INVESTMENT_AMOUNT: 1000
             EMAIL_ID: user@example.com
+            USER_ID: user123
+            SESSION_ID: sess456
 
-            If not found, write: INVESTMENT_AMOUNT: 0 or EMAIL_ID: not_found"""
+            If not found, write: INVESTMENT_AMOUNT: 0 or EMAIL_ID: not_found or USER_ID: not_found or SESSION_ID: not_found"""
 
             # Retry logic for Google AI API calls
             max_retries = 3
@@ -632,6 +773,8 @@ STOCK ANALYSIS DATA:
 
             investment_amount = "0"
             email_id = "not_found"
+            user_id = "not_found"
+            session_id = "not_found"
 
             if response and response.text:
                 response_text = response.text.strip()
@@ -642,20 +785,50 @@ STOCK ANALYSIS DATA:
                         investment_amount = line.replace("INVESTMENT_AMOUNT:", "").strip()
                     elif line.startswith("EMAIL_ID:"):
                         email_id = line.replace("EMAIL_ID:", "").strip()
+                    elif line.startswith("USER_ID:"):
+                        user_id = line.replace("USER_ID:", "").strip()
+                    elif line.startswith("SESSION_ID:"):
+                        session_id = line.replace("SESSION_ID:", "").strip()
 
             # Store in instance variables for later use
             self.investment_amount = investment_amount
             self.email_id = email_id
+            self.user_id = user_id
+            self.session_id = session_id
 
-            # Prepare the portfolio analysis entry
-            timestamp = datetime.now().isoformat()
-            entry = f"\n{'='*50}\nPortfolio Analysis\nTimestamp: {timestamp}\n{'='*50}\n{portfolio_analysis}\n"
+            logger.info(f"Extracted - User ID: {user_id}, Session ID: {session_id}, Investment: {investment_amount}, Email: {email_id}")
 
-            # Append to file
-            with open(file_path, 'a') as f:
-                f.write(entry)
+            # Validate that we have required IDs before saving to database
+            if not self.session_id or self.session_id == "not_found" or not self.user_id or self.user_id == "not_found":
+                logger.warning(f"Missing required IDs - User ID: {self.user_id}, Session ID: {self.session_id}. Skipping database save.")
+                logger.warning("Portfolio analysis will not be saved to database. Please ensure USER_ID and SESSION_ID are included in the analysis request.")
+                # Continue without saving to DB - return success with warning
+                return json.dumps({
+                    "investment_amount": investment_amount,
+                    "email_id": email_id,
+                    "status": "success_without_db_save",
+                    "warning": "Portfolio analysis not saved to database due to missing user_id or session_id"
+                })
 
-            logger.info(f"Successfully saved portfolio analysis to {file_path}")
+            # Save to database
+            db = next(get_db())
+            try:
+                saved_analysis = save_portfolio_analysis(
+                    db=db,
+                    session_id=self.session_id,
+                    user_id=self.user_id,
+                    portfolio_analysis=portfolio_analysis,
+                    investment_amount=investment_amount,
+                    email_id=email_id
+                )
+                if saved_analysis:
+                    logger.info(f"Successfully saved portfolio analysis to database for session {self.session_id}")
+                else:
+                    logger.error("Failed to save portfolio analysis to database")
+                    return json.dumps({"error": "Failed to save to database"})
+            finally:
+                db.close()
+
             logger.info(f"Extracted investment amount: {investment_amount}, email: {email_id}")
 
             return json.dumps({
@@ -668,34 +841,6 @@ STOCK ANALYSIS DATA:
             error_msg = f"Error saving portfolio analysis: {e}"
             logger.error(error_msg)
             return json.dumps({"error": error_msg})
-
-    def save_investment_details_to_file(self) -> str:
-        """
-        Save investment amount and email ID from instance variables to text file.
-
-        Returns:
-            Success/error message
-        """
-        try:
-            logger.info("Saving investment details to file")
-            file_path = "stock_analysis_results.txt"
-
-            # Prepare the investment details entry
-            timestamp = datetime.now().isoformat()
-            entry = f"\n{'='*50}\nInvestment Details\nTimestamp: {timestamp}\n{'='*50}\nInvestment Amount: {self.investment_amount}\nEmail ID: {self.email_id}\n"
-
-            # Append to file
-            with open(file_path, 'a') as f:
-                f.write(entry)
-
-            logger.info(f"Successfully saved investment details to {file_path}")
-            logger.info(f"Investment amount: {self.investment_amount}, Email ID: {self.email_id}")
-            return f"Successfully saved investment details to {file_path} - Amount: {self.investment_amount}, Email: {self.email_id}"
-
-        except Exception as e:
-            error_msg = f"Error saving investment details: {e}"
-            logger.error(error_msg)
-            return error_msg
 
     def convert_portfolio_analysis_to_html(self, text: str) -> str:
         """
@@ -780,6 +925,9 @@ strong { color: #2c3e50; }
 
                     if recommendation == 'BUY':
                         html_parts.append(f'<p><strong>Investment Amount: {investment_amount}</strong></p>')
+                    elif recommendation == 'SELL':
+                        shares_to_sell = stock.get('shares_to_sell', 'Not specified')
+                        html_parts.append(f'<p><strong>⚠️ Action Required: Sell {shares_to_sell}</strong></p>')
 
                     html_parts.append(f'<p><strong>Key Metrics:</strong> {key_metrics}</p>')
                     html_parts.append(f'<p><strong>Reasoning:</strong> {reasoning}</p>')
@@ -964,7 +1112,7 @@ body {{ font-family: Arial, sans-serif; padding: 20px; }}
 
             # Step 1: Save portfolio analysis and extract investment details
             logger.info("Step 1: Saving portfolio analysis and extracting investment details")
-            portfolio_result = self.save_portfolio_analysis_to_file(analysis_request)
+            portfolio_result = self.save_portfolio_analysis(analysis_request)
             portfolio_data = json.loads(portfolio_result)
 
             if "error" in portfolio_data:
@@ -985,23 +1133,69 @@ body {{ font-family: Arial, sans-serif; padding: 20px; }}
             logger.info(f"Extracted {len(existing_stocks)} existing stocks and {len(new_stocks)} new stocks")
             logger.info(f"Context for analysis - User ID: {self.user_id}, Session ID: {self.session_id}, Email: {self.email_id}, Investment Amount: {self.investment_amount}")
 
-            # Step 3: Save investment details to file
-            logger.info("Step 3: Saving investment details to file")
-            investment_save_result = self.save_investment_details_to_file()
-            logger.info(f"Investment details saved: {investment_save_result}")
-
-            # Step 4: Analyze each stock using MCP tool
-            logger.info(f"Step 4: Analyzing {len(all_stocks)} stocks")
+            # Step 3: Analyze each stock using MCP tool
+            logger.info(f"Step 3: Analyzing {len(all_stocks)} stocks")
             for stock in all_stocks:
                 try:
                     logger.info(f"Analyzing stock: {stock}")
 
                     # Call MCP tool through session manager
                     session = await self.stock_mcp_tool._mcp_session_manager.create_session()
-                    stock_data = await session.call_tool("get_stock_info", arguments={"symbol": stock})
+                    stock_data_result = await session.call_tool("get_stock_info", arguments={"symbol": stock})
 
-                    # Save stock analysis result to memory
-                    save_result = self.save_stock_analysis_to_memory(stock, str(stock_data))
+                    # Extract current price immediately from MCP response
+                    try:
+                        # Parse MCP result object to get actual data
+                        stock_data = None
+
+                        # MCP returns a result object with content attribute
+                        if hasattr(stock_data_result, 'content'):
+                            # Extract content from MCP result
+                            if isinstance(stock_data_result.content, list) and len(stock_data_result.content) > 0:
+                                content_item = stock_data_result.content[0]
+                                if hasattr(content_item, 'text'):
+                                    # Parse the JSON text
+                                    stock_data = json.loads(content_item.text)
+                                    logger.info(f"Successfully parsed MCP data for {stock}")
+                        elif isinstance(stock_data_result, dict):
+                            # Already a dict (might happen in some environments)
+                            stock_data = stock_data_result
+                        elif isinstance(stock_data_result, str):
+                            # String response - parse as JSON
+                            stock_data = json.loads(stock_data_result)
+
+                        if stock_data and isinstance(stock_data, dict):
+                            stock_type = stock_data.get("stock_type", "EQUITY")
+                            current_price = None
+
+                            if stock_type == "EQUITY":
+                                # For stocks: get currentPrice from core_valuation_metrics
+                                core_valuation = stock_data.get("core_valuation_metrics", {})
+                                current_price = core_valuation.get("currentPrice")
+                                logger.info(f"Extracted EQUITY price for {stock}: {current_price}")
+                            else:  # ETF
+                                # For ETFs: get regularMarketPrice from trading_valuation
+                                trading_valuation = stock_data.get("trading_valuation", {})
+                                current_price = trading_valuation.get("regularMarketPrice")
+                                logger.info(f"Extracted ETF price for {stock}: {current_price}")
+
+                            if current_price:
+                                self.stock_current_prices[stock] = float(current_price)
+                                logger.info(f"Successfully stored entry price for {stock}: ${current_price}")
+                            else:
+                                logger.warning(f"No current price found in MCP data for {stock}. Stock type: {stock_type}")
+                        else:
+                            logger.warning(f"Could not parse MCP response to dict for {stock}. Type: {type(stock_data_result)}")
+                    except json.JSONDecodeError as json_error:
+                        logger.warning(f"JSON decode error for {stock}: {json_error}")
+                    except Exception as price_error:
+                        logger.warning(f"Could not extract entry price for {stock}: {price_error}")
+                        import traceback
+                        logger.debug(f"Full traceback: {traceback.format_exc()}")
+
+                    # Save stock analysis result to memory (use parsed data if available, otherwise result object)
+                    data_to_save = json.dumps(stock_data) if stock_data else str(stock_data_result)
+                    save_result = self.save_stock_analysis_to_memory(stock, data_to_save)
                     logger.info(f"Saved analysis for {stock}: {save_result}")
 
                 except Exception as stock_error:
@@ -1010,15 +1204,41 @@ body {{ font-family: Arial, sans-serif; padding: 20px; }}
                     error_message = f"Error analyzing {stock}: {str(stock_error)}"
                     self.save_stock_analysis_to_memory(stock, error_message)
 
-            # Step 5: Get expert portfolio recommendations
-            logger.info("Step 5: Generating expert portfolio recommendations")
-            recommendations = self.get_expert_portfolio_recommendations()
+            # Step 4: Get expert portfolio recommendations
+            logger.info("Step 4: Generating expert portfolio recommendations")
+            recommendations = self.get_expert_portfolio_recommendations(analysis_request)
 
-            # Step 6: Save recommendations to database
-            logger.info("Step 6: Saving recommendations to database")
+            # Step 5: Save recommendations to database
+            logger.info("Step 5: Saving recommendations to database")
             try:
                 # Parse the recommendations JSON
                 recommendations_dict = json.loads(recommendations)
+
+                # Use the current prices we extracted during stock analysis
+                entry_prices = self.stock_current_prices.copy()
+                logger.info(f"Using {len(entry_prices)} current prices extracted during analysis")
+
+                # Add entry_price to individual stock recommendations (for BUY and SELL)
+                individual_recommendations = recommendations_dict.get("individual_stock_recommendations", [])
+                prices_added = 0
+                for stock_rec in individual_recommendations:
+                    ticker = stock_rec.get("ticker")
+                    recommendation = stock_rec.get("recommendation", "")
+
+                    # Add entry_price to BUY and SELL recommendations
+                    if recommendation in ["BUY", "SELL"] and ticker in entry_prices:
+                        stock_rec["entry_price"] = f"${entry_prices[ticker]:.2f}"
+                        logger.info(f"Added entry price ${entry_prices[ticker]:.2f} to {recommendation} recommendation for {ticker}")
+                        prices_added += 1
+                    elif recommendation in ["BUY", "SELL"] and ticker not in entry_prices:
+                        logger.warning(f"No entry price available for {recommendation} recommendation: {ticker}")
+
+                logger.info(f"Added entry prices to {prices_added} BUY/SELL recommendations")
+
+                # Add entry prices and recommendation timestamp to the recommendations
+                recommendations_dict["entry_prices"] = entry_prices
+                recommendations_dict["recommendation_date"] = datetime.now().isoformat()
+                logger.info(f"Added entry prices for {len(entry_prices)} stocks to recommendation")
 
                 # Get database session and save
                 db = next(get_db())
@@ -1039,8 +1259,8 @@ body {{ font-family: Arial, sans-serif; padding: 20px; }}
                 logger.error(f"Error saving recommendations to database: {db_error}")
                 # Continue with webhook even if database save fails
 
-            # Step 7: Send analysis to webhook
-            logger.info("Step 7: Sending analysis to webhook")
+            # Step 6: Send analysis to webhook
+            logger.info("Step 6: Sending analysis to webhook")
             webhook_result = self.send_analysis_to_webhook(
                 analysis_response=recommendations,
                 email_to=self.email_id
@@ -1086,8 +1306,7 @@ The function will return a complete summary of the analysis that was performed."
                 self.stock_mcp_tool,
                 self.extract_stocks_from_analysis_request_tool,
                 self.save_stock_analysis_to_memory_tool,
-                self.save_portfolio_analysis_to_file_tool,
-                self.save_investment_details_to_file_tool,
+                self.save_portfolio_analysis_tool,
                 self.get_expert_portfolio_recommendations_tool,
                 self.send_analysis_to_webhook_tool,
             ],

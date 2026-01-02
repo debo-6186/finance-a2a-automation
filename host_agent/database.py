@@ -110,6 +110,23 @@ class AgentState(Base):
     session = relationship("ConversationSession", back_populates="agent_states")
 
 
+class PortfolioAnalysis(Base):
+    """Model for storing portfolio analysis data."""
+    __tablename__ = "portfolio_analysis"
+
+    id = Column(String, primary_key=True, index=True)
+    session_id = Column(String, ForeignKey("conversation_sessions.id"), nullable=False, index=True)
+    user_id = Column(String, ForeignKey("users.id"), nullable=False, index=True)
+    portfolio_analysis = Column(Text, nullable=False)  # The raw portfolio analysis text
+    investment_amount = Column(String, nullable=True)
+    email_id = Column(String, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+    # Relationships
+    session = relationship("ConversationSession")
+    user = relationship("User")
+
+
 class StockRecommendation(Base):
     """Model for storing stock analysis recommendations."""
     __tablename__ = "stock_recommendations"
@@ -454,3 +471,43 @@ def get_user_stock_recommendations(db: Session, user_id: str) -> list:
     except SQLAlchemyError as e:
         logger.error(f"Error getting stock recommendations for user {user_id}: {e}")
         return []
+
+
+def save_portfolio_analysis(db: Session, session_id: str, user_id: str, portfolio_analysis: str,
+                            investment_amount: str = "0", email_id: str = "not_found") -> Optional[PortfolioAnalysis]:
+    """Save portfolio analysis to database."""
+    try:
+        # Ensure user exists before saving analysis
+        user = get_or_create_user(db, user_id)
+        if not user:
+            logger.error(f"Failed to create/get user {user_id} for portfolio analysis")
+            return None
+
+        portfolio_analysis_record = PortfolioAnalysis(
+            id=f"{session_id}_{user_id}_portfolio_{datetime.utcnow().timestamp()}",
+            session_id=session_id,
+            user_id=user_id,
+            portfolio_analysis=portfolio_analysis,
+            investment_amount=investment_amount,
+            email_id=email_id
+        )
+        db.add(portfolio_analysis_record)
+        db.commit()
+        db.refresh(portfolio_analysis_record)
+        logger.info(f"Saved portfolio analysis for session {session_id}, user {user_id}")
+        return portfolio_analysis_record
+    except SQLAlchemyError as e:
+        db.rollback()
+        logger.error(f"Error saving portfolio analysis for session {session_id}: {e}")
+        return None
+
+
+def get_portfolio_analysis(db: Session, session_id: str) -> Optional[PortfolioAnalysis]:
+    """Get portfolio analysis for a session."""
+    try:
+        return db.query(PortfolioAnalysis).filter(
+            PortfolioAnalysis.session_id == session_id
+        ).order_by(PortfolioAnalysis.created_at.desc()).first()
+    except SQLAlchemyError as e:
+        logger.error(f"Error getting portfolio analysis for session {session_id}: {e}")
+        return None

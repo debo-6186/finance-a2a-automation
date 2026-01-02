@@ -4,7 +4,10 @@ This directory contains database migration scripts for the Host Agent.
 
 ## Migration Files
 
+- `000_add_portfolio_statement_uploaded_field.sql` - Adds portfolio statement uploaded flag to sessions
 - `001_add_stock_recommendations_table.sql` - Adds the `stock_recommendations` table to store stock analysis recommendations
+- `002_add_input_format_column.sql` - Adds input format column to track how portfolio data was submitted
+- `003_add_portfolio_analysis_table.sql` - Adds the `portfolio_analysis` table to store portfolio analysis data with investment details
 
 ## Running Migrations
 
@@ -44,6 +47,8 @@ For example:
 
 ## Database Schema
 
+### Stock Recommendations Table
+
 After running migrations, the `stock_recommendations` table will have the following structure:
 
 | Column         | Type      | Description                                                    |
@@ -54,11 +59,31 @@ After running migrations, the `stock_recommendations` table will have the follow
 | recommendation | JSONB     | JSON object containing the complete recommendation data        |
 | created_at     | TIMESTAMP | Timestamp when the recommendation was created                  |
 
-### Indexes
+#### Indexes
 
 - `idx_stock_recommendations_session_id` - Index on session_id for faster lookups
 - `idx_stock_recommendations_user_id` - Index on user_id for faster user queries
 - `idx_stock_recommendations_created_at` - Index on created_at for sorting
+
+### Portfolio Analysis Table
+
+The `portfolio_analysis` table stores portfolio analysis data:
+
+| Column              | Type      | Description                                                    |
+|---------------------|-----------|----------------------------------------------------------------|
+| id                  | VARCHAR   | Primary key - unique identifier for the analysis               |
+| session_id          | VARCHAR   | Foreign key to conversation_sessions table                     |
+| user_id             | VARCHAR   | Foreign key to users table                                     |
+| portfolio_analysis  | TEXT      | Raw portfolio analysis text with stock information             |
+| investment_amount   | VARCHAR   | Extracted investment amount from the analysis                  |
+| email_id            | VARCHAR   | Extracted email address for sending results                    |
+| created_at          | TIMESTAMP | Timestamp when the analysis was submitted                      |
+
+#### Indexes
+
+- `idx_portfolio_analysis_session_id` - Index on session_id for faster lookups
+- `idx_portfolio_analysis_user_id` - Index on user_id for faster user queries
+- `idx_portfolio_analysis_created_at` - Index on created_at for sorting
 
 ## Recommendation JSON Structure
 

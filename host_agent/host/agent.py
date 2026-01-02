@@ -148,7 +148,8 @@ class HostAgent:
                 "new_stocks": [],
                 "investment_amount": 0.0,
                 "receiver_email_id": "",
-                "diversification_preference": ""
+                "diversification_preference": "",
+                "share_counts": {}
             }
 
         try:
@@ -174,7 +175,8 @@ class HostAgent:
                     "new_stocks": [],
                     "investment_amount": 0.0,
                     "receiver_email_id": "",
-                    "diversification_preference": ""
+                    "diversification_preference": "",
+                    "share_counts": {}
                 }
         except Exception as e:
             logger.error(f"✗ Error loading state for session {session_id}: {e}")
@@ -186,7 +188,8 @@ class HostAgent:
                 "new_stocks": [],
                 "investment_amount": 0.0,
                 "receiver_email_id": "",
-                "diversification_preference": ""
+                "diversification_preference": "",
+                "share_counts": {}
             }
 
     def _save_state(self, state: dict):
@@ -238,6 +241,8 @@ class HostAgent:
                         FunctionTool(self.get_investment_amount),
                         FunctionTool(self.add_existing_stocks),
                         FunctionTool(self.add_new_stocks),
+                        FunctionTool(self.store_share_count),
+                        FunctionTool(self.get_share_counts),
                         FunctionTool(self.get_stock_lists),
                         FunctionTool(self.analyze_all_stocks),
                         FunctionTool(self.suggest_stocks_by_category),
@@ -277,15 +282,22 @@ class HostAgent:
 
         **YOU DO NOT PERFORM ANY FINANCIAL ANALYSIS YOURSELF** - You only coordinate and delegate to the Stock Analyser Agent.
 
+        **CRITICAL FIRST MESSAGE REQUIREMENT:**
+        - **ALWAYS START** by checking if portfolio has been provided using `check_file_upload_status`
+        - If NO portfolio data exists yet, your **FIRST MESSAGE MUST BE** asking the user to provide their portfolio
+        - Use this EXACT greeting for first-time users: "Hello! Welcome to the portfolio analysis service. To get started, please provide your portfolio details using any of these methods:
+          1. Upload a PDF portfolio statement
+          2. Upload a screenshot/snapshot of your portfolio
+          3. Type your stock holdings directly in the chat (e.g., 'AAPL 30%, GOOGL 20%, MSFT 50%')
+
+        How would you like to share your portfolio?"
+
         **WORKFLOW - FOLLOW THESE STEPS IN ORDER:**
 
         **STEP 1: Analyze Portfolio**
-        - When user starts the conversation, tell them: "To analyze your portfolio, you can provide your portfolio information in any of these ways:
-          1. Upload a PDF statement
-          2. Upload a screenshot/image of your portfolio
-          3. Type your stock holdings and allocation percentages directly (e.g., 'AAPL 30%, GOOGL 20%, MSFT 50%')"
-
-        - Use `check_file_upload_status` to check if portfolio data has been provided (via file or text)
+        - FIRST, use `check_file_upload_status` to check if portfolio data has been provided (via file or text)
+        - If NO portfolio data, ask user to provide it using the greeting message above
+        - If portfolio data exists, proceed with analysis
 
         **If file is uploaded (PDF or image):**
         - Inform user: "Your portfolio has been uploaded. I'm analyzing it now. This will take about a minute."
@@ -301,7 +313,19 @@ class HostAgent:
         - Extract existing stocks from the response and add them using `add_existing_stocks`
         - Show user their existing stock list from the portfolio
 
-        - Once portfolio is analyzed (regardless of format), proceed to STEP 2
+        - Once portfolio is analyzed (regardless of format), proceed to STEP 1.5
+
+        **STEP 1.5: Collect Missing Share Counts (CRITICAL FOR SELL RECOMMENDATIONS)**
+        - After portfolio analysis, check the portfolio response for "**Holdings Missing Share Counts**" section
+        - If ANY stocks are missing share counts, you MUST ask for them BEFORE proceeding
+        - For EACH stock missing share counts:
+          1. Ask: "How many shares of [TICKER] do you currently own? (Approximate is fine, but needed for SELL recommendations)"
+          2. WAIT for user response
+          3. If user provides a number (exact or approximate), use `store_share_count(ticker="[TICKER]", shares=[NUMBER])`
+          4. If user says "I don't know" or "I don't remember", respond: "Please provide at least an estimate. Knowing approximately how many shares you own is critical for determining if we should recommend selling any positions. Even a rough number helps."
+          5. If user still cannot provide an estimate after reminder, acknowledge and note that SELL recommendations cannot be made for that stock
+        - Repeat for ALL stocks missing share counts
+        - Once all share counts are collected (or acknowledged as unavailable), proceed to STEP 2
 
         **STEP 2: Get Investment Amount**
         - BEFORE asking, check if investment amount is already set using `get_investment_amount`
@@ -387,6 +411,8 @@ class HostAgent:
         * `analyze_text_portfolio`: Analyze portfolio data provided as text input
         * `add_existing_stocks`: Add stocks from portfolio statement
         * `add_new_stocks`: Add new stocks user wants to consider
+        * `store_share_count`: Store share count for a stock ticker (critical for SELL recommendations)
+        * `get_share_counts`: View all stored share counts
         * `store_investment_amount`: Store the investment amount
         * `store_diversification_preference`: Store user's investment strategy
         * `store_receiver_email_id`: Store email ID and trigger stock analysis
@@ -1110,6 +1136,53 @@ Return ONLY a JSON array of uppercase ticker symbols. If a name is already a tic
             logger.info(f"Added {len(stocks)} new stocks (fallback mode). Total: {len(state['new_stocks'])}")
             return f"Added {len(stocks)} new stocks (using input as-is due to error: {str(e)}). Current list: {', '.join(state['new_stocks'])}"
 
+    def store_share_count(self, ticker: str, shares: float):
+        """
+        Stores the number of shares for a specific stock ticker.
+        This is critical for SELL recommendations.
+
+        Args:
+            ticker: Stock ticker symbol (e.g., 'AAPL')
+            shares: Number of shares owned (can be approximate)
+
+        Returns:
+            Confirmation message
+        """
+        logger.info(f"🔧 TOOL CALLED: store_share_count(ticker={ticker}, shares={shares})")
+        state = self._load_state()
+
+        # Initialize share_counts dict if it doesn't exist
+        if "share_counts" not in state:
+            state["share_counts"] = {}
+
+        # Store the share count
+        ticker_upper = ticker.upper().strip()
+        state["share_counts"][ticker_upper] = float(shares)
+
+        self._save_state(state)
+        logger.info(f"✓ Stored {shares} shares for {ticker_upper}")
+
+        return f"Stored {shares} shares for {ticker_upper}. This will be used for portfolio analysis and SELL recommendations."
+
+    def get_share_counts(self):
+        """
+        Returns all stored share counts.
+
+        Returns:
+            Formatted string showing share counts for all stocks
+        """
+        state = self._load_state()
+        share_counts = state.get("share_counts", {})
+
+        if not share_counts:
+            return "No share counts have been stored yet."
+
+        result = "**Stored Share Counts:**\n\n"
+        for ticker, shares in share_counts.items():
+            result += f"• {ticker}: {shares} shares\n"
+
+        return result
+
     def get_stock_lists(self):
         """Returns the current stock lists, investment amount, and report response."""
         state = self._load_state()
@@ -1198,7 +1271,18 @@ Return ONLY a JSON array of uppercase ticker symbols. If a name is already a tic
 
         # Include user ID and session ID in the delegation request
         session_id = self.current_session_id.get("id", "unknown")
-        user_id = self._user_id
+        user_id = self.current_session_id.get("user_id", "unknown")
+
+        # Format share counts for delegation
+        share_counts = state.get("share_counts", {})
+        share_counts_section = ""
+        if share_counts:
+            share_counts_section = "\n**SHARE COUNTS (for SELL recommendations):**\n"
+            for ticker, shares in share_counts.items():
+                share_counts_section += f"- {ticker}: {shares} shares\n"
+            share_counts_section += "\n**CRITICAL:** Only stocks with known share counts above can have SELL recommendations. Stocks without share counts should be marked HOLD instead of SELL.\n"
+        else:
+            share_counts_section = "\n**SHARE COUNTS:** Not provided. SELL recommendations cannot be made without share counts.\n"
 
         delegation_request = f"""
         **STOCKS TO ANALYZE - DELEGATION REQUEST**
@@ -1219,6 +1303,7 @@ Return ONLY a JSON array of uppercase ticker symbols. If a name is already a tic
 
         **RECEIVER EMAIL ID:**
         {state['receiver_email_id'] if state['receiver_email_id'] else 'Not specified'}
+        {share_counts_section}
         {strategy_instruction}
         **DELEGATION INSTRUCTIONS:**
         Please analyze all the stocks listed above and provide comprehensive recommendations.
@@ -1352,8 +1437,35 @@ Return ONLY a JSON array of uppercase ticker symbols. If a name is already a tic
             # Step 2: Extract tickers from the text
             result = extract_stock_tickers_from_text(portfolio_text)
 
-            # Store the response automatically (same as before with remote agent)
+            # Step 3: CRITICAL - Automatically store extracted share counts
             if result and not result.startswith("Error"):
+                # Parse the HOLDINGS_DATA_JSON section from the result
+                try:
+                    if "**HOLDINGS_DATA_JSON:**" in result:
+                        json_start = result.find("**HOLDINGS_DATA_JSON:**") + len("**HOLDINGS_DATA_JSON:**")
+                        json_str = result[json_start:].strip()
+
+                        # Parse the JSON
+                        holdings_data = json.loads(json_str)
+
+                        # Store share counts for each holding that has shares
+                        shares_stored_count = 0
+                        for holding in holdings_data:
+                            ticker = holding.get("ticker")
+                            shares = holding.get("shares", 0)
+
+                            if ticker and shares > 0:
+                                # Call store_share_count to save to database
+                                self.store_share_count(ticker, shares)
+                                shares_stored_count += 1
+                                logger.info(f"Auto-stored share count: {ticker} = {shares} shares")
+
+                        logger.info(f"Automatically stored share counts for {shares_stored_count} stocks from portfolio")
+                except Exception as parse_error:
+                    logger.warning(f"Could not parse holdings JSON for auto-storage: {parse_error}")
+                    # Continue anyway - the response is still valid
+
+                # Store the response automatically (same as before with remote agent)
                 state = self._load_state()
                 state["stock_report_response"] = result
                 self._save_state(state)
@@ -1391,6 +1503,32 @@ Return ONLY a JSON array of uppercase ticker symbols. If a name is already a tic
 
             # Store the response automatically if successful
             if result and not result.startswith("Error") and not result.startswith("No stock"):
+                # CRITICAL - Automatically store extracted share counts
+                try:
+                    if "**HOLDINGS_DATA_JSON:**" in result:
+                        json_start = result.find("**HOLDINGS_DATA_JSON:**") + len("**HOLDINGS_DATA_JSON:**")
+                        json_str = result[json_start:].strip()
+
+                        # Parse the JSON
+                        holdings_data = json.loads(json_str)
+
+                        # Store share counts for each holding that has shares
+                        shares_stored_count = 0
+                        for holding in holdings_data:
+                            ticker = holding.get("ticker")
+                            shares = holding.get("shares", 0)
+
+                            if ticker and shares > 0:
+                                # Call store_share_count to save to database
+                                self.store_share_count(ticker, shares)
+                                shares_stored_count += 1
+                                logger.info(f"Auto-stored share count from text: {ticker} = {shares} shares")
+
+                        logger.info(f"Automatically stored share counts for {shares_stored_count} stocks from text portfolio")
+                except Exception as parse_error:
+                    logger.warning(f"Could not parse holdings JSON for auto-storage: {parse_error}")
+                    # Continue anyway - the response is still valid
+
                 state = self._load_state()
                 state["stock_report_response"] = result
 

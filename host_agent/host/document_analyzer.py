@@ -11,6 +11,7 @@ import boto3
 import fitz  # PyMuPDF
 import io
 import os
+import json
 import logging
 from typing import Tuple
 from google import genai
@@ -319,36 +320,46 @@ def extract_stock_tickers_from_text(portfolio_text: str) -> str:
             client = genai.Client(api_key=api_key)
             logger.info("Using Google AI API for ticker extraction")
 
-        # System prompt for stock ticker extraction
-        system_prompt = """You are an expert financial analyst specializing in analyzing portfolio data and identifying stock ticker symbols.
+        # System prompt for stock ticker extraction with share quantities
+        system_prompt = """You are an expert financial analyst specializing in analyzing portfolio data and extracting stock holdings information.
 
-Your task is to carefully analyze portfolio text and extract ALL stock ticker symbols mentioned.
+Your task is to carefully analyze portfolio text and extract ALL stock holdings with as much detail as possible.
 
-Rules for extraction:
-1. Extract only valid stock ticker symbols (typically 1-5 characters, letters only)
-2. Look for company names and convert them to their ticker symbols (e.g., "Apple Inc." → "AAPL")
+EXTRACTION RULES:
+1. Extract valid stock ticker symbols (1-5 characters, letters only)
+2. Convert company names to ticker symbols (e.g., "Apple Inc." → "AAPL")
 3. Include both individual stocks and ETFs
 4. Convert all tickers to uppercase
-5. Remove duplicates
-6. Do NOT include common words, currency codes, or non-stock identifiers
-7. Include tickers that appear in any context within the portfolio (holdings, transactions, etc.)
-8. Calculate and include percentage allocation for each ticker based on portfolio value
+5. Extract SHARE QUANTITIES when explicitly mentioned
+6. Extract dollar amounts invested when mentioned
+7. Extract percentage allocations when mentioned
+8. Do NOT include common words, currency codes, or non-stock identifiers
 
-Common patterns to look for:
-- Direct ticker mentions: "AAPL", "GOOGL", "TSLA"
-- Company names: "Apple Inc.", "Microsoft Corporation", "Tesla Inc."
-- ETF names: "Vanguard S&P 500 ETF" → "VOO"
-- Holdings tables with ticker columns
-- Transaction records
-- Position values and total portfolio value for percentage calculations
-- Text like "10% AAPL, 20% GOOGL" or "AAPL 10%, GOOGL 20%"
-- Simple lists like "AAPL, GOOGL, MSFT"
+PATTERNS TO LOOK FOR:
+- Share quantities: "10.5 shares of AAPL", "GOOGL: 25 shares", "15.3 MSFT"
+- Dollar amounts: "$3,500 in AAPL", "GOOGL - $8,200"
+- Percentages: "10% AAPL", "AAPL (15.5%)"
+- Combined: "AAPL: 10.5 shares, $3,500, 15%"
+- Holdings tables with columns for ticker, shares, value, allocation
+- Transaction records showing purchases
 
-Respond with ONLY ticker symbols and their percentage allocations in this format:
-AAPL (3.02%), GOOGL (9.66%), MSFT (3.95%), TSLA (0.61%), VOO (37.14%)
+RESPONSE FORMAT - Return ONLY valid JSON in this EXACT format:
+{
+  "holdings": [
+    {"ticker": "AAPL", "shares": 10.5, "allocation_pct": "3.02%", "amount": "$3500"},
+    {"ticker": "GOOGL", "shares": 25.0, "allocation_pct": "9.66%", "amount": "$8200"}
+  ]
+}
 
-If percentages are not available, estimate based on context or use equal distribution.
-If no tickers are found, respond with: NONE"""
+FIELD REQUIREMENTS:
+- ticker: Always required (string, uppercase)
+- shares: Use actual number if mentioned, otherwise 0 (number)
+- allocation_pct: Include if mentioned, otherwise null (string or null)
+- amount: Include if mentioned, otherwise null (string or null)
+
+If no tickers are found, respond with: {"holdings": []}
+
+IMPORTANT: Extract EXACT share numbers when visible in the portfolio. Do not estimate or calculate."""
 
         # User prompt with the portfolio text
         user_prompt = f"""Analyze this portfolio data and extract ALL stock ticker symbols:
@@ -400,53 +411,80 @@ Provide only the comma-separated ticker list with percentages as specified."""
                     # For non-API errors, fail immediately
                     raise
 
-        found_tickers = []
-        allocation_percentage = ""
+        holdings_data = []
 
         if response and response.text:
             # Parse the LLM response
             response_text = response.text.strip()
-            logger.info(f"LLM ticker extraction response: {response_text}")
+            logger.info(f"LLM holdings extraction response: {response_text[:500]}...")
 
-            # Store the raw LLM response for allocation percentage
-            allocation_percentage = response_text
+            try:
+                # Clean JSON response (remove markdown code blocks if present)
+                if response_text.startswith("```"):
+                    response_text = response_text.split("```")[1]
+                    if response_text.startswith("json"):
+                        response_text = response_text[4:]
+                    response_text = response_text.strip()
 
-            # Parse the response
-            if response_text.upper() != "NONE":
-                # Split by commas and clean up
-                ticker_list = response_text.split(',')
-                for ticker_entry in ticker_list:
-                    ticker_entry = ticker_entry.strip()
-                    # Extract ticker symbol (before the parentheses if present)
-                    if '(' in ticker_entry:
-                        ticker = ticker_entry.split('(')[0].strip().upper()
-                    else:
-                        ticker = ticker_entry.strip().upper()
-                    # Validate ticker format (1-5 characters, letters only)
-                    if ticker and len(ticker) >= 1 and len(ticker) <= 5 and ticker.isalpha():
-                        found_tickers.append(ticker)
+                # Parse JSON
+                holdings_json = json.loads(response_text)
+                holdings_data = holdings_json.get("holdings", [])
 
-                # Remove duplicates while preserving order
-                found_tickers = list(dict.fromkeys(found_tickers))
+                logger.info(f"Successfully parsed {len(holdings_data)} holdings")
+
+            except json.JSONDecodeError as e:
+                logger.error(f"Failed to parse JSON response: {e}")
+                logger.error(f"Response text: {response_text}")
+                return f"**Error**: Could not parse holdings data. Please try again."
+
         else:
-            logger.error("No response from LLM for ticker extraction")
-            return "**Error**: Could not extract tickers using LLM. Please try again."
+            logger.error("No response from LLM for holdings extraction")
+            return "**Error**: Could not extract holdings using LLM. Please try again."
 
-        if not found_tickers:
-            logger.info("No stock tickers found by LLM")
-            return "No stock tickers found in the portfolio data. Please check if the input contains stock symbols."
+        if not holdings_data:
+            logger.info("No stock holdings found by LLM")
+            return "No stock holdings found in the portfolio data. Please check if the input contains stock information."
 
-        logger.info(f"LLM found {len(found_tickers)} tickers: {found_tickers}")
+        logger.info(f"LLM found {len(holdings_data)} holdings")
 
-        # Format the result
-        result = f"**Stock Tickers Found in Portfolio:**\n\n"
-        result += f"Total stocks identified: {len(found_tickers)}\n\n"
-        result += "**Individual Stocks:**\n"
-        for i, ticker in enumerate(found_tickers, 1):
-            result += f"{i}. {ticker}\n"
+        # Format the result with detailed holdings information
+        result = f"**Portfolio Holdings Extracted:**\n\n"
+        result += f"Total stocks identified: {len(holdings_data)}\n\n"
 
-        result += f"\n**Allocation Percentage:**\n"
-        result += f"{allocation_percentage}\n"
+        # Separate holdings into those with shares and those without
+        with_shares = [h for h in holdings_data if h.get('shares', 0) > 0]
+        without_shares = [h for h in holdings_data if h.get('shares', 0) == 0]
+
+        if with_shares:
+            result += "**Holdings with Share Quantities:**\n"
+            for holding in with_shares:
+                ticker = holding.get('ticker', 'N/A')
+                shares = holding.get('shares', 0)
+                allocation = holding.get('allocation_pct', 'N/A')
+                amount = holding.get('amount', 'N/A')
+                result += f"• {ticker}: {shares} shares"
+                if allocation != 'N/A' and allocation:
+                    result += f" ({allocation})"
+                if amount != 'N/A' and amount:
+                    result += f" - {amount}"
+                result += "\n"
+            result += "\n"
+
+        if without_shares:
+            result += "**Holdings Missing Share Counts (will ask user):**\n"
+            for holding in without_shares:
+                ticker = holding.get('ticker', 'N/A')
+                allocation = holding.get('allocation_pct', 'N/A')
+                amount = holding.get('amount', 'N/A')
+                result += f"• {ticker}"
+                if allocation != 'N/A' and allocation:
+                    result += f" ({allocation})"
+                if amount != 'N/A' and amount:
+                    result += f" - {amount}"
+                result += "\n"
+
+        # Store holdings data as JSON string for later use
+        result += f"\n**HOLDINGS_DATA_JSON:**\n{json.dumps(holdings_data)}\n"
 
         return result
 

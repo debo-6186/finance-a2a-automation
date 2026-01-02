@@ -9,6 +9,7 @@ import os
 import uuid
 from contextlib import asynccontextmanager
 from typing import List, Optional
+import json
 
 import uvicorn
 from fastapi import FastAPI, HTTPException, Depends, Header, Request
@@ -21,13 +22,17 @@ from fastapi.responses import StreamingResponse
 import requests
 import firebase_admin
 from firebase_admin import credentials, auth as firebase_auth
+from google.adk.tools.mcp_tool.mcp_toolset import MCPToolset
+from mcp import StdioServerParameters
+from config import get_config
 
 from host.agent import HostAgent
 from database import (
     get_db, get_or_create_user, create_session, get_session,
     add_message, can_user_send_message, get_user_message_count,
     update_agent_state, get_agent_state,
-    User, ConversationSession, ConversationMessage, FREE_USER_MESSAGE_LIMIT
+    User, ConversationSession, ConversationMessage, FREE_USER_MESSAGE_LIMIT,
+    get_stock_recommendation, get_user_stock_recommendations
 )
 from user_api import (
     get_user_profile, update_user_profile, get_user_statistics,
@@ -112,6 +117,9 @@ class LoginResponse(BaseModel):
 
 # Global variable to store the host agent instance
 host_agent_instance: Optional[HostAgent] = None
+
+# Global variable to store the MCP tool instance
+stock_mcp_tool: Optional[MCPToolset] = None
 
 # Import configuration
 from config import current_config as Config
@@ -272,14 +280,14 @@ def get_current_user(authorization: str = Header(None)) -> dict:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application lifespan manager to initialize and cleanup the host agent."""
-    global host_agent_instance
-    
+    global host_agent_instance, stock_mcp_tool
+
     try:
         logger.info("Initializing Host Agent...")
-        
+
         # Initialize Firebase Admin SDK
         init_firebase()
-        
+
         # Initialize database
         from database import init_db
         try:
@@ -288,13 +296,37 @@ async def lifespan(app: FastAPI):
         except Exception as e:
             logger.error(f"Failed to initialize database: {e}")
             logger.warning("Continuing without database initialization")
-        
+
+        # Initialize MCP tool for stock data
+        global stock_mcp_tool
+        try:
+            current_config = get_config()
+            mcp_directory = current_config.MCP_DIRECTORY
+            logger.info(f"Initializing MCP tool from directory: {mcp_directory}")
+
+            mcp_env = {**os.environ}
+            mcp_env["MCP_TIMEOUT"] = os.getenv("MCP_TIMEOUT", "30")
+
+            server_script = os.path.join(mcp_directory, "server.py")
+
+            stock_mcp_tool = MCPToolset(
+                server_params=StdioServerParameters(
+                    command="python",
+                    args=[server_script],
+                    env=mcp_env,
+                )
+            )
+            logger.info("MCP tool initialized successfully")
+        except Exception as e:
+            logger.error(f"Failed to initialize MCP tool: {e}")
+            logger.warning("Continuing without MCP tool - portfolio performance may be limited")
+
         # Create and initialize the host agent
         host_agent_instance = await HostAgent.create(remote_agent_addresses=AGENT_URLS)
         logger.info("Host Agent initialized successfully")
-        
+
         yield
-        
+
     except Exception as e:
         logger.error(f"Failed to initialize Host Agent: {e}")
         raise
@@ -302,6 +334,7 @@ async def lifespan(app: FastAPI):
         logger.info("Shutting down Host Agent...")
         # Cleanup if needed
         host_agent_instance = None
+        stock_mcp_tool = None
 
 
 # Create FastAPI app with lifespan events
@@ -1215,6 +1248,716 @@ async def get_session_messages(session_id: str, limit: int = 50, offset: int = 0
         raise HTTPException(status_code=500, detail=f"Error getting session messages: {str(e)}")
 
 
+@app.get("/api/portfolio-performance/{session_id}")
+async def get_portfolio_performance(session_id: str, _current_user: dict = Depends(get_current_user)):
+    """
+    Get portfolio performance showing profit/loss for recommended stocks.
+    Calculates based on entry price vs current price, taking into account number of shares.
+
+    Returns:
+        {
+            "overall_performance": {
+                "total_investment": 2100.00,
+                "current_value": 2310.00,
+                "profit_loss": 210.00,
+                "profit_loss_percentage": 10.0,
+                "status": "profit"  // or "loss"
+            },
+            "stocks": [
+                {
+                    "ticker": "AMZN",
+                    "entry_price": 232.00,
+                    "current_price": 245.00,
+                    "investment_amount": 525.00,
+                    "shares": 2.26,
+                    "current_value": 554.52,
+                    "profit_loss": 29.52,
+                    "profit_loss_percentage": 5.62,
+                    "status": "profit"
+                },
+                ...
+            ],
+            "recommendation_date": "2025-12-30T10:30:00"
+        }
+    """
+    try:
+        logger.info(f"Fetching portfolio performance for session {session_id}")
+
+        # Get database session
+        db = next(get_db())
+
+        try:
+            # Get the stock recommendation for this session
+            recommendation = get_stock_recommendation(db, session_id)
+
+            if not recommendation:
+                raise HTTPException(status_code=404, detail="No stock recommendation found for this session")
+
+            # Parse the recommendation JSON
+            rec_data = recommendation.recommendation
+            allocation_breakdown = rec_data.get("allocation_breakdown", [])
+            entry_prices = rec_data.get("entry_prices", {})
+            recommendation_date = rec_data.get("recommendation_date", recommendation.created_at.isoformat())
+
+            # If entry_prices is missing, fetch from MCP and populate
+            if not entry_prices:
+                logger.info("Entry prices missing - fetching from MCP")
+
+                if not stock_mcp_tool:
+                    raise HTTPException(
+                        status_code=503,
+                        detail="Stock data service unavailable. Cannot fetch entry prices."
+                    )
+
+                try:
+                    # Fetch stock prices from MCP
+                    tickers = [stock["ticker"] for stock in allocation_breakdown]
+                    entry_prices = {}
+
+                    for ticker in tickers:
+                        try:
+                            logger.info(f"Fetching stock info for {ticker} from MCP")
+                            session = await stock_mcp_tool._mcp_session_manager.create_session()
+                            stock_data = await session.call_tool("get_stock_info", arguments={"symbol": ticker})
+
+                            # Parse the stock data JSON
+                            stock_info = json.loads(str(stock_data))
+
+                            # Extract currentPrice from MCP data
+                            stock_type = stock_info.get("stock_type", "EQUITY")
+                            current_price = None
+
+                            if stock_type == "EQUITY":
+                                core_valuation = stock_info.get("core_valuation_metrics", {})
+                                current_price = core_valuation.get("currentPrice")
+                            else:  # ETF
+                                trading_valuation = stock_info.get("trading_valuation", {})
+                                current_price = trading_valuation.get("regularMarketPrice")
+
+                            if current_price:
+                                entry_prices[ticker] = float(current_price)
+                                logger.info(f"Fetched entry price for {ticker}: ${current_price}")
+
+                        except Exception as ticker_error:
+                            logger.error(f"Error fetching price for {ticker}: {ticker_error}")
+                            continue
+
+                    if entry_prices:
+                        # Update recommendation in database with entry prices
+                        rec_data["entry_prices"] = entry_prices
+                        if "recommendation_date" not in rec_data:
+                            rec_data["recommendation_date"] = recommendation.created_at.isoformat()
+
+                        # Save updated recommendation
+                        from host_agent.database import StockRecommendation
+                        from sqlalchemy import update
+
+                        stmt = update(StockRecommendation).where(
+                            StockRecommendation.session_id == session_id
+                        ).values(recommendation=rec_data)
+                        db.execute(stmt)
+                        db.commit()
+
+                        logger.info(f"Populated and saved entry prices for {len(entry_prices)} stocks")
+                    else:
+                        raise HTTPException(
+                            status_code=500,
+                            detail="Failed to fetch entry prices from stock data service."
+                        )
+
+                except Exception as mcp_error:
+                    logger.error(f"Error fetching entry prices from MCP: {mcp_error}")
+                    raise HTTPException(
+                        status_code=500,
+                        detail=f"Error fetching stock prices: {str(mcp_error)}"
+                    )
+
+            # Check if recommendation is less than 1 day old
+            from datetime import datetime, timedelta
+            rec_datetime = datetime.fromisoformat(recommendation_date.replace('Z', '+00:00'))
+            time_since_recommendation = datetime.now(rec_datetime.tzinfo) - rec_datetime
+            is_too_recent = time_since_recommendation < timedelta(days=1)
+
+            if is_too_recent:
+                logger.info(f"Recommendation is only {time_since_recommendation.total_seconds() / 3600:.1f} hours old - too recent for performance calculation")
+            else:
+                logger.info(f"Recommendation is {time_since_recommendation.days} days old - calculating performance")
+
+            # If recommendation is too recent, return minimal data without performance metrics
+            if is_too_recent:
+                hours_old = time_since_recommendation.total_seconds() / 3600
+                stock_list = []
+
+                for stock in allocation_breakdown:
+                    ticker = stock["ticker"]
+                    import re
+                    investment_str = stock.get("investment_amount", "$0")
+                    investment_match = re.search(r'[\d.]+', investment_str)
+                    investment_amount = float(investment_match.group()) if investment_match else 0.0
+
+                    entry_price = entry_prices.get(ticker, 0.0)
+
+                    stock_list.append({
+                        "ticker": ticker,
+                        "entry_price": round(entry_price, 2),
+                        "investment_amount": round(investment_amount, 2),
+                        "status": "too_recent"
+                    })
+
+                total_investment = sum(
+                    float(re.search(r'[\d.]+', s.get("investment_amount", "$0")).group())
+                    for s in allocation_breakdown
+                    if re.search(r'[\d.]+', s.get("investment_amount", "$0"))
+                )
+
+                return {
+                    "overall_performance": {
+                        "total_investment": round(total_investment, 2),
+                        "status": "too_recent",
+                        "message": f"Recommendation is only {hours_old:.1f} hours old. Performance tracking will be available after 24 hours."
+                    },
+                    "stocks": stock_list,
+                    "recommendation_date": recommendation_date,
+                    "is_too_recent": True,
+                    "hours_since_recommendation": round(hours_old, 1)
+                }
+
+            # Fetch current prices for all tickers (only if recommendation is old enough)
+            logger.info(f"Fetching current prices for {len(allocation_breakdown)} stocks")
+            current_prices = await fetch_current_stock_prices([stock["ticker"] for stock in allocation_breakdown])
+
+            # Calculate performance for each stock
+            stock_performance = []
+            total_investment = 0.0
+            total_current_value = 0.0
+
+            for stock in allocation_breakdown:
+                ticker = stock["ticker"]
+
+                # Extract investment amount (remove $ and convert to float)
+                import re
+                investment_str = stock.get("investment_amount", "$0")
+                investment_match = re.search(r'[\d.]+', investment_str)
+                investment_amount = float(investment_match.group()) if investment_match else 0.0
+
+                total_investment += investment_amount
+
+                # Get entry and current prices
+                entry_price = entry_prices.get(ticker, 0.0)
+                current_price = current_prices.get(ticker, 0.0)
+
+                if entry_price > 0 and current_price > 0:
+                    # Calculate number of shares purchased
+                    shares = investment_amount / entry_price
+
+                    # Calculate current value
+                    current_value = shares * current_price
+
+                    # Calculate profit/loss
+                    profit_loss = current_value - investment_amount
+                    profit_loss_percentage = (profit_loss / investment_amount) * 100 if investment_amount > 0 else 0.0
+
+                    status = "profit" if profit_loss >= 0 else "loss"
+
+                    stock_performance.append({
+                        "ticker": ticker,
+                        "entry_price": round(entry_price, 2),
+                        "current_price": round(current_price, 2),
+                        "investment_amount": round(investment_amount, 2),
+                        "shares": round(shares, 2),
+                        "current_value": round(current_value, 2),
+                        "profit_loss": round(profit_loss, 2),
+                        "profit_loss_percentage": round(profit_loss_percentage, 2),
+                        "status": status
+                    })
+
+                    total_current_value += current_value
+                else:
+                    logger.warning(f"Missing price data for {ticker} (entry: {entry_price}, current: {current_price})")
+                    # Add stock with error status
+                    stock_performance.append({
+                        "ticker": ticker,
+                        "entry_price": entry_price,
+                        "current_price": current_price,
+                        "investment_amount": round(investment_amount, 2),
+                        "shares": 0.0,
+                        "current_value": 0.0,
+                        "profit_loss": 0.0,
+                        "profit_loss_percentage": 0.0,
+                        "status": "error",
+                        "error": "Price data unavailable"
+                    })
+
+            # Calculate overall performance
+            overall_profit_loss = total_current_value - total_investment
+            overall_profit_loss_percentage = (overall_profit_loss / total_investment) * 100 if total_investment > 0 else 0.0
+            overall_status = "profit" if overall_profit_loss >= 0 else "loss"
+
+            response = {
+                "overall_performance": {
+                    "total_investment": round(total_investment, 2),
+                    "current_value": round(total_current_value, 2),
+                    "profit_loss": round(overall_profit_loss, 2),
+                    "profit_loss_percentage": round(overall_profit_loss_percentage, 2),
+                    "status": overall_status
+                },
+                "stocks": stock_performance,
+                "recommendation_date": recommendation_date,
+                "is_too_recent": False,
+                "days_since_recommendation": time_since_recommendation.days
+            }
+
+            logger.info(f"Portfolio performance calculated: {overall_status} of ${abs(overall_profit_loss):.2f} ({overall_profit_loss_percentage:.2f}%)")
+            return response
+
+        finally:
+            db.close()
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error calculating portfolio performance for session {session_id}: {e}")
+        raise HTTPException(status_code=500, detail=f"Error calculating portfolio performance: {str(e)}")
+
+
+@app.get("/api/user-recommendations/{user_id}")
+async def get_user_recommendations(user_id: str, current_user: dict = Depends(get_current_user)):
+    """
+    Get all stock recommendations for a user.
+
+    Returns a list of recommendations with their session IDs, dates, and basic info.
+    """
+    try:
+        logger.info(f"Fetching recommendations for user {user_id}")
+
+        # Verify the authenticated user matches the requested user_id
+        if current_user.get('uid') != user_id:
+            raise HTTPException(status_code=403, detail="Unauthorized to access this user's recommendations")
+
+        # Get database session
+        db = next(get_db())
+
+        try:
+            # Get all recommendations for this user
+            recommendations = get_user_stock_recommendations(db, user_id)
+
+            if not recommendations:
+                return {
+                    "user_id": user_id,
+                    "recommendations": [],
+                    "total_count": 0
+                }
+
+            # Format recommendations for response
+            formatted_recommendations = []
+            for rec in recommendations:
+                rec_data = rec.recommendation
+                allocation_breakdown = rec_data.get("allocation_breakdown", [])
+
+                # Calculate total investment
+                import re
+                total_investment = sum(
+                    float(re.search(r'[\d.]+', stock.get("investment_amount", "$0")).group())
+                    for stock in allocation_breakdown
+                    if re.search(r'[\d.]+', stock.get("investment_amount", "$0"))
+                )
+
+                formatted_recommendations.append({
+                    "session_id": rec.session_id,
+                    "created_at": rec.created_at.isoformat(),
+                    "total_investment": round(total_investment, 2),
+                    "stock_count": len(allocation_breakdown),
+                    "stocks": [s.get("ticker") for s in allocation_breakdown],
+                    "has_entry_prices": "entry_prices" in rec_data,
+                    "recommendation_date": rec_data.get("recommendation_date", rec.created_at.isoformat())
+                })
+
+            return {
+                "user_id": user_id,
+                "recommendations": formatted_recommendations,
+                "total_count": len(formatted_recommendations)
+            }
+
+        finally:
+            db.close()
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error fetching user recommendations for {user_id}: {e}")
+        raise HTTPException(status_code=500, detail=f"Error fetching recommendations: {str(e)}")
+
+
+async def fetch_current_stock_prices(tickers: list) -> dict:
+    """
+    Fetch current stock prices for a list of tickers.
+
+    Args:
+        tickers: List of stock ticker symbols
+
+    Returns:
+        Dictionary mapping ticker to current price
+    """
+    import json
+
+    prices = {}
+
+    # Use Perplexity API to fetch current prices
+    try:
+        from openai import OpenAI
+
+        perplexity_api_key = os.getenv("PERPLEXITY_API_KEY")
+        if not perplexity_api_key:
+            logger.error("PERPLEXITY_API_KEY not found")
+            return prices
+
+        client = OpenAI(
+            api_key=perplexity_api_key,
+            base_url="https://api.perplexity.ai"
+        )
+
+        # Request current prices for all tickers
+        ticker_list = ", ".join(tickers)
+
+        response = client.chat.completions.create(
+            model="sonar",
+            messages=[
+                {
+                    "role": "system",
+                    "content": """You are a stock price lookup assistant. Return ONLY valid JSON with no additional text.
+                    Format: {"TICKER": price_as_number, ...}
+                    Example: {"AAPL": 232.50, "GOOGL": 175.30}"""
+                },
+                {
+                    "role": "user",
+                    "content": f"Get the current stock prices for these tickers: {ticker_list}. Return as JSON only."
+                }
+            ]
+        )
+
+        # Parse the response
+        if response.choices and len(response.choices) > 0:
+            content = response.choices[0].message.content.strip()
+
+            # Remove markdown code blocks if present
+            if content.startswith("```"):
+                content = content.split("```")[1]
+                if content.startswith("json"):
+                    content = content[4:]
+                content = content.strip()
+
+            # Parse JSON
+            prices = json.loads(content)
+            logger.info(f"Fetched current prices for {len(prices)} stocks")
+
+    except Exception as e:
+        logger.error(f"Error fetching current stock prices: {e}")
+
+    return prices
+
+
+async def fetch_current_prices_from_mcp(tickers: list) -> dict:
+    """
+    Fetch current stock prices using MCP tool.
+
+    Args:
+        tickers: List of stock ticker symbols
+
+    Returns:
+        Dictionary mapping ticker to current price
+    """
+    prices = {}
+
+    if not stock_mcp_tool:
+        logger.error("MCP tool not available for fetching prices")
+        return prices
+
+    try:
+        for ticker in tickers:
+            try:
+                logger.info(f"Fetching current price for {ticker} from MCP")
+                session = await stock_mcp_tool._mcp_session_manager.create_session()
+                stock_data_result = await session.call_tool("get_stock_info", arguments={"symbol": ticker})
+
+                # Parse MCP result object
+                stock_data = None
+                if hasattr(stock_data_result, 'content'):
+                    if isinstance(stock_data_result.content, list) and len(stock_data_result.content) > 0:
+                        content_item = stock_data_result.content[0]
+                        if hasattr(content_item, 'text'):
+                            stock_data = json.loads(content_item.text)
+                elif isinstance(stock_data_result, dict):
+                    stock_data = stock_data_result
+                elif isinstance(stock_data_result, str):
+                    stock_data = json.loads(stock_data_result)
+
+                if stock_data:
+                    stock_type = stock_data.get("stock_type", "EQUITY")
+                    current_price = None
+
+                    if stock_type == "EQUITY":
+                        core_valuation = stock_data.get("core_valuation_metrics", {})
+                        current_price = core_valuation.get("currentPrice")
+                    else:  # ETF
+                        trading_valuation = stock_data.get("trading_valuation", {})
+                        current_price = trading_valuation.get("regularMarketPrice")
+
+                    if current_price:
+                        prices[ticker] = float(current_price)
+                        logger.info(f"Fetched current price for {ticker}: ${current_price}")
+                    else:
+                        logger.warning(f"No price found for {ticker}")
+
+            except Exception as ticker_error:
+                logger.error(f"Error fetching price for {ticker}: {ticker_error}")
+                continue
+
+    except Exception as e:
+        logger.error(f"Error in fetch_current_prices_from_mcp: {e}")
+
+    return prices
+
+
+@app.get("/api/debug/user-recommendations/{user_id}")
+async def debug_user_recommendations(user_id: str, _current_user: dict = Depends(get_current_user)):
+    """
+    Debug endpoint to see the raw recommendation data structure.
+    """
+    try:
+        db = next(get_db())
+        try:
+            recommendations = get_user_stock_recommendations(db, user_id)
+            if not recommendations or len(recommendations) == 0:
+                return {"error": "No recommendations found", "user_id": user_id}
+
+            latest = recommendations[0]
+            return {
+                "user_id": user_id,
+                "session_id": latest.session_id,
+                "created_at": latest.created_at.isoformat(),
+                "recommendation_data": latest.recommendation,
+                "has_individual_recommendations": bool(latest.recommendation.get("individual_stock_recommendations")),
+                "has_entry_prices": bool(latest.recommendation.get("entry_prices")),
+                "individual_recommendations_count": len(latest.recommendation.get("individual_stock_recommendations", [])),
+                "entry_prices_count": len(latest.recommendation.get("entry_prices", {}))
+            }
+        finally:
+            db.close()
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@app.get("/api/portfolio-performance/user/{user_id}")
+async def get_user_portfolio_performance(user_id: str, _current_user: dict = Depends(get_current_user)):
+    """
+    Get portfolio performance for the user's LATEST stock recommendation.
+    Shows profit/loss by comparing entry_price vs current MCP price.
+    Only tracks BUY and SELL stocks.
+
+    Returns:
+        {
+            "overall_performance": {
+                "total_investment": 3000.00,
+                "current_value": 3250.00,
+                "profit_loss": 250.00,
+                "profit_loss_percentage": 8.33,
+                "status": "profit"
+            },
+            "stocks": [
+                {
+                    "ticker": "AMZN",
+                    "recommendation": "BUY",
+                    "entry_price": 215.30,
+                    "current_price": 220.50,
+                    "investment_amount": 750.00,
+                    "shares": 3.48,
+                    "current_value": 767.52,
+                    "profit_loss": 17.52,
+                    "profit_loss_percentage": 2.34,
+                    "status": "profit"
+                },
+                ...
+            ],
+            "recommendation_date": "2026-01-02T10:30:00",
+            "session_id": "session_123"
+        }
+    """
+    try:
+        logger.info(f"Fetching latest portfolio performance for user {user_id}")
+
+        # Get database session
+        db = next(get_db())
+
+        try:
+            # Get the LATEST stock recommendation for this user
+            recommendations = get_user_stock_recommendations(db, user_id)
+
+            if not recommendations or len(recommendations) == 0:
+                raise HTTPException(status_code=404, detail="No stock recommendations found for this user")
+
+            # Get the most recent recommendation (first in list as it's ordered by created_at desc)
+            latest_recommendation = recommendations[0]
+            rec_data = latest_recommendation.recommendation
+
+            # Extract data
+            individual_recommendations = rec_data.get("individual_stock_recommendations", [])
+            entry_prices_dict = rec_data.get("entry_prices", {})
+            recommendation_date = rec_data.get("recommendation_date", latest_recommendation.created_at.isoformat())
+            session_id = latest_recommendation.session_id
+
+            # Log what we found
+            logger.info(f"Total individual recommendations: {len(individual_recommendations)}")
+            for stock in individual_recommendations:
+                logger.info(f"Stock {stock.get('ticker')}: recommendation={stock.get('recommendation')}, has entry_price={bool(stock.get('entry_price'))}")
+
+            # Use ALL stocks (BUY/SELL/HOLD) for performance tracking
+            all_stocks = individual_recommendations
+
+            if not all_stocks:
+                logger.warning("No stock recommendations found")
+                return {
+                    "overall_performance": {
+                        "total_investment": 0.0,
+                        "current_value": 0.0,
+                        "profit_loss": 0.0,
+                        "profit_loss_percentage": 0.0,
+                        "status": "no_recommendations"
+                    },
+                    "stocks": [],
+                    "recommendation_date": recommendation_date,
+                    "session_id": session_id,
+                    "message": "No stock recommendations found in your latest portfolio"
+                }
+
+            logger.info(f"Processing {len(all_stocks)} stocks (BUY/SELL/HOLD)")
+
+            # Get tickers for current price lookup
+            tickers = [stock["ticker"] for stock in all_stocks]
+
+            # Fetch current prices from MCP
+            logger.info(f"Fetching current prices for {len(tickers)} stocks from MCP")
+            current_prices = await fetch_current_prices_from_mcp(tickers)
+
+            # Calculate performance for each stock (BUY/SELL/HOLD)
+            stock_performance = []
+            total_investment = 0.0
+            total_current_value = 0.0
+
+            for stock in all_stocks:
+                ticker = stock.get("ticker")
+                recommendation = stock.get("recommendation", "HOLD")
+
+                # Extract investment amount
+                import re
+                investment_str = stock.get("investment_amount", "$0")
+                investment_match = re.search(r'[\d.]+', investment_str.replace(",", ""))
+                investment_amount = float(investment_match.group()) if investment_match else 0.0
+
+                # Get entry price from the stock recommendation (we just added this field!)
+                entry_price_str = stock.get("entry_price", "")
+                if entry_price_str:
+                    entry_price_match = re.search(r'[\d.]+', str(entry_price_str).replace(",", ""))
+                    entry_price = float(entry_price_match.group()) if entry_price_match else entry_prices_dict.get(ticker, 0.0)
+                else:
+                    # Fallback to entry_prices dict
+                    entry_price = entry_prices_dict.get(ticker, 0.0)
+
+                # Get current price from MCP
+                current_price = current_prices.get(ticker, 0.0)
+
+                # For HOLD stocks or stocks with investment, calculate performance
+                if entry_price > 0 and current_price > 0:
+                    if investment_amount > 0:
+                        # Calculate shares: investment_amount / entry_price
+                        shares = investment_amount / entry_price
+
+                        # Calculate current value
+                        current_value = shares * current_price
+
+                        # Calculate profit/loss
+                        profit_loss = current_value - investment_amount
+                        profit_loss_percentage = (profit_loss / investment_amount) * 100
+
+                        status = "profit" if profit_loss >= 0 else "loss"
+
+                        stock_performance.append({
+                            "ticker": ticker,
+                            "recommendation": recommendation,
+                            "entry_price": round(entry_price, 2),
+                            "current_price": round(current_price, 2),
+                            "investment_amount": round(investment_amount, 2),
+                            "shares": round(shares, 4),
+                            "current_value": round(current_value, 2),
+                            "profit_loss": round(profit_loss, 2),
+                            "profit_loss_percentage": round(profit_loss_percentage, 2),
+                            "status": status
+                        })
+
+                        # Only count BUY stocks in total investment and profit/loss
+                        if recommendation == "BUY":
+                            total_investment += investment_amount
+                            total_current_value += current_value
+                    else:
+                        # HOLD or SELL stock - show prices but no investment
+                        stock_performance.append({
+                            "ticker": ticker,
+                            "recommendation": recommendation,
+                            "entry_price": round(entry_price, 2),
+                            "current_price": round(current_price, 2),
+                            "investment_amount": 0.0,
+                            "shares": 0.0,
+                            "current_value": 0.0,
+                            "profit_loss": 0.0,
+                            "profit_loss_percentage": 0.0,
+                            "status": "neutral"
+                        })
+                else:
+                    # Missing price data
+                    logger.warning(f"Missing data for {ticker}: entry={entry_price}, current={current_price}")
+                    stock_performance.append({
+                        "ticker": ticker,
+                        "recommendation": recommendation,
+                        "entry_price": entry_price if entry_price > 0 else 0.0,
+                        "current_price": current_price if current_price > 0 else 0.0,
+                        "investment_amount": round(investment_amount, 2),
+                        "shares": 0.0,
+                        "current_value": 0.0,
+                        "profit_loss": 0.0,
+                        "profit_loss_percentage": 0.0,
+                        "status": "error",
+                        "error": "Price data unavailable"
+                    })
+
+            # Calculate overall performance
+            overall_profit_loss = total_current_value - total_investment
+            overall_profit_loss_percentage = (overall_profit_loss / total_investment) * 100 if total_investment > 0 else 0.0
+            overall_status = "profit" if overall_profit_loss >= 0 else "loss"
+
+            return {
+                "overall_performance": {
+                    "total_investment": round(total_investment, 2),
+                    "current_value": round(total_current_value, 2),
+                    "profit_loss": round(overall_profit_loss, 2),
+                    "profit_loss_percentage": round(overall_profit_loss_percentage, 2),
+                    "status": overall_status
+                },
+                "stocks": stock_performance,
+                "recommendation_date": recommendation_date,
+                "session_id": session_id
+            }
+
+        finally:
+            db.close()
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error getting portfolio performance for user {user_id}: {e}")
+        import traceback
+        logger.error(f"Traceback: {traceback.format_exc()}")
+        raise HTTPException(status_code=500, detail=f"Error calculating portfolio performance: {str(e)}")
+
+
 def main():
     """Start the Host Agent API server."""
     try:
@@ -1238,6 +1981,8 @@ def main():
         logger.info("  GET /health - Health check")
         logger.info("  GET /sessions/{session_id} - Get session information")
         logger.info("  GET /sessions/{session_id}/messages - Get session messages")
+        logger.info("  GET /api/portfolio-performance/{session_id} - Get portfolio profit/loss performance")
+        logger.info("  GET /api/user-recommendations/{user_id} - Get all recommendations for a user")
         logger.info("  GET /users/{user_id} - Get user information")
         logger.info("  GET /users/{user_id}/sessions - Get user sessions")
         logger.info("  GET /api/profile - Get current user's profile (authenticated)")
