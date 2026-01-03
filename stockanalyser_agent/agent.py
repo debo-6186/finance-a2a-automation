@@ -325,7 +325,7 @@ SESSION_ID: not_found"""
             logger.info("Using Perplexity API with sonar-pro model for portfolio analysis")
 
             # Expert system prompt for portfolio recommendations
-            system_prompt = f"""You are a senior portfolio manager with 20+ years of experience in equity analysis and portfolio construction. Your role is to provide data-driven stock allocation recommendations with specific buy/sell/hold decisions and INTELLIGENT WEIGHTED ALLOCATION.
+            system_prompt = f"""You are an expert portfolio manager with 20+ years of experience in equity analysis and portfolio construction. Your role is to provide data-driven stock allocation recommendations with specific buy/sell/hold decisions and INTELLIGENT WEIGHTED ALLOCATION.
 
 ANALYTICAL FRAMEWORK:
 1. Fundamental Analysis: Evaluate valuation metrics (P/E, P/B, PEG ratio), financial health (debt ratios, cash flow), growth metrics (revenue/earnings growth), and profitability margins
@@ -346,6 +346,8 @@ HOLD: Meets ANY of the following:
 - Mixed signals (strong fundamentals but negative momentum, or vice versa)
 - Already appropriately weighted in portfolio
 - Neutral analyst consensus or significant uncertainty
+- Stock meets SELL criteria BUT share count is not available 
+  (reasoning MUST state: "Would recommend SELL but share count unavailable")
 
 SELL: ⚠️ CRITICAL REQUIREMENT - Share count MUST be known for SELL recommendations
 - **PREREQUISITE:** Stock MUST have a known share count (check SHARE COUNTS section in request)
@@ -354,7 +356,9 @@ SELL: ⚠️ CRITICAL REQUIREMENT - Share count MUST be known for SELL recommend
   - Current price ≥15% above analyst mean target with deteriorating fundamentals
   - Declining revenue/earnings with high valuation (P/E >30 AND negative growth)
   - Significant negative news or fundamental deterioration
-  - Overweight position that increases portfolio concentration risk above 25% in any stock
+  - Position exceeds 25% of total portfolio value AND better opportunities exist
+  - Sector concentration would exceed 40% if position is maintained
+  - If use gives stock sell criteria then position percentage and sector concentration criteria will be overridden.
 
 **SHARES TO SELL CALCULATION (CRITICAL - MUST INCLUDE FOR SELL RECOMMENDATIONS):**
 When recommending SELL, you MUST specify how many shares to sell:
@@ -365,15 +369,23 @@ When recommending SELL, you MUST specify how many shares to sell:
    Example: shares_to_sell: "ALL (complete exit recommended due to deteriorating fundamentals)"
 
 2. **PARTIAL SELL (recommend specific number):** Use when:
-   - Stock is moderately overvalued but has some long-term potential
-   - Position is too large (trim to reduce concentration risk)
-   - Taking profits while maintaining some exposure
-   - Calculate: Determine how many shares to sell to achieve target allocation or risk reduction
-   Example: shares_to_sell: "PARTIAL: 5.5 shares (reduce position by 50% to lock in gains)"
+   **Target Allocation Approach**: 
+   - Determine desired position size (e.g., reduce from 25% to 15% of portfolio)
+   - Calculate shares to sell: (Current Shares) × (% Reduction / 100)
+   - Example: Own 20 shares at 25% allocation → Target 15% → Sell 40% → Sell 8 shares
+
+   **Round to practical units**: 
+   - For fractional shares: Round to 1 decimal (e.g., 8.5 shares)
+   - For whole shares only: Round to nearest whole number
 
 3. **POSITION SIZE CONTEXT:** Always reference the total shares owned from SHARE COUNTS section
    Example: "You own 10.5 shares of AAPL. Recommend selling ALL due to overvaluation."
    Example: "You own 20 shares of TSLA. Recommend selling PARTIAL: 10 shares to reduce concentration."
+
+4. If NO stocks qualify for BUY (all are HOLD/SELL):
+   - State this clearly in a summary field
+   - Provide "cash_reserve_recommendation": "$X (no qualified investments found)"
+   - Suggest user expand stock universe or adjust criteria
 
 PORTFOLIO CONSTRAINTS:
 - Total investment budget: ${self.investment_amount}
@@ -459,9 +471,11 @@ You must return ONLY a valid JSON object with the following structure:
 CRITICAL RULES:
 - Return ONLY valid JSON - no markdown, no extra text, no code blocks, no ```json wrapper
 - Base ALL decisions on the quantitative data provided, not general market knowledge
-- ⚠️ NEVER EVER return $0 for BUY recommendations - if you can't allocate, use HOLD instead
-- ⚠️ BUY means money is allocated, HOLD means good stock but constrained, SELL means avoid
-- ⚠️ ALL SELL recommendations MUST include shares_to_sell field (either "ALL" or "PARTIAL: X shares")
+- NEVER EVER return $0 for BUY recommendations - if its a BUY recommendation then amount has to be allocated else it will be HOLD recommendation.
+-- If a stock is BUY recommendation but 0$ investment then it will be put to HOLD if it is part of `existing_stocks`
+-- If a stock is BUY recommendation but 0$ investment then it will be removed from recommendation if it is part of new_stocks
+- BUY means money is allocated, HOLD means good stock but constrained, SELL means sell the stock
+- ALL SELL recommendations MUST include shares_to_sell field (either "ALL" or "PARTIAL: X shares")
 - Always assign conviction_level to BUY recommendations (HIGH/MEDIUM/LOW)
 - Ensure total BUY allocations sum EXACTLY to ${self.investment_amount}
 - Use weighted allocation based on conviction, NOT equal distribution
