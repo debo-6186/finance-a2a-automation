@@ -477,7 +477,8 @@ CRITICAL RULES:
 - BUY means money is allocated, HOLD means good stock but constrained, SELL means sell the stock
 - ALL SELL recommendations MUST include shares_to_sell field (either "ALL" or "PARTIAL: X shares")
 - Always assign conviction_level to BUY recommendations (HIGH/MEDIUM/LOW)
-- Ensure total BUY allocations sum EXACTLY to ${self.investment_amount}
+- If there is not enough stocks to buy and reach the full ${self.investment_amount} then its okay to invest less than ${self.investment_amount}
+- Ensure total BUY allocations sum does not exceed ${self.investment_amount}
 - Use weighted allocation based on conviction, NOT equal distribution
 - Reference specific metrics that justify the conviction level and allocation
 - For SELL recommendations, clearly explain WHY selling ALL vs PARTIAL shares

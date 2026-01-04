@@ -190,6 +190,13 @@ def get_or_create_user(db: Session, user_id: str, email: Optional[str] = None, n
                       paid_user: bool = False) -> User:
     """Get existing user or create new one."""
     try:
+        # First, check if email already exists with a different user_id
+        if email:
+            existing_user_with_email = db.query(User).filter(User.email == email).first()
+            if existing_user_with_email and existing_user_with_email.id != user_id:
+                logger.error(f"User with email {email} already exists with different ID {existing_user_with_email.id}")
+                raise ValueError(f"A user with email {email} already exists. Please use a different email or contact support.")
+
         user = db.query(User).filter(User.id == user_id).first()
         if user:
             # Update fields if they changed
@@ -221,21 +228,9 @@ def get_or_create_user(db: Session, user_id: str, email: Optional[str] = None, n
             if existing_user:
                 # Check if it's a different user_id
                 if existing_user.id != user_id:
-                    logger.warning(f"Found user with email {email} but different ID. Updating ID from {existing_user.id} to {user_id}")
-                    # Update the user's ID to match the Firebase UID
-                    existing_user.id = user_id
-                    existing_user.paid_user = paid_user
-                    if name:
-                        existing_user.name = name
-                    try:
-                        db.commit()
-                        db.refresh(existing_user)
-                        logger.info(f"Updated user ID to {user_id}")
-                        return existing_user
-                    except Exception as update_error:
-                        db.rollback()
-                        logger.error(f"Failed to update user ID: {update_error}")
-                        raise
+                    logger.error(f"User with email {email} already exists with different ID {existing_user.id}")
+                    # Raise a specific error that can be caught and returned to the frontend
+                    raise ValueError(f"A user with email {email} already exists. Please use a different email or contact support.")
                 else:
                     logger.info(f"Found existing user with email {email} and matching ID {existing_user.id}")
                     return existing_user

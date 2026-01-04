@@ -35,9 +35,10 @@ from database import (
     get_stock_recommendation, get_user_stock_recommendations
 )
 from user_api import (
-    get_user_profile, update_user_profile, get_user_statistics,
+    get_user_profile, get_user_statistics,
     delete_user_account, get_user_sessions_summary, upgrade_user_to_paid,
-    downgrade_user_to_free, UserProfile, UserUpdate, UserStats
+    downgrade_user_to_free, update_user_profile,
+    UserProfile, UserStats, UserUpdateRequest
 )
 
 load_dotenv()
@@ -349,8 +350,10 @@ app = FastAPI(
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
-        "https://warm-rookery-461602-i8.web.app",
-        "https://warm-rookery-461602-i8.firebaseapp.com",
+        "https://aistockrecommender.com",  # Custom domain
+        "https://www.aistockrecommender.com",  # Custom domain with www
+        "https://warm-rookery-461602-i8.web.app",  # Keep for backward compatibility
+        "https://warm-rookery-461602-i8.firebaseapp.com",  # Keep for backward compatibility
         "http://localhost:3000",  # For local development
         "https://localhost:3000",  # For local development with HTTPS
     ],
@@ -365,25 +368,27 @@ def login(login_request: LoginRequest):
     """
     Handle Firebase authentication and user creation/login.
     """
+    db = None
     try:
         logger.info(f"Processing login request with token: {login_request.id_token[:20]}...")
-        
+
         # Validate Firebase token
         firebase_user = validate_firebase_token(login_request.id_token)
         user_id = firebase_user['uid']
         email = firebase_user.get('email', '')
         name = firebase_user.get('name', '')
-        
-        logger.info(f"Firebase token validated for user: {user_id}")
-        
+
+        logger.info(f"Firebase token validated for user: {user_id}, email: {email}")
+
         # Get database session
         db = next(get_db())
-        
+
         # Get or create user in database
         user = get_or_create_user(db, user_id, email=email, name=name, paid_user=False)
-        
+
         logger.info(f"User {'created' if user else 'found'} in database: {user_id}")
-        
+
+        db.close()
         return LoginResponse(
             id=user_id,
             email=email,
@@ -393,12 +398,33 @@ def login(login_request: LoginRequest):
             uploadFile=user.paid_user if user else False,  # Map paid_user to uploadFile
             createdAt=user.created_at.isoformat() if user else ""
         )
-        
+
+    except ValueError as e:
+        # Handle duplicate email error
+        error_msg = str(e)
+        logger.error(f"[LOGIN ERROR] Duplicate email detected: {error_msg}")
+        logger.error(f"[LOGIN ERROR] Returning 409 Conflict to frontend")
+        if db:
+            try:
+                db.close()
+            except:
+                pass
+        raise HTTPException(status_code=409, detail=error_msg)
     except HTTPException as e:
-        logger.error(f"HTTP error during login: {e.detail}")
+        logger.error(f"[LOGIN ERROR] HTTP error during login: {e.detail}")
+        if db:
+            try:
+                db.close()
+            except:
+                pass
         raise e
     except Exception as e:
-        logger.error(f"Unexpected error during login: {e}")
+        logger.error(f"[LOGIN ERROR] Unexpected error during login: {e}")
+        if db:
+            try:
+                db.close()
+            except:
+                pass
         raise HTTPException(status_code=500, detail=f"Login failed: {str(e)}")
 
 
@@ -677,6 +703,10 @@ async def chat(request: Request, current_user: dict = Depends(get_current_user))
             end_session=end_session
         )
 
+    except ValueError as e:
+        # Handle duplicate email error
+        logger.error(f"Value error during chat: {e}")
+        raise HTTPException(status_code=409, detail=str(e))
     except HTTPException:
         raise
     except Exception as e:
@@ -936,7 +966,16 @@ async def chat_stream(request: Request):
             media_type="application/x-ndjson",
             headers={"Cache-Control": "no-cache"}
         )
-        
+
+    except ValueError as e:
+        # Handle duplicate email error
+        logger.error(f"Value error during streaming chat: {e}")
+        try:
+            db.close()
+            logger.info(f"Database session closed (ValueError) for session {session_id}")
+        except:
+            pass  # Already closed or doesn't exist
+        raise HTTPException(status_code=409, detail=str(e))
     except HTTPException:
         # Close db if generator hasn't started
         try:
@@ -1160,14 +1199,13 @@ def get_user_profile_endpoint(user_id: str, current_user: dict = Depends(get_cur
 
 
 @app.put("/api/users/{user_id}/profile", response_model=UserProfile)
-def update_user_profile_endpoint(user_id: str, update_data: UserUpdate, current_user: dict = Depends(get_current_user)):
+def update_user_profile_endpoint(user_id: str, update_data: UserUpdateRequest, current_user: dict = Depends(get_current_user)):
     """Update user profile information."""
     # Ensure user can only update their own profile
     if current_user['uid'] != user_id:
         raise HTTPException(status_code=403, detail="You can only update your own profile")
 
-    # Pass email from JWT token for user creation if needed
-    return update_user_profile(user_id, update_data, email=current_user.get('email'))
+    return update_user_profile(user_id, update_data)
 
 
 @app.get("/api/users/{user_id}/statistics", response_model=UserStats)
@@ -1987,7 +2025,6 @@ def main():
         logger.info("  GET /users/{user_id}/sessions - Get user sessions")
         logger.info("  GET /api/profile - Get current user's profile (authenticated)")
         logger.info("  GET /users/{user_id}/profile - Get complete user profile")
-        logger.info("  PUT /users/{user_id}/profile - Update user profile")
         logger.info("  GET /users/{user_id}/statistics - Get user statistics")
         logger.info("  DELETE /users/{user_id} - Delete user account")
         logger.info("  GET /users/{user_id}/sessions/summary - Get user sessions summary")

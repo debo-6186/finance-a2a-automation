@@ -3,7 +3,7 @@ User-level API endpoints for the Host Agent.
 This module provides user management and profile functionality.
 """
 
-from typing import List, Optional
+from typing import Optional
 from datetime import datetime, timedelta
 import logging
 
@@ -11,8 +11,9 @@ from fastapi import HTTPException
 from pydantic import BaseModel
 
 from database import (
-    get_db, get_or_create_user, get_user_message_count,
-    can_user_send_message, User, ConversationSession, ConversationMessage
+    get_db, get_user_message_count,
+    can_user_send_message, User, ConversationSession, ConversationMessage,
+    get_or_create_user
 )
 
 # Set up logging
@@ -33,15 +34,6 @@ class UserProfile(BaseModel):
     total_messages: int
     can_send_messages: bool
     message_limit: str
-
-
-class UserUpdate(BaseModel):
-    """User update model."""
-    email: Optional[str] = None
-    name: Optional[str] = None
-    contact_number: Optional[str] = None
-    country_code: Optional[str] = None
-    paid_user: Optional[bool] = None
 
 
 class UserStats(BaseModel):
@@ -72,15 +64,15 @@ def get_user_profile(user_id: str, email: Optional[str] = None) -> UserProfile:
 
         if not user:
             raise HTTPException(status_code=404, detail="User not found")
-        
+
         # Get user's sessions
         sessions = db.query(ConversationSession).filter(
             ConversationSession.user_id == user_id
         ).all()
-        
+
         # Get total message count
         message_count = get_user_message_count(db, user_id)
-        
+
         profile = UserProfile(
             user_id=user_id,
             email=user.email,
@@ -95,63 +87,16 @@ def get_user_profile(user_id: str, email: Optional[str] = None) -> UserProfile:
             can_send_messages=can_user_send_message(db, user_id),
             message_limit="unlimited" if user.paid_user else "19 messages"
         )
-        
+
         db.close()
         return profile
-        
+
     except HTTPException:
         db.close()
         raise
     except Exception as e:
         db.close()
         raise HTTPException(status_code=500, detail=f"Error getting user profile: {str(e)}")
-
-
-def update_user_profile(user_id: str, update_data: UserUpdate, email: Optional[str] = None) -> UserProfile:
-    """Update user profile information."""
-    db = next(get_db())
-    try:
-        # Get or create user - this handles first-time profile updates
-        user = get_or_create_user(
-            db,
-            user_id,
-            email=update_data.email or email,
-            name=update_data.name,
-            contact_number=update_data.contact_number,
-            country_code=update_data.country_code or '+1',
-            paid_user=update_data.paid_user or False
-        )
-        
-        # Update fields if provided
-        if update_data.email is not None:
-            user.email = update_data.email
-        if update_data.name is not None:
-            user.name = update_data.name
-        if update_data.contact_number is not None:
-            user.contact_number = update_data.contact_number
-        if update_data.country_code is not None:
-            user.country_code = update_data.country_code
-        if update_data.paid_user is not None:
-            user.paid_user = update_data.paid_user
-        
-        user.updated_at = datetime.utcnow()
-        
-        db.commit()
-        db.refresh(user)
-        
-        # Close this session before getting the profile
-        db.close()
-        
-        # Return updated profile
-        return get_user_profile(user_id)
-        
-    except HTTPException:
-        db.close()
-        raise
-    except Exception as e:
-        db.rollback()
-        db.close()
-        raise HTTPException(status_code=500, detail=f"Error updating user profile: {str(e)}")
 
 
 def get_user_statistics(user_id: str) -> UserStats:
@@ -339,23 +284,73 @@ def downgrade_user_to_free(user_id: str) -> UserProfile:
     try:
         db = next(get_db())
         user = db.query(User).filter(User.id == user_id).first()
-        
+
         if not user:
             raise HTTPException(status_code=404, detail="User not found")
-        
+
         if not user.paid_user:
             raise HTTPException(status_code=400, detail="User is already a free user")
-        
+
         user.paid_user = False
         user.updated_at = datetime.utcnow()
-        
+
         db.commit()
         db.refresh(user)
-        
+
         return get_user_profile(user_id)
-        
+
     except HTTPException:
         raise
     except Exception as e:
         db.rollback()
         raise HTTPException(status_code=500, detail=f"Error downgrading user to free: {str(e)}")
+
+
+class UserUpdateRequest(BaseModel):
+    """User update request model."""
+    email: Optional[str] = None
+    name: Optional[str] = None
+    contact_number: Optional[str] = None
+    country_code: Optional[str] = None
+    paid_user: Optional[bool] = None
+
+
+def update_user_profile(user_id: str, update_data: UserUpdateRequest) -> UserProfile:
+    """Update user profile information."""
+    try:
+        db = next(get_db())
+
+        # Check if user exists
+        existing_user = db.query(User).filter(User.id == user_id).first()
+
+        # If user doesn't exist and we're trying to create them, email is required
+        if not existing_user and not update_data.email:
+            raise HTTPException(
+                status_code=400,
+                detail="Email is required when creating a new user profile"
+            )
+
+        # Try to get or create user
+        try:
+            user = get_or_create_user(
+                db,
+                user_id,
+                email=update_data.email,
+                name=update_data.name,
+                contact_number=update_data.contact_number,
+                country_code=update_data.country_code,
+                paid_user=update_data.paid_user if update_data.paid_user is not None else False
+            )
+        except ValueError as e:
+            # Re-raise ValueError for duplicate email
+            raise HTTPException(status_code=409, detail=str(e))
+
+        db.close()
+        return get_user_profile(user_id, update_data.email)
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        if db:
+            db.rollback()
+        raise HTTPException(status_code=500, detail=f"Error updating user profile: {str(e)}")

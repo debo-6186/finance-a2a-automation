@@ -34,6 +34,288 @@ logger = logging.getLogger("host_agent_api.document_analyzer")
 logger.setLevel(logging.INFO)
 
 
+def verify_portfolio_document(file_bytes: bytes, file_format: str) -> Tuple[bool, str]:
+    """
+    Verify if the uploaded document is actually a portfolio statement or report.
+    Uses Gemini 2.5 Flash to analyze the content and determine validity.
+
+    Args:
+        file_bytes: The file content as bytes
+        file_format: The format type ('pdf' or 'image')
+
+    Returns:
+        Tuple of (is_valid, message)
+        - is_valid: True if document is a valid portfolio statement, False otherwise
+        - message: Explanation message
+    """
+    try:
+        logger.info(f"Verifying {file_format} document ({len(file_bytes)} bytes)")
+
+        # Create the client with proper configuration
+        if os.getenv("GOOGLE_GENAI_USE_VERTEXAI") == "TRUE":
+            client = genai.Client(vertexai=True)
+            logger.info("Using Vertex AI for document verification")
+        else:
+            api_key = os.getenv("GOOGLE_API_KEY")
+            if not api_key:
+                logger.error("No GOOGLE_API_KEY found for document verification")
+                return False, "**Error**: Google API key not configured. Please set GOOGLE_API_KEY environment variable."
+            client = genai.Client(api_key=api_key)
+            logger.info("Using Google AI API for document verification")
+
+        # System prompt for document verification
+        system_prompt = """You are an expert financial document analyst specializing in portfolio statements and investment reports.
+
+Your task is to verify if a document is a VALID PORTFOLIO STATEMENT or INVESTMENT REPORT.
+
+VALID PORTFOLIO DOCUMENTS contain at least ONE of the following:
+1. Stock holdings (ticker symbols, company names, shares, values)
+2. Investment positions (mutual funds, ETFs, bonds)
+3. Portfolio summary (total value, asset allocation)
+4. Brokerage account statements (trades, positions, balances)
+5. Investment account screenshots (from apps like Robinhood, E*TRADE, Zerodha, etc.)
+6. Holdings tables or lists with financial data
+7. Transaction history with stock purchases/sales
+
+INVALID DOCUMENTS (reject these):
+- Bank statements without investment holdings
+- Credit card statements
+- Utility bills
+- Personal documents (ID, passport, etc.)
+- Random screenshots without portfolio data
+- News articles or research reports
+- Empty or corrupted files
+- General financial documents without specific holdings
+
+RESPONSE FORMAT - Return ONLY valid JSON in this EXACT format:
+{
+  "is_valid": true/false,
+  "confidence": "high/medium/low",
+  "document_type": "portfolio statement/brokerage account/investment report/not portfolio related",
+  "reason": "Brief explanation of your decision"
+}
+
+Be strict but fair - if you're unsure but see ANY investment holdings, mark as valid with low confidence."""
+
+        # Process based on file format
+        if file_format == 'pdf':
+            # Extract text from PDF
+            text = read_pdf_document(file_bytes)
+            if text.startswith("Error"):
+                return False, f"Could not verify document: {text}"
+
+            user_prompt = f"""Analyze this document text and determine if it's a valid portfolio statement:
+
+{text[:4000]}
+
+Provide your verification response in the specified JSON format."""
+
+            logger.info("Verifying PDF document with LLM...")
+            response = client.models.generate_content(
+                model="gemini-2.5-flash",
+                contents=user_prompt,
+                config=GenerateContentConfig(
+                    system_instruction=[system_prompt]
+                )
+            )
+
+        elif file_format == 'image':
+            # Verify image can be opened
+            image = Image.open(io.BytesIO(file_bytes))
+            logger.info(f"Verifying image: {image.format}, Size: {image.size}")
+
+            # Create image part for Gemini Vision
+            image_part = Part.from_bytes(
+                data=file_bytes,
+                mime_type=f"image/{image.format.lower()}" if image.format else "image/jpeg"
+            )
+
+            user_prompt = "Analyze this image and determine if it's a valid portfolio statement or investment report. Provide your verification response in the specified JSON format."
+
+            logger.info("Verifying image document with Vision LLM...")
+            response = client.models.generate_content(
+                model="gemini-2.5-flash",
+                contents=[image_part, user_prompt],
+                config=GenerateContentConfig(
+                    system_instruction=[system_prompt]
+                )
+            )
+        else:
+            return False, f"Unsupported file format: {file_format}"
+
+        # Parse the LLM response
+        if response and response.text:
+            response_text = response.text.strip()
+            logger.info(f"Verification response: {response_text}")
+
+            try:
+                # Clean JSON response (remove markdown code blocks if present)
+                if response_text.startswith("```"):
+                    response_text = response_text.split("```")[1]
+                    if response_text.startswith("json"):
+                        response_text = response_text[4:]
+                    response_text = response_text.strip()
+
+                # Parse JSON
+                verification_result = json.loads(response_text)
+                is_valid = verification_result.get("is_valid", False)
+                confidence = verification_result.get("confidence", "low")
+                document_type = verification_result.get("document_type", "unknown")
+                reason = verification_result.get("reason", "No reason provided")
+
+                logger.info(f"Verification result: valid={is_valid}, confidence={confidence}, type={document_type}")
+
+                if is_valid:
+                    message = f"Document verified as valid {document_type} (confidence: {confidence}). {reason}"
+                    return True, message
+                else:
+                    message = f"**Invalid Document**: This does not appear to be a portfolio statement or investment report.\n\n"
+                    message += f"Document type detected: {document_type}\n"
+                    message += f"Reason: {reason}\n\n"
+                    message += "**Please upload a valid portfolio statement** (brokerage account statement, investment app screenshot, or holdings report) "
+                    message += "**OR enter your portfolio details as text** (e.g., 'AAPL 30%, GOOGL 20%, MSFT 15%')."
+                    return False, message
+
+            except json.JSONDecodeError as e:
+                logger.error(f"Failed to parse verification JSON: {e}")
+                logger.error(f"Response text: {response_text}")
+                # If we can't parse, assume invalid for safety
+                return False, "Could not verify document format. Please ensure you're uploading a portfolio statement or enter your holdings as text."
+        else:
+            logger.error("No response from LLM for document verification")
+            return False, "Could not verify document. Please try again or enter your portfolio as text."
+
+    except Exception as e:
+        logger.error(f"Error verifying portfolio document: {e}")
+        return False, f"Error during verification: {str(e)}. Please try uploading again or enter your portfolio as text."
+
+
+def verify_text_portfolio(text_input: str) -> Tuple[bool, str]:
+    """
+    Verify if the text input contains valid portfolio information.
+    Uses Gemini 2.5 Flash to analyze the text content.
+
+    Args:
+        text_input: The user's text input
+
+    Returns:
+        Tuple of (is_valid, message)
+        - is_valid: True if text contains valid portfolio data, False otherwise
+        - message: Explanation message
+    """
+    try:
+        logger.info(f"Verifying text portfolio input ({len(text_input)} characters)")
+
+        # Quick validation - if text is too short, likely not portfolio data
+        if len(text_input.strip()) < 10:
+            return False, "**Invalid Input**: Please provide portfolio information with stock tickers or company names."
+
+        # Create the client with proper configuration
+        if os.getenv("GOOGLE_GENAI_USE_VERTEXAI") == "TRUE":
+            client = genai.Client(vertexai=True)
+            logger.info("Using Vertex AI for text verification")
+        else:
+            api_key = os.getenv("GOOGLE_API_KEY")
+            if not api_key:
+                logger.error("No GOOGLE_API_KEY found for text verification")
+                return False, "**Error**: Google API key not configured."
+            client = genai.Client(api_key=api_key)
+            logger.info("Using Google AI API for text verification")
+
+        # System prompt for text verification
+        system_prompt = """You are an expert financial analyst specializing in portfolio data analysis.
+
+Your task is to verify if user text input contains VALID PORTFOLIO INFORMATION.
+
+VALID PORTFOLIO TEXT contains at least ONE of the following:
+1. Stock ticker symbols (AAPL, GOOGL, MSFT, etc.)
+2. Company names with investment context (Apple Inc., Google, Microsoft)
+3. Holdings with percentages (AAPL 30%, GOOGL 20%)
+4. Share quantities (10 shares of AAPL, GOOGL 25 shares)
+5. Investment amounts ($5000 in AAPL, GOOGL - $3000)
+6. Portfolio descriptions or lists
+
+INVALID TEXT (reject these):
+- Random words or gibberish
+- Questions without portfolio data ("What should I invest in?")
+- General financial discussions without specific holdings
+- Empty or very short text
+- Non-portfolio related content
+
+RESPONSE FORMAT - Return ONLY valid JSON in this EXACT format:
+{
+  "is_valid": true/false,
+  "confidence": "high/medium/low",
+  "reason": "Brief explanation of your decision"
+}
+
+Be lenient - if you see ANY stock tickers or company names in investment context, mark as valid."""
+
+        user_prompt = f"""Analyze this user text and determine if it contains valid portfolio information:
+
+"{text_input}"
+
+Provide your verification response in the specified JSON format."""
+
+        logger.info("Verifying text input with LLM...")
+        response = client.models.generate_content(
+            model="gemini-2.5-flash",
+            contents=user_prompt,
+            config=GenerateContentConfig(
+                system_instruction=[system_prompt]
+            )
+        )
+
+        # Parse the LLM response
+        if response and response.text:
+            response_text = response.text.strip()
+            logger.info(f"Text verification response: {response_text}")
+
+            try:
+                # Clean JSON response (remove markdown code blocks if present)
+                if response_text.startswith("```"):
+                    response_text = response_text.split("```")[1]
+                    if response_text.startswith("json"):
+                        response_text = response_text[4:]
+                    response_text = response_text.strip()
+
+                # Parse JSON
+                verification_result = json.loads(response_text)
+                is_valid = verification_result.get("is_valid", False)
+                confidence = verification_result.get("confidence", "low")
+                reason = verification_result.get("reason", "No reason provided")
+
+                logger.info(f"Text verification result: valid={is_valid}, confidence={confidence}")
+
+                if is_valid:
+                    message = f"Portfolio text verified (confidence: {confidence}). {reason}"
+                    return True, message
+                else:
+                    message = f"**Invalid Portfolio Input**: The text provided does not contain recognizable portfolio information.\n\n"
+                    message += f"Reason: {reason}\n\n"
+                    message += "**Please provide portfolio details** in one of these formats:\n"
+                    message += "- Stock tickers with percentages: 'AAPL 30%, GOOGL 20%, MSFT 15%'\n"
+                    message += "- Holdings with shares: 'AAPL 10 shares, GOOGL 25 shares'\n"
+                    message += "- Company names: 'Apple Inc., Google, Microsoft'\n"
+                    message += "**OR upload a portfolio statement file** (PDF or image)."
+                    return False, message
+
+            except json.JSONDecodeError as e:
+                logger.error(f"Failed to parse text verification JSON: {e}")
+                logger.error(f"Response text: {response_text}")
+                # If we can't parse, be lenient and allow it through
+                return True, "Could not fully verify text format, proceeding with analysis."
+        else:
+            logger.error("No response from LLM for text verification")
+            # If no response, be lenient and allow it through
+            return True, "Could not verify text format, proceeding with analysis."
+
+    except Exception as e:
+        logger.error(f"Error verifying text portfolio: {e}")
+        # On error, be lenient and allow it through
+        return True, f"Verification error, proceeding with analysis: {str(e)}"
+
+
 def detect_file_format(filename: str) -> str:
     """
     Detect the format of the uploaded file based on extension.

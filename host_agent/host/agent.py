@@ -30,7 +30,7 @@ from google.adk.sessions import InMemorySessionService
 from google.adk.tools import FunctionTool
 from google.genai import types
 from .remote_agent_connection import RemoteAgentConnections
-from .document_analyzer import read_portfolio_document, extract_stock_tickers_from_text
+from .document_analyzer import read_portfolio_document, extract_stock_tickers_from_text, verify_portfolio_document, verify_text_portfolio
 import logging
 
 # Import database functions and models at the top
@@ -1434,10 +1434,83 @@ Return ONLY a JSON array of uppercase ticker symbols. If a name is already a tic
 
             logger.info(f"Successfully read portfolio text ({actual_format}): {len(portfolio_text)} characters")
 
-            # Step 2: Extract tickers from the text
+            # Step 2: VERIFY the document is a valid portfolio statement
+            logger.info(f"Verifying document is a valid portfolio statement...")
+
+            # Need to re-read the file bytes for verification
+            try:
+                if current_config.is_local():
+                    storage_path = current_config.LOCAL_STORAGE_PATH
+                    base_filename = f"{user_id}_{session_id}_portfolio_statement"
+
+                    # Determine file extension
+                    if actual_format == 'pdf':
+                        file_path = os.path.join(storage_path, base_filename + '.pdf')
+                    else:
+                        # Try to find image file
+                        image_extensions = ['.jpg', '.jpeg', '.png', '.gif', '.bmp', '.tiff', '.webp']
+                        file_path = None
+                        for ext in image_extensions:
+                            test_path = os.path.join(storage_path, base_filename + ext)
+                            if os.path.exists(test_path):
+                                file_path = test_path
+                                break
+
+                    if not file_path or not os.path.exists(file_path):
+                        logger.error(f"Could not find file for verification: {file_path}")
+                        return "Error: Could not locate file for verification."
+
+                    with open(file_path, 'rb') as f:
+                        file_bytes = f.read()
+                else:
+                    # S3 storage
+                    import io
+                    bucket_name = current_config.S3_BUCKET_NAME
+                    s3_client = boto3.client('s3')
+                    base_filename = f"{user_id}_{session_id}_portfolio_statement"
+
+                    if actual_format == 'pdf':
+                        filename = base_filename + '.pdf'
+                    else:
+                        # Try to find image file
+                        image_extensions = ['.jpg', '.jpeg', '.png', '.gif', '.bmp', '.tiff', '.webp']
+                        filename = None
+                        for ext in image_extensions:
+                            test_filename = base_filename + ext
+                            try:
+                                s3_client.head_object(Bucket=bucket_name, Key=test_filename)
+                                filename = test_filename
+                                break
+                            except:
+                                continue
+
+                    if not filename:
+                        logger.error(f"Could not find file in S3 for verification")
+                        return "Error: Could not locate file in S3 for verification."
+
+                    file_obj = io.BytesIO()
+                    s3_client.download_fileobj(bucket_name, filename, file_obj)
+                    file_obj.seek(0)
+                    file_bytes = file_obj.read()
+
+                # Verify the document
+                is_valid, verification_message = verify_portfolio_document(file_bytes, actual_format)
+
+                if not is_valid:
+                    logger.warning(f"Document verification failed: {verification_message}")
+                    return verification_message
+
+                logger.info(f"Document verification passed: {verification_message}")
+
+            except Exception as verify_error:
+                logger.error(f"Error during document verification: {verify_error}")
+                # Continue with analysis if verification fails due to technical error
+                logger.warning("Continuing with analysis despite verification error")
+
+            # Step 3: Extract tickers from the text
             result = extract_stock_tickers_from_text(portfolio_text)
 
-            # Step 3: CRITICAL - Automatically store extracted share counts
+            # Step 4: CRITICAL - Automatically store extracted share counts
             if result and not result.startswith("Error"):
                 # Parse the HOLDINGS_DATA_JSON section from the result
                 try:
@@ -1498,7 +1571,17 @@ Return ONLY a JSON array of uppercase ticker symbols. If a name is already a tic
             if not portfolio_text or len(portfolio_text.strip()) < 3:
                 return "Error: Please provide portfolio data in text format."
 
-            # Extract tickers from the text using LLM
+            # Step 1: VERIFY the text contains valid portfolio information
+            logger.info(f"Verifying text contains valid portfolio information...")
+            is_valid, verification_message = verify_text_portfolio(portfolio_text)
+
+            if not is_valid:
+                logger.warning(f"Text verification failed: {verification_message}")
+                return verification_message
+
+            logger.info(f"Text verification passed: {verification_message}")
+
+            # Step 2: Extract tickers from the text using LLM
             result = extract_stock_tickers_from_text(portfolio_text)
 
             # Store the response automatically if successful
