@@ -216,6 +216,167 @@ Agent: Processes portfolio statement and provides investment insights
 5. **Stock analysis** is delegated to Stock Analyser Agent via A2A protocol
 6. **All communication** goes through the `/chats` API
 
+## ☁️ AWS Deployment
+
+The application can be deployed to AWS using ECS Fargate with automated database migrations.
+
+### Prerequisites
+
+- AWS CLI configured with appropriate credentials
+- Docker installed and running
+- AWS account with ECS, ECR, RDS, and Secrets Manager access
+
+### Deployment Steps
+
+#### 1. Run Complete Deployment
+
+Deploy everything (build images, run migrations, update services):
+
+```bash
+./deploy.sh
+```
+
+This script will:
+1. Create ECR repositories (if needed)
+2. Build and push Docker images to ECR
+3. Create/verify ECS cluster
+4. Create CloudWatch log groups
+5. **Run database migrations via ECS Fargate task**
+6. Update ECS services with new images
+
+#### 2. Run Migrations Only
+
+To run database migrations without full deployment:
+
+```bash
+./run_migrations_task.sh
+```
+
+This is useful for:
+- Running migrations after manual code changes
+- Testing new migration scripts
+- Emergency database updates
+
+### Database Migrations
+
+#### Migration Architecture
+
+The system uses **ECS/Fargate tasks** for database migrations - the production-standard approach:
+
+- Migrations run as **one-off Fargate tasks** before application deployment
+- Automatic execution during deployment
+- Clear separation from application runtime
+- Full CloudWatch logging at `/ecs/finance-a2a-migration`
+- Deployment **fails automatically** if migrations fail (safety mechanism)
+
+#### Migration Files
+
+All SQL migrations are stored in `host_agent/migrations/`:
+```
+host_agent/migrations/
+├── 000_add_portfolio_statement_uploaded_field.sql
+├── 001_add_stock_recommendations_table.sql
+├── 002_add_input_format_column.sql
+├── 003_add_portfolio_analysis_table.sql
+├── 004_add_user_whitelist_table.sql
+└── run_migrations.py
+```
+
+Migrations are executed in **alphabetical order**.
+
+#### Adding New Migrations
+
+1. Create a new SQL file with the next number:
+   ```bash
+   touch host_agent/migrations/005_your_migration_name.sql
+   ```
+
+2. Write your SQL migration:
+   ```sql
+   -- 005_your_migration_name.sql
+   ALTER TABLE users ADD COLUMN phone_verified BOOLEAN DEFAULT FALSE;
+   CREATE INDEX idx_users_phone_verified ON users(phone_verified);
+   ```
+
+3. Test locally:
+   ```bash
+   cd host_agent
+   python migrations/run_migrations.py
+   ```
+
+4. Deploy to AWS:
+   ```bash
+   ./deploy.sh
+   ```
+
+The migration will run automatically before the application is deployed.
+
+### Monitoring Deployments
+
+#### View Migration Logs
+```bash
+# Real-time logs
+aws logs tail /ecs/finance-a2a-migration --follow --region us-east-1
+
+# Recent logs
+aws logs tail /ecs/finance-a2a-migration --since 10m --region us-east-1
+```
+
+#### View Service Logs
+```bash
+# Host Agent logs
+aws logs tail /ecs/finance-a2a-host-agent --follow --region us-east-1
+
+# Stock Analyser Agent logs
+aws logs tail /ecs/finance-a2a-stockanalyser-agent --follow --region us-east-1
+```
+
+#### Check Service Status
+```bash
+aws ecs describe-services \
+  --cluster finance-a2a-cluster \
+  --services host-agent stockanalyser-agent \
+  --region us-east-1
+```
+
+### Deployment Files
+
+- **`deploy.sh`** - Main deployment script
+- **`run_migrations_task.sh`** - Standalone migration runner
+- **`task-definition-migration.json`** - ECS task definition for migrations
+- **`host_agent/Dockerfile`** - Host agent container definition
+- **`stockanalyser_agent/Dockerfile`** - Stock analyser container definition
+
+### Rollback Strategy
+
+If a deployment fails:
+
+1. **Check migration logs** to identify the issue:
+   ```bash
+   aws logs tail /ecs/finance-a2a-migration --region us-east-1
+   ```
+
+2. **Fix the migration file** locally
+
+3. **Re-run deployment**:
+   ```bash
+   ./deploy.sh
+   ```
+
+4. **For urgent rollbacks**, use AWS Console to:
+   - Roll back ECS service to previous task definition
+   - Manually revert database changes if needed
+
+### Infrastructure
+
+The deployment uses:
+- **ECS Fargate** for serverless container orchestration
+- **ECR** for Docker image storage
+- **RDS PostgreSQL** for database
+- **CloudWatch Logs** for logging
+- **VPC** with private subnets for security
+- **IAM roles** for task permissions
+
 ## 📡 Host Agent API Documentation
 
 The Host Agent now provides a REST API for user conversations, replacing the previous ADK web UI.

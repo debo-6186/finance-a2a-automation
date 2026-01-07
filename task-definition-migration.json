@@ -1,0 +1,39 @@
+{
+  "family": "finance-a2a-migration",
+  "networkMode": "awsvpc",
+  "requiresCompatibilities": ["FARGATE"],
+  "cpu": "256",
+  "memory": "512",
+  "executionRoleArn": "arn:aws:iam::${AWS_ACCOUNT_ID}:role/finance-a2a-task-execution-role",
+  "taskRoleArn": "arn:aws:iam::${AWS_ACCOUNT_ID}:role/finance-a2a-task-role",
+  "containerDefinitions": [
+    {
+      "name": "migration-runner",
+      "image": "${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/finance-a2a/host-agent:latest",
+      "essential": true,
+      "command": ["python", "migrations/run_migrations.py"],
+      "logConfiguration": {
+        "logDriver": "awslogs",
+        "options": {
+          "awslogs-group": "/ecs/finance-a2a-migration",
+          "awslogs-region": "${AWS_REGION}",
+          "awslogs-stream-prefix": "migration"
+        }
+      },
+      "environment": [
+        {
+          "name": "DATABASE_URL",
+          "value": "postgresql://postgres:ParisSwiss*0610@finance-a2a-postgres.cmfakuca6d6h.us-east-1.rds.amazonaws.com:5432/finance_a2a?sslmode=require"
+        },
+        {
+          "name": "ENVIRONMENT",
+          "value": "production"
+        },
+        {
+          "name": "AWS_REGION",
+          "value": "${AWS_REGION}"
+        }
+      ]
+    }
+  ]
+}

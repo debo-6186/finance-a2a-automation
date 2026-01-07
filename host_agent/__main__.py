@@ -32,7 +32,9 @@ from database import (
     add_message, can_user_send_message, get_user_message_count,
     update_agent_state, get_agent_state,
     User, ConversationSession, ConversationMessage, FREE_USER_MESSAGE_LIMIT,
-    get_stock_recommendation, get_user_stock_recommendations
+    get_stock_recommendation, get_user_stock_recommendations,
+    can_user_generate_report, update_user_max_reports, add_user_credits,
+    set_user_whitelist_status, get_or_create_whitelist_entry
 )
 from user_api import (
     get_user_profile, get_user_statistics,
@@ -526,7 +528,7 @@ async def chat(request: Request, current_user: dict = Depends(get_current_user))
         logger.info(f"Processing chat message in session {session_id} for user {final_user_id}: {final_message[:100]}...")
 
         # Get or create user
-        get_or_create_user(db, final_user_id, paid_user=final_paid_user)
+        user = get_or_create_user(db, final_user_id, paid_user=final_paid_user)
 
         # Check if user can send more messages
         if not can_user_send_message(db, final_user_id):
@@ -539,8 +541,34 @@ async def chat(request: Request, current_user: dict = Depends(get_current_user))
         # Get or create session
         session = get_session(db, session_id)
         if not session:
+            # NEW SESSION: Check report generation limits before creating session
+            user_email = user.email if user.email else "no-email@example.com"
+            can_generate, limit_message, current_count, max_reports = can_user_generate_report(db, user_email, final_user_id)
+
+            if not can_generate:
+                logger.warning(f"User {final_user_id} ({user_email}) blocked from creating session: {limit_message}")
+                raise HTTPException(
+                    status_code=403,
+                    detail=limit_message
+                )
+
+            logger.info(f"User {final_user_id} ({user_email}) can generate new report: {current_count}/{max_reports} reports used")
             session = create_session(db, session_id, final_user_id)
-        
+
+            # CRITICAL: Send initial greeting immediately when session is created
+            # This ensures the greeting is the FIRST message in the conversation
+            initial_greeting = (
+                "Hello! Welcome to the portfolio analysis service. To get started, please provide your portfolio details using any of these methods:\n\n"
+                "1. Upload a PDF portfolio statement\n"
+                "2. Upload a screenshot/snapshot of your portfolio\n"
+                "3. Type your stock holdings directly in the chat (e.g., 'AAPL 30 shares, GOOGL around 20 shares, MSFT 55 shares')\n\n"
+                "How would you like to share your portfolio?"
+            )
+
+            # Add initial greeting to database as agent message
+            add_message(db, session_id, final_user_id, "agent", initial_greeting, "host_agent")
+            logger.info(f"Sent initial greeting for new session {session_id}")
+
         # Handle file upload if present
         file_uploaded = False
         if uploaded_file and hasattr(uploaded_file, 'filename') and uploaded_file.filename:
@@ -792,8 +820,8 @@ async def chat_stream(request: Request):
         logger.info(f"Processing streaming chat message in session {session_id} for user {final_user_id}: {final_message[:100]}...")
 
         # Get or create user
-        get_or_create_user(db, final_user_id, paid_user=final_paid_user)
-        
+        user = get_or_create_user(db, final_user_id, paid_user=final_paid_user)
+
         # Check if user can send more messages
         if not can_user_send_message(db, final_user_id):
             message_count = get_user_message_count(db, final_user_id)
@@ -801,12 +829,38 @@ async def chat_stream(request: Request):
                 status_code=429,
                 detail=f"Message limit reached. Free users are limited to {FREE_USER_MESSAGE_LIMIT} messages. You have sent {message_count} messages. Upgrade to paid to continue."
             )
-        
+
         # Get or create session
         session = get_session(db, session_id)
         if not session:
+            # NEW SESSION: Check report generation limits before creating session
+            user_email = user.email if user.email else "no-email@example.com"
+            can_generate, limit_message, current_count, max_reports = can_user_generate_report(db, user_email, final_user_id)
+
+            if not can_generate:
+                logger.warning(f"User {final_user_id} ({user_email}) blocked from creating session: {limit_message}")
+                raise HTTPException(
+                    status_code=403,
+                    detail=limit_message
+                )
+
+            logger.info(f"User {final_user_id} ({user_email}) can generate new report: {current_count}/{max_reports} reports used")
             session = create_session(db, session_id, final_user_id)
-        
+
+            # CRITICAL: Send initial greeting immediately when session is created
+            # This ensures the greeting is the FIRST message in the conversation
+            initial_greeting = (
+                "Hello! Welcome to the portfolio analysis service. To get started, please provide your portfolio details using any of these methods:\n\n"
+                "1. Upload a PDF portfolio statement\n"
+                "2. Upload a screenshot/snapshot of your portfolio\n"
+                "3. Type your stock holdings directly in the chat (e.g., 'AAPL 30%, GOOGL 20%, MSFT 50%')\n\n"
+                "How would you like to share your portfolio?"
+            )
+
+            # Add initial greeting to database as agent message
+            add_message(db, session_id, final_user_id, "agent", initial_greeting, "host_agent")
+            logger.info(f"Sent initial greeting for new session {session_id}")
+
         # Handle file upload if present
         file_uploaded = False
         if uploaded_file and hasattr(uploaded_file, 'filename') and uploaded_file.filename:
@@ -1236,6 +1290,164 @@ def upgrade_user_to_paid_endpoint(user_id: str):
 def downgrade_user_to_free_endpoint(user_id: str):
     """Downgrade user to free status."""
     return downgrade_user_to_free(user_id)
+
+
+# Admin API endpoints for managing user credits and whitelist
+class AdminCreditsRequest(BaseModel):
+    """
+    Request model for admin user credits and settings management.
+
+    All fields except email are optional. Provide only the fields you want to update.
+    """
+    email: str
+    credits: Optional[int] = None  # Add credits to user (incremental)
+    max_reports: Optional[int] = None  # Set max reports limit (absolute value)
+    whitelist: Optional[bool] = None  # Set whitelist status
+
+
+@app.post("/api/admin/credits")
+def admin_credits_endpoint(request: AdminCreditsRequest):
+    """
+    Single admin endpoint to manage user credits, max reports, and whitelist status.
+
+    Updates only the fields that are provided in the request.
+
+    Example requests:
+
+    Add 5 credits to a user:
+    {
+        "email": "user@example.com",
+        "credits": 5
+    }
+
+    Set max reports to 10:
+    {
+        "email": "user@example.com",
+        "max_reports": 10
+    }
+
+    Whitelist a user:
+    {
+        "email": "user@example.com",
+        "whitelist": true
+    }
+
+    Update multiple settings at once:
+    {
+        "email": "user@example.com",
+        "credits": 5,
+        "max_reports": 10,
+        "whitelist": true
+    }
+    """
+    try:
+        db = next(get_db())
+
+        # Track what was updated
+        updates = []
+
+        # Add credits if provided
+        if request.credits is not None:
+            success = add_user_credits(db, request.email, request.credits)
+            if success:
+                updates.append(f"Added {request.credits} credits")
+            else:
+                raise HTTPException(status_code=500, detail="Failed to add credits")
+
+        # Set max reports if provided
+        if request.max_reports is not None:
+            success = update_user_max_reports(db, request.email, request.max_reports)
+            if success:
+                updates.append(f"Set max_reports to {request.max_reports}")
+            else:
+                raise HTTPException(status_code=500, detail="Failed to update max_reports")
+
+        # Set whitelist status if provided
+        if request.whitelist is not None:
+            success = set_user_whitelist_status(db, request.email, request.whitelist)
+            if success:
+                status = "whitelisted" if request.whitelist else "blacklisted"
+                updates.append(f"User {status}")
+            else:
+                raise HTTPException(status_code=500, detail="Failed to update whitelist status")
+
+        # If no fields were provided, return error
+        if not updates:
+            raise HTTPException(
+                status_code=400,
+                detail="At least one field (credits, max_reports, or whitelist) must be provided"
+            )
+
+        # Get final state of user
+        whitelist_entry = get_or_create_whitelist_entry(db, request.email)
+
+        # Find user by email to get user_id for report count
+        user = db.query(User).filter(User.email == request.email).first()
+        current_count = 0
+        if user:
+            from database import count_user_valid_recommendations
+            current_count = count_user_valid_recommendations(db, user.id)
+
+        return {
+            "success": True,
+            "message": "; ".join(updates),
+            "email": request.email,
+            "current_state": {
+                "whitelisted": whitelist_entry.whitelisted if whitelist_entry else False,
+                "max_reports": whitelist_entry.max_reports if whitelist_entry else 0,
+                "current_report_count": current_count,
+                "remaining_reports": max(0, whitelist_entry.max_reports - current_count) if (whitelist_entry and whitelist_entry.max_reports > 0) else "unlimited"
+            }
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error in admin_credits_endpoint: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/admin/credits/{email}")
+def get_admin_credits_info(email: str):
+    """
+    Get user credits, max reports, and whitelist information.
+
+    Returns the current state of user's credits and settings.
+    """
+    try:
+        db = next(get_db())
+
+        # Get whitelist entry
+        whitelist_entry = get_or_create_whitelist_entry(db, email)
+
+        if not whitelist_entry:
+            raise HTTPException(status_code=404, detail="User not found")
+
+        # Find user by email to get user_id
+        user = db.query(User).filter(User.email == email).first()
+
+        # Count reports if user exists
+        current_count = 0
+        if user:
+            from database import count_user_valid_recommendations
+            current_count = count_user_valid_recommendations(db, user.id)
+
+        return {
+            "success": True,
+            "email": email,
+            "whitelisted": whitelist_entry.whitelisted,
+            "max_reports": whitelist_entry.max_reports,
+            "current_report_count": current_count,
+            "remaining_reports": max(0, whitelist_entry.max_reports - current_count) if whitelist_entry.max_reports > 0 else "unlimited",
+            "created_at": whitelist_entry.created_at.isoformat(),
+            "updated_at": whitelist_entry.updated_at.isoformat()
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error getting credits info for {email}: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 
@@ -2030,6 +2242,8 @@ def main():
         logger.info("  GET /users/{user_id}/sessions/summary - Get user sessions summary")
         logger.info("  POST /users/{user_id}/upgrade - Upgrade user to paid")
         logger.info("  POST /users/{user_id}/downgrade - Downgrade user to free")
+        logger.info("  POST /api/admin/credits - Manage user credits, max reports, and whitelist")
+        logger.info("  GET /api/admin/credits/{email} - Get user credits and settings info")
         
         # Run using the in-memory app object to avoid module import path issues
         uvicorn.run(

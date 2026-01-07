@@ -128,8 +128,33 @@ for agent in host-agent stockanalyser-agent; do
     fi
 done
 
-# Step 6: Update ECS Services
-print_info "Step 6/7: Updating ECS services with new images..."
+# Step 6: Run Database Migrations
+print_info "Step 6/8: Running database migrations via ECS task..."
+
+# Check if host-agent service exists (needed for network config)
+if aws ecs describe-services --cluster $CLUSTER_NAME --services host-agent --region $AWS_REGION --query 'services[0].status' --output text 2>/dev/null | grep -q "ACTIVE"; then
+    print_info "Running migration task (this may take a few minutes)..."
+
+    # Make the script executable
+    chmod +x run_migrations_task.sh
+
+    # Run the migration script
+    if ./run_migrations_task.sh; then
+        print_info "✓ Database migrations completed successfully"
+    else
+        print_error "Migration failed! Stopping deployment."
+        exit 1
+    fi
+else
+    print_warning "host-agent service does not exist yet. Skipping migrations."
+    print_warning "You will need to run migrations manually after first deployment using:"
+    print_warning "  ./run_migrations_task.sh"
+fi
+
+echo ""
+
+# Step 7: Update ECS Services
+print_info "Step 7/8: Updating ECS services with new images..."
 
 # Check if services exist and update them
 for service in host-agent stockanalyser-agent; do
@@ -147,8 +172,8 @@ for service in host-agent stockanalyser-agent; do
     fi
 done
 
-# Step 7: Summary
-print_info "Step 7/7: Deployment complete!"
+# Step 8: Summary
+print_info "Step 8/8: Deployment complete!"
 
 cat << EOF
 
@@ -160,20 +185,26 @@ Deployment Status
 ✓ Docker images built and pushed
 ✓ ECS cluster verified: $CLUSTER_NAME
 ✓ CloudWatch log groups created
+✓ Database migrations completed
 ✓ ECS services updated (if they exist)
 
 ${YELLOW}Post-Deployment Tasks:${NC}
-1. Run database migration Lambda function to apply schema changes
-2. Update frontend environment variables with API CloudFront URL
-3. Deploy frontend to Firebase Hosting
+1. Update frontend environment variables with API CloudFront URL
+2. Deploy frontend to Firebase Hosting
 
 ${GREEN}Useful Commands:${NC}
+# Run migrations manually
+./run_migrations_task.sh
+
 # Monitor ECS services
 aws ecs describe-services --cluster $CLUSTER_NAME --services host-agent stockanalyser-agent --region $AWS_REGION
 
 # View service logs
 aws logs tail /ecs/${PROJECT_NAME}-host-agent --follow --region $AWS_REGION
 aws logs tail /ecs/${PROJECT_NAME}-stockanalyser-agent --follow --region $AWS_REGION
+
+# View migration logs
+aws logs tail /ecs/${PROJECT_NAME}-migration --follow --region $AWS_REGION
 
 # Check CloudFront URL
 cd terraform && terraform output cloudfront_url

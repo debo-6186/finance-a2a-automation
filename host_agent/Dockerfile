@@ -29,5 +29,6 @@ RUN uv pip compile pyproject.toml -o requirements.txt && \
 # Expose the port
 EXPOSE 10001
 
-# Run migrations and start the server
-CMD ["sh", "-c", "python migrations/run_migrations.py && python __main__.py"]
+# Start the server
+# Note: Migrations are run separately via ECS task before deployment
+CMD ["python", "__main__.py"]
