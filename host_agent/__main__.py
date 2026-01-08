@@ -1414,14 +1414,33 @@ def get_admin_credits_info(email: str):
 
     Returns the current state of user's credits and settings.
     """
+    db = None
     try:
         db = next(get_db())
+
+        # Validate email format
+        if not email or '@' not in email:
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "success": False,
+                    "error": "Invalid email format",
+                    "message": "Please provide a valid email address"
+                }
+            )
 
         # Get whitelist entry
         whitelist_entry = get_or_create_whitelist_entry(db, email)
 
         if not whitelist_entry:
-            raise HTTPException(status_code=404, detail="User not found")
+            raise HTTPException(
+                status_code=404,
+                detail={
+                    "success": False,
+                    "error": "User not found",
+                    "message": f"No user found with email: {email}"
+                }
+            )
 
         # Find user by email to get user_id
         user = db.query(User).filter(User.email == email).first()
@@ -1447,7 +1466,17 @@ def get_admin_credits_info(email: str):
         raise
     except Exception as e:
         logger.error(f"Error getting credits info for {email}: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "success": False,
+                "error": "Internal server error",
+                "message": str(e)
+            }
+        )
+    finally:
+        if db:
+            db.close()
 
 
 

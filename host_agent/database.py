@@ -592,15 +592,16 @@ def can_user_generate_report(db: Session, email: str, user_id: str) -> tuple[boo
         - max_reports: Maximum reports allowed for this user
     """
     try:
-        # Get or create whitelist entry (default: max_reports=3, whitelisted=True)
-        whitelist_entry = get_or_create_whitelist_entry(db, email)
+        # Get whitelist entry - DO NOT auto-create
+        whitelist_entry = db.query(UserWhitelist).filter(UserWhitelist.email == email).first()
 
+        # If user is not in whitelist table at all, deny access
         if not whitelist_entry:
-            return False, "Unable to verify user whitelist status. Please contact support.", 0, 0
+            return False, "Your account is not authorized. Please contact support to get access.", 0, 0
 
         # Check if user is whitelisted
         if not whitelist_entry.whitelisted:
-            return False, "Your account is not authorized to generate reports. Please contact support.", 0, whitelist_entry.max_reports
+            return False, "Your account has been disabled. Please contact support.", 0, whitelist_entry.max_reports
 
         # Check if max_reports is 0 (unlimited for paid users)
         if whitelist_entry.max_reports == 0:

@@ -576,6 +576,194 @@ def read_portfolio_document(session_id: str = "", user_name: str = "", input_for
         return f"Error extracting text: {e}", ""
 
 
+def validate_exchange_consistency(holdings_data: list) -> Tuple[bool, str]:
+    """
+    Validates that all stocks belong to the same exchange (US or India) and rejects crypto/other assets.
+
+    Args:
+        holdings_data: List of holdings dictionaries with ticker symbols
+
+    Returns:
+        Tuple of (is_valid, message)
+        - is_valid: True if all stocks are from same exchange and no crypto, False otherwise
+        - message: Explanation message
+    """
+    try:
+        if not holdings_data:
+            return True, "No holdings to validate"
+
+        logger.info(f"Validating exchange consistency for {len(holdings_data)} holdings")
+
+        # Create the client with proper configuration
+        if os.getenv("GOOGLE_GENAI_USE_VERTEXAI") == "TRUE":
+            client = genai.Client(vertexai=True)
+            logger.info("Using Vertex AI for exchange validation")
+        else:
+            api_key = os.getenv("GOOGLE_API_KEY")
+            if not api_key:
+                logger.error("No GOOGLE_API_KEY found for exchange validation")
+                return False, "**Error**: Google API key not configured for validation."
+            client = genai.Client(api_key=api_key)
+            logger.info("Using Google AI API for exchange validation")
+
+        # Extract just the tickers for validation
+        tickers = [holding.get('ticker', '') for holding in holdings_data if holding.get('ticker')]
+        tickers_str = ", ".join(tickers)
+
+        # System prompt for exchange validation
+        system_prompt = """You are an expert financial analyst specializing in stock exchange classification.
+
+Your task is to analyze a list of stock tickers and determine:
+1. Which stock exchange each ticker belongs to (US or India)
+2. Whether any tickers are cryptocurrencies or other non-stock assets
+3. Whether all stocks belong to the SAME exchange
+
+EXCHANGE IDENTIFICATION RULES:
+- **US Stocks**: Ticker symbols without country suffixes (e.g., AAPL, GOOGL, MSFT, TSLA, AMZN)
+  - Usually 1-5 uppercase letters
+  - Listed on NYSE, NASDAQ, etc.
+
+- **Indian Stocks**: Ticker symbols with .NS (NSE) or .BO (BSE) suffixes (e.g., RELIANCE.NS, TCS.BO, INFY.NS)
+  - May also be Indian company names without suffixes that are clearly Indian companies
+  - Listed on NSE (National Stock Exchange) or BSE (Bombay Stock Exchange)
+
+- **Cryptocurrencies**: BTC, ETH, DOGE, BNB, ADA, SOL, XRP, USDT, USDC, etc.
+  - These are NOT stocks and must be REJECTED
+
+- **Other Assets**: Commodities, forex, bonds, mutual funds, etc.
+  - These are NOT stocks and must be REJECTED
+
+VALIDATION RULES:
+1. ALL tickers must be valid stocks (no crypto, no commodities, no forex)
+2. ALL tickers must belong to the SAME exchange (all US OR all India)
+3. If tickers are mixed (some US, some India), this is INVALID
+4. If any crypto or non-stock assets are present, this is INVALID
+
+RESPONSE FORMAT - Return ONLY valid JSON in this EXACT format:
+{
+  "is_valid": true/false,
+  "primary_exchange": "US" or "India" or "Mixed" or "Unknown",
+  "invalid_assets": [
+    {"ticker": "BTC", "type": "cryptocurrency", "reason": "Cryptocurrencies not supported"},
+    {"ticker": "GOLD", "type": "commodity", "reason": "Commodities not supported"}
+  ],
+  "exchange_breakdown": {
+    "us_stocks": ["AAPL", "GOOGL"],
+    "india_stocks": ["RELIANCE.NS", "TCS.BO"],
+    "crypto": ["BTC", "ETH"],
+    "other": ["GOLD"]
+  },
+  "message": "Detailed explanation of the validation result"
+}
+
+Be thorough and accurate in your classification."""
+
+        user_prompt = f"""Analyze these stock tickers and validate their exchange consistency:
+
+Tickers: {tickers_str}
+
+Determine:
+1. Are all these valid stocks (no crypto/commodities)?
+2. Do they all belong to the same exchange (all US or all India)?
+3. Provide detailed breakdown of each ticker.
+
+Respond in the specified JSON format."""
+
+        logger.info("Validating exchange consistency with LLM...")
+        response = client.models.generate_content(
+            model="gemini-2.5-flash",
+            contents=user_prompt,
+            config=GenerateContentConfig(
+                system_instruction=[system_prompt]
+            )
+        )
+
+        # Parse the LLM response
+        if response and response.text:
+            response_text = response.text.strip()
+            logger.info(f"Exchange validation response: {response_text}")
+
+            try:
+                # Clean JSON response (remove markdown code blocks if present)
+                if response_text.startswith("```"):
+                    response_text = response_text.split("```")[1]
+                    if response_text.startswith("json"):
+                        response_text = response_text[4:]
+                    response_text = response_text.strip()
+
+                # Parse JSON
+                validation_result = json.loads(response_text)
+                is_valid = validation_result.get("is_valid", False)
+                primary_exchange = validation_result.get("primary_exchange", "Unknown")
+                invalid_assets = validation_result.get("invalid_assets", [])
+                exchange_breakdown = validation_result.get("exchange_breakdown", {})
+                llm_message = validation_result.get("message", "")
+
+                logger.info(f"Validation result: valid={is_valid}, exchange={primary_exchange}")
+
+                if is_valid:
+                    message = f"All stocks validated successfully. Exchange: {primary_exchange}"
+                    return True, message
+                else:
+                    # Build detailed error message
+                    message = "**Invalid Portfolio: Exchange Consistency Error**\n\n"
+
+                    # Check for crypto/invalid assets
+                    if invalid_assets:
+                        message += "**Invalid Assets Detected:**\n"
+                        for asset in invalid_assets:
+                            ticker = asset.get('ticker', 'N/A')
+                            asset_type = asset.get('type', 'unknown')
+                            reason = asset.get('reason', 'Not supported')
+                            message += f"• {ticker} - {asset_type}: {reason}\n"
+                        message += "\n"
+
+                    # Check for mixed exchanges
+                    us_stocks = exchange_breakdown.get("us_stocks", [])
+                    india_stocks = exchange_breakdown.get("india_stocks", [])
+
+                    if us_stocks and india_stocks:
+                        message += "**Mixed Exchanges Detected:**\n"
+                        message += f"• US stocks: {', '.join(us_stocks)}\n"
+                        message += f"• Indian stocks: {', '.join(india_stocks)}\n\n"
+                        message += "**Requirement:** All stocks must be from the SAME exchange.\n"
+                        message += "Please provide either:\n"
+                        message += "- All US stocks only (e.g., AAPL, GOOGL, MSFT), OR\n"
+                        message += "- All Indian stocks only (e.g., RELIANCE.NS, TCS.BO, INFY.NS)\n"
+
+                    # Check for crypto
+                    crypto = exchange_breakdown.get("crypto", [])
+                    if crypto:
+                        message += f"\n**Cryptocurrency Detected:** {', '.join(crypto)}\n"
+                        message += "Cryptocurrencies are not supported. Please provide only stock tickers.\n"
+
+                    # Check for other assets
+                    other = exchange_breakdown.get("other", [])
+                    if other:
+                        message += f"\n**Unsupported Assets:** {', '.join(other)}\n"
+                        message += "Only stocks are supported (no commodities, forex, bonds, etc.)\n"
+
+                    if llm_message:
+                        message += f"\n**Details:** {llm_message}"
+
+                    return False, message
+
+            except json.JSONDecodeError as e:
+                logger.error(f"Failed to parse exchange validation JSON: {e}")
+                logger.error(f"Response text: {response_text}")
+                # If we can't parse, be lenient and allow through (backward compatibility)
+                return True, "Could not fully validate exchange consistency, proceeding with analysis."
+        else:
+            logger.error("No response from LLM for exchange validation")
+            # If no response, be lenient and allow through
+            return True, "Could not validate exchange consistency, proceeding with analysis."
+
+    except Exception as e:
+        logger.error(f"Error validating exchange consistency: {e}")
+        # On error, be lenient and allow through
+        return True, f"Validation error, proceeding with analysis: {str(e)}"
+
+
 def extract_stock_tickers_from_text(portfolio_text: str) -> str:
     """
     Extracts stock tickers from portfolio text using LLM.
@@ -728,6 +916,14 @@ Provide only the comma-separated ticker list with percentages as specified."""
             return "No stock holdings found in the portfolio data. Please check if the input contains stock information."
 
         logger.info(f"LLM found {len(holdings_data)} holdings")
+
+        # VALIDATE EXCHANGE CONSISTENCY - Must all be from same exchange (US or India), no crypto
+        is_valid, validation_message = validate_exchange_consistency(holdings_data)
+        if not is_valid:
+            logger.warning(f"Exchange validation failed: {validation_message}")
+            return validation_message
+
+        logger.info(f"Exchange validation passed: {validation_message}")
 
         # Format the result with detailed holdings information
         result = f"**Portfolio Holdings Extracted:**\n\n"
