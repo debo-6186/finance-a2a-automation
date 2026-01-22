@@ -71,6 +71,7 @@ class ConversationSession(Base):
     is_active = Column(Boolean, default=True, nullable=False)
     portfolio_statement_uploaded = Column(Boolean, default=False, nullable=False)
     input_format = Column(String, nullable=True)  # 'pdf', 'image', 'text', or None
+    market_preference = Column(String, nullable=True)  # 'US' or 'INDIA'
 
     # Relationships
     user = relationship("User", back_populates="sessions")
@@ -222,9 +223,17 @@ def get_or_create_user(db: Session, user_id: str, email: Optional[str] = None, n
             if name and user.name != name:
                 user.name = name
                 updated = True
+            if contact_number and user.contact_number != contact_number:
+                user.contact_number = contact_number
+                updated = True
+            if country_code and user.country_code != country_code:
+                user.country_code = country_code
+                updated = True
 
             if updated:
+                user.updated_at = datetime.utcnow()
                 db.commit()
+                db.refresh(user)
                 logger.info(f"Updated user {user_id}")
             return user
         else:
@@ -321,6 +330,18 @@ def get_conversation_history(db: Session, session_id: str, limit: int = 50):
     except SQLAlchemyError as e:
         logger.error(f"Error getting conversation history for session {session_id}: {e}")
         return []
+
+
+def has_session_messages(db: Session, session_id: str) -> bool:
+    """Check if a session has any messages in conversation_messages table."""
+    try:
+        message_count = db.query(ConversationMessage).filter(
+            ConversationMessage.session_id == session_id
+        ).count()
+        return message_count > 0
+    except SQLAlchemyError as e:
+        logger.error(f"Error checking messages for session {session_id}: {e}")
+        return False
 
 
 def get_user_message_count(db: Session, user_id: str) -> int:

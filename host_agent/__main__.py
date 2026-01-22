@@ -22,7 +22,7 @@ from fastapi.responses import StreamingResponse
 import requests
 import firebase_admin
 from firebase_admin import credentials, auth as firebase_auth
-from google.adk.tools.mcp_tool.mcp_toolset import MCPToolset
+from google.adk.tools.mcp_tool.mcp_toolset import MCPToolset, StdioConnectionParams
 from mcp import StdioServerParameters
 from config import get_config
 
@@ -30,7 +30,7 @@ from host.agent import HostAgent
 from database import (
     get_db, get_or_create_user, create_session, get_session,
     add_message, can_user_send_message, get_user_message_count,
-    update_agent_state, get_agent_state,
+    update_agent_state, get_agent_state, has_session_messages,
     User, ConversationSession, ConversationMessage, FREE_USER_MESSAGE_LIMIT,
     get_stock_recommendation, get_user_stock_recommendations,
     can_user_generate_report, update_user_max_reports, add_user_credits,
@@ -111,8 +111,9 @@ class LoginResponse(BaseModel):
     email: str
     name: str
     contactNumber: str = ""
-    countryCode: str = "+1" 
+    countryCode: str = "+1"
     uploadFile: bool = False
+    paid_user: bool = False
     createdAt: str
 
 
@@ -312,12 +313,16 @@ async def lifespan(app: FastAPI):
 
             server_script = os.path.join(mcp_directory, "server.py")
 
-            stock_mcp_tool = MCPToolset(
+            # Use uv run to execute in the correct virtual environment
+            connection_params = StdioConnectionParams(
                 server_params=StdioServerParameters(
-                    command="python",
-                    args=[server_script],
+                    command="uv",
+                    args=["run", "--directory", mcp_directory, "python", server_script],
                     env=mcp_env,
                 )
+            )
+            stock_mcp_tool = MCPToolset(
+                connection_params=connection_params,
             )
             logger.info("MCP tool initialized successfully")
         except Exception as e:
@@ -393,12 +398,13 @@ def login(login_request: LoginRequest):
         db.close()
         return LoginResponse(
             id=user_id,
-            email=email,
-            name=name,
-            contactNumber="",  # Will be updated by user later
-            countryCode="+1",  # Default country code
+            email=user.email or email,
+            name=user.name or name,
+            contactNumber=user.contact_number or "",
+            countryCode=user.country_code or "+1",
             uploadFile=user.paid_user if user else False,  # Map paid_user to uploadFile
-            createdAt=user.created_at.isoformat() if user else ""
+            createdAt=user.created_at.isoformat() if user else "",
+            paid_user=user.paid_user if user else False
         )
 
     except ValueError as e:
@@ -443,6 +449,95 @@ async def health_check():
         "message": "Host Agent is running",
         "connected_agents": list(host_agent_instance.remote_agent_connections.keys())
     }
+
+
+@app.post("/api/chats/init")
+async def init_chat(request: Request, current_user: dict = Depends(get_current_user)):
+    """
+    Initialize a chat session and return the greeting message.
+    This endpoint is called when a user starts a new chat to get the initial greeting.
+
+    Request body (JSON):
+    {
+        "user_id": "user123",
+        "session_id": "optional-session-id"  // If not provided, a new one will be generated
+    }
+    """
+    try:
+        # Parse request body
+        json_data = await request.json()
+        user_id = json_data.get("user_id")
+        session_id = json_data.get("session_id") or str(uuid.uuid4())
+
+        if not user_id:
+            raise HTTPException(status_code=400, detail="user_id is required")
+
+        logger.info(f"[INIT_CHAT] Initializing chat for user {user_id}, session {session_id}")
+
+        # Get database session
+        db = next(get_db())
+
+        try:
+            # Get or create user
+            user = get_or_create_user(db, user_id)
+
+            # Check if user can send messages
+            if not can_user_send_message(db, user_id):
+                message_count = get_user_message_count(db, user_id)
+                raise HTTPException(
+                    status_code=429,
+                    detail=f"Message limit reached. Free users are limited to {FREE_USER_MESSAGE_LIMIT} messages."
+                )
+
+            # Get or create session
+            session = get_session(db, session_id)
+            if not session:
+                # Check report generation limits before creating session
+                user_email = user.email if user.email else "no-email@example.com"
+                can_generate, limit_message, current_count, max_reports = can_user_generate_report(db, user_email, user_id)
+
+                if not can_generate:
+                    logger.warning(f"User {user_id} ({user_email}) blocked from creating session: {limit_message}")
+                    raise HTTPException(
+                        status_code=403,
+                        detail=limit_message
+                    )
+
+                logger.info(f"Creating new session {session_id} for user {user_id}")
+                session = create_session(db, session_id, user_id)
+
+            # Check if session has any messages - add greeting if no messages exist
+            greeting_message = None
+            if not has_session_messages(db, session_id):
+                initial_greeting = (
+                    "Hello! Welcome to the portfolio analysis service. To get started, please provide your portfolio details using any of these methods:\n\n"
+                    "1. Upload a PDF portfolio statement\n"
+                    "2. Upload a screenshot/snapshot of your portfolio\n"
+                    "3. Type your stock holdings directly in the chat (e.g., 'AAPL 30 shares, GOOGL around 20 shares, MSFT 55 shares')\n\n"
+                    "How would you like to share your portfolio?"
+                )
+
+                # Add initial greeting to database as agent message
+                add_message(db, session_id, user_id, "agent", initial_greeting, "host_agent")
+                greeting_message = initial_greeting
+                logger.info(f"Added greeting message for session {session_id}")
+            else:
+                logger.info(f"Session {session_id} already has messages, skipping greeting")
+
+            return {
+                "session_id": session_id,
+                "greeting": greeting_message,
+                "has_messages": has_session_messages(db, session_id)
+            }
+
+        finally:
+            db.close()
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error initializing chat: {e}")
+        raise HTTPException(status_code=500, detail=f"Error initializing chat: {str(e)}")
 
 
 @app.post("/api/chats", response_model=ChatResponse)
@@ -555,8 +650,9 @@ async def chat(request: Request, current_user: dict = Depends(get_current_user))
             logger.info(f"User {final_user_id} ({user_email}) can generate new report: {current_count}/{max_reports} reports used")
             session = create_session(db, session_id, final_user_id)
 
-            # CRITICAL: Send initial greeting immediately when session is created
-            # This ensures the greeting is the FIRST message in the conversation
+        # CRITICAL: Check if session has any messages - send greeting if no messages exist
+        # This ensures the greeting is sent every time the API is called with a session that has no messages
+        if not has_session_messages(db, session_id):
             initial_greeting = (
                 "Hello! Welcome to the portfolio analysis service. To get started, please provide your portfolio details using any of these methods:\n\n"
                 "1. Upload a PDF portfolio statement\n"
@@ -567,7 +663,7 @@ async def chat(request: Request, current_user: dict = Depends(get_current_user))
 
             # Add initial greeting to database as agent message
             add_message(db, session_id, final_user_id, "agent", initial_greeting, "host_agent")
-            logger.info(f"Sent initial greeting for new session {session_id}")
+            logger.info(f"Sent initial greeting for session {session_id} (no messages found)")
 
         # Handle file upload if present
         file_uploaded = False
@@ -847,19 +943,20 @@ async def chat_stream(request: Request):
             logger.info(f"User {final_user_id} ({user_email}) can generate new report: {current_count}/{max_reports} reports used")
             session = create_session(db, session_id, final_user_id)
 
-            # CRITICAL: Send initial greeting immediately when session is created
-            # This ensures the greeting is the FIRST message in the conversation
+        # CRITICAL: Check if session has any messages - send greeting if no messages exist
+        # This ensures the greeting is sent every time the API is called with a session that has no messages
+        if not has_session_messages(db, session_id):
             initial_greeting = (
                 "Hello! Welcome to the portfolio analysis service. To get started, please provide your portfolio details using any of these methods:\n\n"
                 "1. Upload a PDF portfolio statement\n"
                 "2. Upload a screenshot/snapshot of your portfolio\n"
-                "3. Type your stock holdings directly in the chat (e.g., 'AAPL 30%, GOOGL 20%, MSFT 50%')\n\n"
+                "3. Type your stock holdings directly in the chat (e.g., 'AAPL 30 shares, GOOGL around 20 shares, MSFT 55 shares')\n\n"
                 "How would you like to share your portfolio?"
             )
 
             # Add initial greeting to database as agent message
             add_message(db, session_id, final_user_id, "agent", initial_greeting, "host_agent")
-            logger.info(f"Sent initial greeting for new session {session_id}")
+            logger.info(f"Sent initial greeting for session {session_id} (no messages found)")
 
         # Handle file upload if present
         file_uploaded = False
@@ -1491,10 +1588,10 @@ async def get_session_messages(session_id: str, limit: int = 50, offset: int = 0
         if not session:
             raise HTTPException(status_code=404, detail="Session not found")
         
-        # Get messages with pagination
+        # Get messages with pagination (ordered chronologically - oldest first)
         messages = db.query(ConversationMessage).filter(
             ConversationMessage.session_id == session_id
-        ).order_by(ConversationMessage.timestamp.desc()).offset(offset).limit(limit).all()
+        ).order_by(ConversationMessage.timestamp.asc()).offset(offset).limit(limit).all()
         
         message_list = []
         for message in messages:
@@ -1726,8 +1823,17 @@ async def get_portfolio_performance(session_id: str, _current_user: dict = Depen
                 current_price = current_prices.get(ticker, 0.0)
 
                 if entry_price > 0 and current_price > 0:
-                    # Calculate number of shares purchased
-                    shares = investment_amount / entry_price
+                    # Get number of shares - prefer pre-calculated value from recommendation
+                    shares_str = stock.get("number_of_shares")
+                    if shares_str:
+                        # Parse the shares string (format: "16.6667 shares")
+                        shares_match = re.search(r'[\d.]+', shares_str)
+                        shares = float(shares_match.group()) if shares_match else 0.0
+                        logger.info(f"Using pre-calculated shares for {ticker}: {shares}")
+                    else:
+                        # Fallback: Calculate number of shares (for backward compatibility)
+                        shares = investment_amount / entry_price
+                        logger.info(f"Calculated shares for {ticker}: {shares} (no pre-calculated value found)")
 
                     # Calculate current value
                     current_value = shares * current_price
@@ -1796,6 +1902,238 @@ async def get_portfolio_performance(session_id: str, _current_user: dict = Depen
         raise
     except Exception as e:
         logger.error(f"Error calculating portfolio performance for session {session_id}: {e}")
+        raise HTTPException(status_code=500, detail=f"Error calculating portfolio performance: {str(e)}")
+
+
+@app.get("/api/latest-portfolio-performance/{user_id}")
+async def get_latest_portfolio_performance(user_id: str, current_user: dict = Depends(get_current_user)):
+    """
+    Get portfolio performance for the user's latest stock recommendation.
+
+    Automatically fetches the most recent recommendation and shows transparent
+    profit/loss calculations with detailed price comparisons for each stock.
+
+    Returns:
+        {
+            "user_id": "user123",
+            "session_id": "session_abc",
+            "recommendation_date": "2025-01-15T10:00:00",
+            "days_since_recommendation": 5,
+            "overall_performance": {
+                "total_investment": 10000.00,
+                "total_current_value": 10500.00,
+                "total_profit_loss": 500.00,
+                "total_profit_loss_percentage": 5.00,
+                "status": "profit"
+            },
+            "stocks": [
+                {
+                    "ticker": "AAPL",
+                    "recommendation": "BUY",
+                    "conviction_level": "HIGH",
+                    "entry_price": 180.00,
+                    "current_price": 185.50,
+                    "price_change": 5.50,
+                    "price_change_percentage": 3.06,
+                    "number_of_shares": 13.8889,
+                    "investment_amount": 2500.00,
+                    "current_value": 2576.39,
+                    "profit_loss": 76.39,
+                    "profit_loss_percentage": 3.06,
+                    "status": "profit"
+                },
+                ...
+            ]
+        }
+    """
+    try:
+        logger.info(f"Fetching latest portfolio performance for user {user_id}")
+
+        # Verify the authenticated user matches the requested user_id
+        if current_user.get('uid') != user_id:
+            raise HTTPException(status_code=403, detail="Unauthorized to access this user's portfolio")
+
+        # Get database session
+        db = next(get_db())
+
+        try:
+            # Get the latest recommendation for this user
+            recommendations = get_user_stock_recommendations(db, user_id)
+
+            if not recommendations:
+                raise HTTPException(status_code=404, detail="No stock recommendations found for this user")
+
+            # Get the most recent recommendation (already ordered by created_at desc)
+            latest_recommendation = recommendations[0]
+            session_id = latest_recommendation.session_id
+
+            logger.info(f"Found latest recommendation for user {user_id} in session {session_id}")
+
+            # Parse the recommendation JSON
+            rec_data = latest_recommendation.recommendation
+            individual_recommendations = rec_data.get("individual_stock_recommendations", [])
+            entry_prices = rec_data.get("entry_prices", {})
+            recommendation_date = rec_data.get("recommendation_date", latest_recommendation.created_at.isoformat())
+
+            # Calculate time since recommendation
+            from datetime import datetime
+            rec_datetime = datetime.fromisoformat(recommendation_date.replace('Z', '+00:00') if 'Z' in recommendation_date else recommendation_date)
+            time_since_recommendation = datetime.now() - rec_datetime
+
+            # Check if recommendation is too recent (less than 24 hours)
+            if time_since_recommendation.total_seconds() < 86400:  # 24 hours in seconds
+                hours_since = time_since_recommendation.total_seconds() / 3600
+                logger.info(f"Recommendation is only {hours_since:.1f} hours old, returning limited data")
+
+                return {
+                    "user_id": user_id,
+                    "session_id": session_id,
+                    "recommendation_date": recommendation_date,
+                    "is_too_recent": True,
+                    "hours_since_recommendation": round(hours_since, 1),
+                    "message": f"Recommendation is only {hours_since:.1f} hours old. Performance tracking will be available after 24 hours.",
+                    "overall_performance": {
+                        "status": "too_recent"
+                    },
+                    "stocks": []
+                }
+
+            # Get BUY stocks only (those with investment amounts > 0)
+            buy_stocks = [
+                stock for stock in individual_recommendations
+                if stock.get("recommendation") == "BUY"
+            ]
+
+            if not buy_stocks:
+                raise HTTPException(status_code=404, detail="No BUY recommendations found in latest recommendation")
+
+            # Extract tickers for current price fetching
+            tickers = [stock["ticker"] for stock in buy_stocks]
+
+            # Fetch current prices
+            logger.info(f"Fetching current prices for {len(tickers)} stocks from MCP")
+            current_prices = await fetch_current_prices_from_mcp(tickers)
+
+            if not current_prices:
+                raise HTTPException(status_code=500, detail="Failed to fetch current stock prices")
+
+            # Calculate performance for each BUY stock
+            stock_performance = []
+            total_investment = 0.0
+            total_current_value = 0.0
+
+            import re
+            for stock in buy_stocks:
+                ticker = stock["ticker"]
+
+                # Get entry price
+                entry_price = entry_prices.get(ticker)
+                if not entry_price:
+                    # Try to extract from stock's entry_price field
+                    entry_price_str = stock.get("entry_price", "$0")
+                    entry_match = re.search(r'[\d.]+', entry_price_str)
+                    entry_price = float(entry_match.group()) if entry_match else 0.0
+
+                # Get current price
+                current_price = current_prices.get(ticker, 0.0)
+
+                # Get number of shares - prefer pre-calculated value
+                shares_str = stock.get("number_of_shares")
+                if shares_str:
+                    shares_match = re.search(r'[\d.]+', shares_str)
+                    shares = float(shares_match.group()) if shares_match else 0.0
+                else:
+                    # Fallback: calculate from investment amount
+                    investment_str = stock.get("investment_amount", "$0")
+                    investment_match = re.search(r'[\d.]+', investment_str)
+                    investment_amount = float(investment_match.group()) if investment_match else 0.0
+                    shares = investment_amount / entry_price if entry_price > 0 else 0.0
+
+                # Get investment amount
+                investment_str = stock.get("investment_amount", "$0")
+                investment_match = re.search(r'[\d.]+', investment_str)
+                investment_amount = float(investment_match.group()) if investment_match else 0.0
+
+                if entry_price > 0 and current_price > 0 and shares > 0:
+                    # Calculate values
+                    current_value = shares * current_price
+                    profit_loss = current_value - investment_amount
+                    profit_loss_percentage = (profit_loss / investment_amount) * 100 if investment_amount > 0 else 0.0
+
+                    # Calculate price change
+                    price_change = current_price - entry_price
+                    price_change_percentage = (price_change / entry_price) * 100 if entry_price > 0 else 0.0
+
+                    status = "profit" if profit_loss >= 0 else "loss"
+
+                    stock_performance.append({
+                        "ticker": ticker,
+                        "recommendation": "BUY",
+                        "conviction_level": stock.get("conviction_level", "N/A"),
+                        "entry_price": round(entry_price, 2),
+                        "current_price": round(current_price, 2),
+                        "price_change": round(price_change, 2),
+                        "price_change_percentage": round(price_change_percentage, 2),
+                        "number_of_shares": round(shares, 4),
+                        "investment_amount": round(investment_amount, 2),
+                        "current_value": round(current_value, 2),
+                        "profit_loss": round(profit_loss, 2),
+                        "profit_loss_percentage": round(profit_loss_percentage, 2),
+                        "status": status
+                    })
+
+                    total_investment += investment_amount
+                    total_current_value += current_value
+                else:
+                    logger.warning(f"Missing data for {ticker}: entry_price={entry_price}, current_price={current_price}, shares={shares}")
+                    stock_performance.append({
+                        "ticker": ticker,
+                        "recommendation": "BUY",
+                        "conviction_level": stock.get("conviction_level", "N/A"),
+                        "entry_price": entry_price,
+                        "current_price": current_price,
+                        "price_change": 0.0,
+                        "price_change_percentage": 0.0,
+                        "number_of_shares": shares,
+                        "investment_amount": round(investment_amount, 2),
+                        "current_value": 0.0,
+                        "profit_loss": 0.0,
+                        "profit_loss_percentage": 0.0,
+                        "status": "error",
+                        "error": "Incomplete price or share data"
+                    })
+
+            # Calculate overall performance
+            overall_profit_loss = total_current_value - total_investment
+            overall_profit_loss_percentage = (overall_profit_loss / total_investment) * 100 if total_investment > 0 else 0.0
+            overall_status = "profit" if overall_profit_loss >= 0 else "loss"
+
+            response = {
+                "user_id": user_id,
+                "session_id": session_id,
+                "recommendation_date": recommendation_date,
+                "days_since_recommendation": time_since_recommendation.days,
+                "is_too_recent": False,
+                "overall_performance": {
+                    "total_investment": round(total_investment, 2),
+                    "total_current_value": round(total_current_value, 2),
+                    "total_profit_loss": round(overall_profit_loss, 2),
+                    "total_profit_loss_percentage": round(overall_profit_loss_percentage, 2),
+                    "status": overall_status
+                },
+                "stocks": stock_performance
+            }
+
+            logger.info(f"Latest portfolio performance calculated: {overall_status} of ${abs(overall_profit_loss):.2f} ({overall_profit_loss_percentage:.2f}%)")
+            return response
+
+        finally:
+            db.close()
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error calculating latest portfolio performance for user {user_id}: {e}")
         raise HTTPException(status_code=500, detail=f"Error calculating portfolio performance: {str(e)}")
 
 

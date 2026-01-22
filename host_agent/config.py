@@ -32,6 +32,9 @@ class Config:
     # Free user message limit
     FREE_USER_MESSAGE_LIMIT = int(os.getenv("FREE_USER_MESSAGE_LIMIT", "300"))
 
+    # MCP Configuration
+    MCP_DIRECTORY = os.getenv("MCP_DIRECTORY", "/Users/debojyotichakraborty/codebase/finhub-mcp")  # Default to local path
+
     @classmethod
     def is_local(cls):
         """Check if running in local environment."""

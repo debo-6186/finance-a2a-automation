@@ -6,7 +6,7 @@ import time
 import threading
 import shutil
 from datetime import datetime
-from typing import Any, AsyncIterable, List
+from typing import Any, AsyncIterable, List, Tuple
 
 import boto3
 import httpx
@@ -235,6 +235,8 @@ class HostAgent:
                         FunctionTool(self.read_and_analyze_portfolio),
                         FunctionTool(self.analyze_text_portfolio),
                         FunctionTool(self.store_stock_report_response),
+                        FunctionTool(self.store_market_preference),
+                        FunctionTool(self.get_market_preference),
                         FunctionTool(self.store_investment_amount),
                         FunctionTool(self.store_diversification_preference),
                         FunctionTool(self.store_receiver_email_id),
@@ -244,6 +246,7 @@ class HostAgent:
                         FunctionTool(self.store_share_count),
                         FunctionTool(self.get_share_counts),
                         FunctionTool(self.get_stock_lists),
+                        FunctionTool(self.answer_general_stock_question),
                         FunctionTool(self.analyze_all_stocks),
                         FunctionTool(self.suggest_stocks_by_category),
                         FunctionTool(self.get_agent_status),
@@ -282,8 +285,22 @@ class HostAgent:
         - Stock market data and analysis
         - Investment preferences and amounts
 
-        **For ANY questions outside this scope, you MUST respond with:**
-        "I am a portfolio analyzer and stock recommender bot. I can only assist with questions related to stocks, portfolios, and investment strategies. Please ask me about your portfolio analysis, stock recommendations, or investment planning."
+        **HANDLING OFF-TOPIC QUESTIONS:**
+        1. **If a question is outside your portfolio analysis workflow BUT still related to stocks/stock market:**
+           - Examples: "What is a stock split?", "How does the stock market work?", "What's the current price of AAPL?", "What is P/E ratio?"
+           - Use the `answer_general_stock_question` tool with the user's question
+           - Return the answer from the tool to the user
+           - After answering, gently guide them back to the portfolio analysis workflow if they haven't completed it yet
+
+        2. **If a question is completely unrelated to stocks, markets, or finance:**
+           - Examples: "What's the weather?", "How do I cook pasta?", "Tell me a joke"
+           - Respond with: "I am a portfolio analyzer and stock recommender bot. I can only assist with questions related to stocks, portfolios, and investment strategies. Please ask me about your portfolio analysis, stock recommendations, or investment planning."
+
+        **How to determine if a question is stock-related:**
+        - Does it mention stocks, shares, companies, market, trading, investing, or financial terms?
+        - Is it asking about stock market concepts, mechanisms, or data?
+        - If YES to any of these, use `answer_general_stock_question` tool
+        - If NO to all, give the rejection message above
 
         **Role:** You are a stock portfolio coordinator agent. Your job is to:
         1. Analyze the user's portfolio
@@ -294,20 +311,33 @@ class HostAgent:
         **YOU DO NOT PERFORM ANY FINANCIAL ANALYSIS YOURSELF** - You only coordinate and delegate to the Stock Analyser Agent.
 
         **CRITICAL FIRST MESSAGE REQUIREMENT:**
-        - **ALWAYS START** by checking if portfolio has been provided using `check_file_upload_status`
-        - If NO portfolio data exists yet, your **FIRST MESSAGE MUST BE** asking the user to provide their portfolio
-        - Use this EXACT greeting for first-time users: "Hello! Welcome to the portfolio analysis service. To get started, please provide your portfolio details using any of these methods:
+        - **ALWAYS START** by checking if market preference has been set using `get_market_preference`
+        - If NO market preference exists yet, your **FIRST MESSAGE MUST BE** the greeting and asking about market preference
+        - Use this EXACT greeting for first-time users: "Hello! Welcome to the portfolio analysis service. Before we begin, I need to know which market you'd like to invest in.
+
+        Are you interested in:
+        1. US Market (stocks like AAPL, GOOGL, MSFT, etc.)
+        2. Indian Market (stocks like RELIANCE.NS, TCS.BO, INFY.NS, etc.)
+
+        Please specify 'US' or 'India'."
+
+        **WORKFLOW - FOLLOW THESE STEPS IN ORDER:**
+
+        **STEP 0: Get Market Preference**
+        - FIRST, use `get_market_preference` to check if market preference has been set
+        - If NOT set, show the greeting message above and wait for user response
+        - WAIT for user to specify 'US' or 'India' (or variations like 'USA', 'United States', 'Indian', etc.)
+        - Store using `store_market_preference` with value "US" or "INDIA" (normalized)
+        - Proceed immediately to STEP 1
+
+        **STEP 1: Analyze Portfolio**
+        - FIRST, use `check_file_upload_status` to check if portfolio data has been provided (via file or text)
+        - If NO portfolio data, ask user: "Please provide your portfolio details using any of these methods:
           1. Upload a PDF portfolio statement
           2. Upload a screenshot/snapshot of your portfolio
           3. Type your stock holdings directly in the chat (e.g., 'AAPL 30%, GOOGL 20%, MSFT 50%')
 
         How would you like to share your portfolio?"
-
-        **WORKFLOW - FOLLOW THESE STEPS IN ORDER:**
-
-        **STEP 1: Analyze Portfolio**
-        - FIRST, use `check_file_upload_status` to check if portfolio data has been provided (via file or text)
-        - If NO portfolio data, ask user to provide it using the greeting message above
         - If portfolio data exists, proceed with analysis
 
         **If file is uploaded (PDF or image):**
@@ -361,27 +391,25 @@ class HostAgent:
         **STEP 4: Check for Additional Stocks**
         - BEFORE asking, check `get_stock_lists` to see if new stocks have been discussed
         - If NOT discussed yet, ask: "Do you want to invest in any other stocks besides your existing portfolio?
-          • Say 'yes' to add more stocks from specific sectors (Technology, Financial, or Automobile for USA/India)
-          • Specify stock tickers directly (e.g., 'AAPL', 'TSLA', 'RELIANCE.NS')
+          • Say 'yes' to add more stocks from specific sectors (Technology, Financial, or Automobile)
+          • Specify stock tickers directly (e.g., 'AAPL', 'TSLA' for US or 'RELIANCE.NS', 'TCS.BO' for India)
           • Say 'no' if you only want to analyze your existing portfolio"
         - WAIT for user response
 
         **If user wants to add more stocks:**
         - If user mentions a sector: Use `suggest_stocks_by_category` with the appropriate category name:
-          * USA_TOP_TECHNOLOGY_STOCKS
-          * USA_TOP_FINANCIAL_STOCKS
-          * USA_TOP_AUTOMOBILE_STOCKS
-          * INDIA_TOP_TECHNOLOGY_STOCKS
-          * INDIA_TOP_FINANCIAL_STOCKS
-          * INDIA_TOP_AUTOMOBILE_STOCKS
+          * **For US Market users:** USA_TOP_TECHNOLOGY_STOCKS, USA_TOP_FINANCIAL_STOCKS, USA_TOP_AUTOMOBILE_STOCKS
+          * **For India Market users:** INDIA_TOP_TECHNOLOGY_STOCKS, INDIA_TOP_FINANCIAL_STOCKS, INDIA_TOP_AUTOMOBILE_STOCKS
+          * **IMPORTANT:** Only use categories matching the user's market preference (check with `get_market_preference`)
         - Show the stocks from that category
         - Ask user to select specific tickers from the list
         - WAIT for user to select tickers
-        - Add selected stocks using `add_new_stocks`
+        - Add selected stocks using `add_new_stocks` (will auto-validate against market preference)
         - Ask: "Would you like to add stocks from another sector?" and repeat if yes
 
         **If user mentions specific stock tickers:**
-        - Add them directly using `add_new_stocks`
+        - Add them directly using `add_new_stocks` (will auto-validate against market preference)
+        - The tool will reject stocks that don't match the user's selected market
         - Ask: "Would you like to add any more stocks?" and repeat if yes
 
         **If user says 'no':**
@@ -421,7 +449,9 @@ class HostAgent:
         * `read_and_analyze_portfolio`: Analyze portfolio document (PDF or image) and extract stock tickers
         * `analyze_text_portfolio`: Analyze portfolio data provided as text input
         * `add_existing_stocks`: Add stocks from portfolio statement
-        * `add_new_stocks`: Add new stocks user wants to consider
+        * `store_market_preference`: Store user's market preference (US or INDIA)
+        * `get_market_preference`: Check user's market preference
+        * `add_new_stocks`: Add new stocks user wants to consider (auto-validates against market preference)
         * `store_share_count`: Store share count for a stock ticker (critical for SELL recommendations)
         * `get_share_counts`: View all stored share counts
         * `store_investment_amount`: Store the investment amount
@@ -429,7 +459,8 @@ class HostAgent:
         * `store_receiver_email_id`: Store email ID and trigger stock analysis
         * `get_investment_amount`: Check if investment amount is set
         * `get_stock_lists`: View current state of all stored information
-        * `suggest_stocks_by_category`: Get stocks from specific categories
+        * `answer_general_stock_question`: Answer general stock market questions using external knowledge (use for stock-related questions outside the workflow)
+        * `suggest_stocks_by_category`: Get stocks from categories matching user's market preference
         * `analyze_all_stocks`: Create comprehensive analysis request
         * `send_message`: Delegate to Stock Analyser Agent
 
@@ -910,6 +941,81 @@ class HostAgent:
         logger.info(f"✓ Stored investment amount: ${amount:,.2f}")
         return f"Investment amount stored successfully: ${amount:,.2f}"
 
+    def store_market_preference(self, market: str):
+        """Stores the user's market preference (US or INDIA).
+
+        Args:
+            market: The market preference - should be "US" or "INDIA"
+        """
+        logger.info(f"🔧 TOOL CALLED: store_market_preference(market='{market}')")
+
+        # Normalize the market value
+        market_normalized = market.upper().strip()
+        if market_normalized in ["USA", "UNITED STATES", "AMERICA"]:
+            market_normalized = "US"
+        elif market_normalized in ["IND", "INDIAN", "BHARAT"]:
+            market_normalized = "INDIA"
+
+        if market_normalized not in ["US", "INDIA"]:
+            logger.warning(f"Invalid market preference: {market}. Expected 'US' or 'INDIA'")
+            return f"Error: Invalid market preference '{market}'. Please specify 'US' or 'India'."
+
+        # Store in agent state
+        state = self._load_state()
+        state["market_preference"] = market_normalized
+        self._save_state(state)
+
+        # Also update the database session
+        try:
+            session_id = self.current_session_id["id"]
+            db = next(get_db())
+            session = get_session(db, session_id)
+            if session:
+                session.market_preference = market_normalized
+                db.commit()
+                logger.info(f"✓ Updated market_preference in database session: {market_normalized}")
+            db.close()
+        except Exception as db_error:
+            logger.error(f"Error updating market_preference in database: {db_error}")
+
+        logger.info(f"✓ Stored market preference: {market_normalized}")
+        return f"Market preference stored successfully: {market_normalized} Market"
+
+    def get_market_preference(self):
+        """Gets the user's market preference.
+
+        Returns:
+            String indicating the market preference status
+        """
+        logger.info(f"🔧 TOOL CALLED: get_market_preference()")
+
+        # First check agent state
+        state = self._load_state()
+        market_pref = state.get("market_preference")
+
+        # If not in state, check database
+        if not market_pref:
+            try:
+                session_id = self.current_session_id["id"]
+                db = next(get_db())
+                session = get_session(db, session_id)
+                if session and session.market_preference:
+                    market_pref = session.market_preference
+                    # Sync to state
+                    state["market_preference"] = market_pref
+                    self._save_state(state)
+                    logger.info(f"✓ Loaded market preference from database: {market_pref}")
+                db.close()
+            except Exception as db_error:
+                logger.error(f"Error loading market_preference from database: {db_error}")
+
+        if market_pref:
+            logger.info(f"✓ Market preference is set: {market_pref}")
+            return f"Market preference: {market_pref} Market"
+        else:
+            logger.info(f"✓ Market preference NOT set yet")
+            return "Market preference: NOT SET"
+
     def store_diversification_preference(self, preference: str):
         """Stores the user's complete investment strategy.
 
@@ -1124,6 +1230,24 @@ Return ONLY a JSON array of uppercase ticker symbols. If a name is already a tic
 
             tickers = json.loads(response_text)
 
+            # VALIDATE STOCKS AGAINST MARKET PREFERENCE
+            market_preference = state.get("market_preference")
+            if market_preference:
+                logger.info(f"Validating {len(tickers)} new stocks against market preference: {market_preference}")
+                is_valid, error_message, valid_tickers, invalid_tickers = self._validate_stocks_against_market_preference(
+                    tickers, market_preference
+                )
+
+                if not is_valid:
+                    logger.warning(f"Stock validation failed: {len(invalid_tickers)} invalid stocks")
+                    return error_message
+
+                # Use only valid tickers
+                tickers = valid_tickers
+                logger.info(f"All {len(tickers)} stocks validated successfully")
+            else:
+                logger.warning("Market preference not set - skipping stock validation")
+
             # Add tickers to the list
             added_count = 0
             for ticker in tickers:
@@ -1235,6 +1359,69 @@ Return ONLY a JSON array of uppercase ticker symbols. If a name is already a tic
             result += "No stock report response stored yet.\n"
 
         return result
+
+    def answer_general_stock_question(self, question: str):
+        """
+        Answers general stock market questions using Perplexity API.
+
+        This function is used for questions that are related to stocks/stock market
+        but are outside the current portfolio analysis workflow.
+
+        Args:
+            question: The user's question about stocks or the stock market
+
+        Returns:
+            Answer from Perplexity API or error message
+        """
+        try:
+            logger.info(f"🔧 TOOL CALLED: answer_general_stock_question(question='{question[:100]}...')")
+
+            # Get Perplexity API key from environment
+            perplexity_api_key = os.getenv("PERPLEXITY_API_KEY")
+            if not perplexity_api_key:
+                logger.error("PERPLEXITY_API_KEY not found in environment variables")
+                return "I apologize, but I'm unable to answer general stock market questions at the moment due to a configuration issue. Please try asking about your portfolio analysis instead."
+
+            # Use OpenAI client with Perplexity base URL
+            from openai import OpenAI
+
+            client = OpenAI(
+                api_key=perplexity_api_key,
+                base_url="https://api.perplexity.ai"
+            )
+
+            # Make the API call to Perplexity
+            response = client.chat.completions.create(
+                model="sonar",
+                messages=[
+                    {
+                        "role": "system",
+                        "content": """You are a knowledgeable stock market expert assistant.
+                        Provide accurate, helpful, and concise answers to stock market related questions.
+                        Focus on factual information and include relevant data when available.
+                        If you mention stock prices or market data, clarify the timeframe.
+                        Keep responses clear and user-friendly."""
+                    },
+                    {
+                        "role": "user",
+                        "content": question
+                    }
+                ]
+            )
+
+            # Extract the answer
+            if response.choices and len(response.choices) > 0:
+                answer = response.choices[0].message.content.strip()
+                logger.info(f"✓ Successfully answered general stock question using Perplexity API")
+                return answer
+            else:
+                logger.error("No response from Perplexity API")
+                return "I apologize, but I couldn't get an answer at the moment. Please try again or ask about your portfolio analysis."
+
+        except Exception as e:
+            error_msg = f"Error querying Perplexity API: {e}"
+            logger.error(error_msg)
+            return f"I apologize, but I encountered an error while trying to answer your question. Please try asking about your portfolio analysis instead, or rephrase your question."
 
     def analyze_all_stocks(self):
         """Creates a comprehensive list of stocks to analyze and prepares the delegation request."""
@@ -1519,7 +1706,10 @@ Return ONLY a JSON array of uppercase ticker symbols. If a name is already a tic
                 logger.warning("Continuing with analysis despite verification error")
 
             # Step 3: Extract tickers from the text
-            result = extract_stock_tickers_from_text(portfolio_text)
+            # Get market preference to validate portfolio against it
+            state = self._load_state()
+            market_preference = state.get("market_preference")
+            result = extract_stock_tickers_from_text(portfolio_text, market_preference)
 
             # Step 4: CRITICAL - Automatically store extracted share counts
             if result and not result.startswith("Error"):
@@ -1593,7 +1783,10 @@ Return ONLY a JSON array of uppercase ticker symbols. If a name is already a tic
             logger.info(f"Text verification passed: {verification_message}")
 
             # Step 2: Extract tickers from the text using LLM
-            result = extract_stock_tickers_from_text(portfolio_text)
+            # Get market preference to validate portfolio against it
+            state = self._load_state()
+            market_preference = state.get("market_preference")
+            result = extract_stock_tickers_from_text(portfolio_text, market_preference)
 
             # Store the response automatically if successful
             if result and not result.startswith("Error") and not result.startswith("No stock"):
@@ -1648,25 +1841,178 @@ Return ONLY a JSON array of uppercase ticker symbols. If a name is already a tic
             logger.error(error_msg)
             return f"Error: {error_msg}"
 
+    def _validate_stocks_against_market_preference(self, tickers: List[str], market_preference: str) -> Tuple[bool, str, List[str], List[str]]:
+        """
+        Validates that stock tickers match the user's market preference using LLM.
+
+        Args:
+            tickers: List of stock ticker symbols to validate
+            market_preference: User's market preference ("US" or "INDIA")
+
+        Returns:
+            Tuple of (is_valid, error_message, valid_tickers, invalid_tickers)
+        """
+        from google import genai
+        from google.genai.types import GenerateContentConfig
+
+        try:
+            logger.info(f"Validating {len(tickers)} tickers against market preference: {market_preference}")
+
+            # Create the client with proper configuration
+            if os.getenv("GOOGLE_GENAI_USE_VERTEXAI") == "TRUE":
+                client = genai.Client(vertexai=True)
+            else:
+                api_key = os.getenv("GOOGLE_API_KEY")
+                if not api_key:
+                    logger.error("No GOOGLE_API_KEY found for stock validation")
+                    # If no API key, skip validation (lenient fallback)
+                    return True, "", tickers, []
+                client = genai.Client(api_key=api_key)
+
+            tickers_str = ", ".join(tickers)
+            expected_market = "US" if market_preference == "US" else "India"
+
+            # System prompt for stock validation
+            system_prompt = f"""You are a financial expert who validates stock tickers against specific stock exchanges.
+
+Your task is to validate whether stock tickers belong to the {expected_market} market/exchange.
+
+VALIDATION RULES:
+- **US Market Stocks**: Tickers WITHOUT country suffixes (e.g., AAPL, GOOGL, MSFT, TSLA, JPM, VOO, SPY)
+  - Listed on US exchanges (NYSE, NASDAQ, etc.)
+  - Usually 1-5 uppercase letters
+  - ETFs like VOO, SPY, QQQ are also US market
+
+- **Indian Market Stocks**: Tickers WITH .NS (NSE) or .BO (BSE) suffixes OR Indian company names
+  - Listed on Indian exchanges (NSE, BSE)
+  - Examples: RELIANCE.NS, TCS.BO, INFY.NS, HDFCBANK, SBIN
+  - If ticker lacks suffix but is clearly an Indian company (like RELIANCE, TCS, INFY), classify as Indian
+
+RESPONSE FORMAT - Return ONLY valid JSON:
+{{
+  "valid_tickers": ["list of tickers matching {expected_market} market"],
+  "invalid_tickers": [
+    {{"ticker": "ticker_symbol", "actual_market": "US/India/Unknown", "reason": "explanation"}}
+  ],
+  "all_valid": true/false
+}}"""
+
+            user_prompt = f"""Validate these tickers for {expected_market} market:
+
+Tickers: {tickers_str}
+
+Check if ALL tickers belong to {expected_market} market. Return valid and invalid tickers."""
+
+            # Make the LLM call
+            response = client.models.generate_content(
+                model="gemini-2.5-flash",
+                contents=user_prompt,
+                config=GenerateContentConfig(system_instruction=[system_prompt])
+            )
+
+            response_text = response.text.strip()
+
+            # Parse JSON response
+            if response_text.startswith("```"):
+                response_text = response_text.split("```")[1]
+                if response_text.startswith("json"):
+                    response_text = response_text[4:]
+                response_text = response_text.strip()
+
+            validation_result = json.loads(response_text)
+            all_valid = validation_result.get("all_valid", False)
+            valid_tickers = validation_result.get("valid_tickers", [])
+            invalid_tickers_data = validation_result.get("invalid_tickers", [])
+            invalid_tickers = [item.get("ticker") for item in invalid_tickers_data]
+
+            if all_valid:
+                logger.info(f"✓ All {len(tickers)} tickers are valid for {expected_market} market")
+                return True, "", valid_tickers, []
+            else:
+                # Build error message
+                error_msg = f"**Invalid Stocks: Market Preference Mismatch**\n\n"
+                error_msg += f"You selected **{market_preference} Market**, but some stocks don't match:\n\n"
+
+                for invalid_item in invalid_tickers_data:
+                    ticker = invalid_item.get("ticker")
+                    actual_market = invalid_item.get("actual_market", "Unknown")
+                    reason = invalid_item.get("reason", "Does not match selected market")
+                    error_msg += f"• **{ticker}**: {reason} (Appears to be {actual_market} market)\n"
+
+                error_msg += f"\n**Requirement:** All stocks must be from the {expected_market} market.\n"
+                if expected_market == "US":
+                    error_msg += "Please provide only US stocks (e.g., AAPL, GOOGL, MSFT, JPM, VOO).\n"
+                else:
+                    error_msg += "Please provide only Indian stocks (e.g., RELIANCE.NS, TCS.BO, INFY.NS, HDFCBANK).\n"
+
+                logger.warning(f"Validation failed: {len(invalid_tickers)} invalid tickers for {expected_market} market")
+                return False, error_msg, valid_tickers, invalid_tickers
+
+        except Exception as e:
+            logger.error(f"Error validating stocks against market preference: {e}")
+            # On error, be lenient and allow through
+            return True, "", tickers, []
+
     def suggest_stocks_by_category(self, category: str):
         """
         Retrieves a list of stocks from a specified category.
-        
+        Validates that the category matches the user's market preference.
+
         Args:
             category: The full category name (e.g., 'USA_TOP_AUTOMOBILE_STOCKS', 'INDIA_TOP_TECHNOLOGY_STOCKS')
         """
+        logger.info(f"🔧 TOOL CALLED: suggest_stocks_by_category(category='{category}')")
+
+        # Check market preference
+        state = self._load_state()
+        market_preference = state.get("market_preference")
+
+        if not market_preference:
+            return "Error: Market preference not set. Please specify if you want to invest in US or Indian market first."
+
+        # Validate category matches market preference
+        category_upper = category.upper()
+        if market_preference == "US":
+            if not category_upper.startswith("USA_"):
+                error_msg = f"**Market Preference Mismatch**\n\n"
+                error_msg += f"You selected **US Market**, but requested category '{category}' is for Indian stocks.\n\n"
+                error_msg += "**Available US Categories:**\n"
+                error_msg += "• USA_TOP_TECHNOLOGY_STOCKS\n"
+                error_msg += "• USA_TOP_FINANCIAL_STOCKS\n"
+                error_msg += "• USA_TOP_AUTOMOBILE_STOCKS\n"
+                logger.warning(f"Category '{category}' doesn't match US market preference")
+                return error_msg
+        elif market_preference == "INDIA":
+            if not category_upper.startswith("INDIA_"):
+                error_msg = f"**Market Preference Mismatch**\n\n"
+                error_msg += f"You selected **Indian Market**, but requested category '{category}' is for US stocks.\n\n"
+                error_msg += "**Available Indian Categories:**\n"
+                error_msg += "• INDIA_TOP_TECHNOLOGY_STOCKS\n"
+                error_msg += "• INDIA_TOP_FINANCIAL_STOCKS\n"
+                error_msg += "• INDIA_TOP_AUTOMOBILE_STOCKS\n"
+                logger.warning(f"Category '{category}' doesn't match INDIA market preference")
+                return error_msg
+
         stock_data_path = os.path.join(os.path.dirname(__file__), "stock_data.json")
-        
+
         if not os.path.exists(stock_data_path):
             return "Error: stock_data.json not found. Please ensure it's in the correct directory."
 
         try:
             with open(stock_data_path, "r") as f:
                 stock_data = json.load(f)
-            
+
             if category not in stock_data:
-                available_categories = list(stock_data.keys())
-                return f"Error: Category '{category}' not found. Available categories:\n" + "\n".join(available_categories)
+                # Show only categories matching the user's market preference
+                all_categories = list(stock_data.keys())
+                if market_preference == "US":
+                    available_categories = [cat for cat in all_categories if cat.startswith("USA_")]
+                    market_name = "US"
+                else:
+                    available_categories = [cat for cat in all_categories if cat.startswith("INDIA_")]
+                    market_name = "Indian"
+
+                return f"Error: Category '{category}' not found. Available {market_name} categories:\n" + "\n".join(available_categories)
             
             stocks_in_category = stock_data[category]
             if not stocks_in_category:

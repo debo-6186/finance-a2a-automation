@@ -47,6 +47,8 @@ class StockAnalyzerAgent:
         self.stock_analysis_data = {}  # Store stock analysis data in memory
         self.stock_current_prices = {}  # Store current prices separately for easier access
         self.stock_share_counts = {}  # Store share counts for existing stocks
+        self.existing_stocks = []  # Track existing portfolio stocks
+        self.new_stocks = []  # Track new stocks to analyze
         
         # Initialize MCP tool
         # Get MCP directory from config (environment-aware)
@@ -287,7 +289,7 @@ SESSION_ID: not_found"""
         """
         Analyzes portfolio data from memory and provides comprehensive investment recommendations.
         Reads both portfolio analysis and individual stock data to make buy/sell/hold decisions.
-        Uses Perplexity's sonar-pro model for analysis.
+        Uses Google's Gemini 3.0 Pro model for analysis.
 
         Args:
             analysis_request: Original portfolio analysis request containing current holdings information
@@ -312,17 +314,17 @@ SESSION_ID: not_found"""
             logger.info(f"Successfully loaded portfolio data from memory")
             logger.info(f"Found text content with {len(text_content)} characters for {len(self.stock_analysis_data)} stocks")
 
-            # Initialize Perplexity client using OpenAI-compatible format
-            perplexity_api_key = os.getenv("PERPLEXITY_API_KEY")
-            if not perplexity_api_key:
-                logger.error("PERPLEXITY_API_KEY not found in environment variables")
-                return json.dumps({"error": "PERPLEXITY_API_KEY not configured. Please set the environment variable."})
-
-            client = OpenAI(
-                api_key=perplexity_api_key,
-                base_url="https://api.perplexity.ai"
-            )
-            logger.info("Using Perplexity API with sonar-pro model for portfolio analysis")
+            # Initialize Gemini client
+            if os.getenv("GOOGLE_GENAI_USE_VERTEXAI") == "TRUE":
+                client = genai.Client(vertexai=True)
+                logger.info("Using Vertex AI with Gemini 3.0 Pro for portfolio analysis")
+            else:
+                api_key = os.getenv("GOOGLE_API_KEY")
+                if not api_key:
+                    logger.error("GOOGLE_API_KEY not found in environment variables")
+                    return json.dumps({"error": "GOOGLE_API_KEY not configured. Please set the environment variable."})
+                client = genai.Client(api_key=api_key)
+                logger.info("Using Google AI API with Gemini 3.0 Pro for portfolio analysis")
 
             # Expert system prompt for portfolio recommendations
             system_prompt = f"""You are an expert portfolio manager with 20+ years of experience in equity analysis and portfolio construction. Your role is to provide data-driven stock allocation recommendations with specific buy/sell/hold decisions and INTELLIGENT WEIGHTED ALLOCATION.
@@ -393,26 +395,44 @@ PORTFOLIO CONSTRAINTS:
 - Minimum single stock allocation: 5% of total budget (to ensure meaningful positions)
 - Ensure sector diversification: No more than 40% in any single sector
 
-INTELLIGENT ALLOCATION METHODOLOGY (CRITICAL - MUST FOLLOW):
-For each BUY recommendation, assign a CONVICTION LEVEL and allocate accordingly:
+INTELLIGENT ALLOCATION METHODOLOGY (**⚠️ CRITICAL - MUST FOLLOW**):
+For each BUY recommendation, assign a CONVICTION LEVEL and allocate accordingly.
+
+**NEVER allocate the same amount to all stocks** - this indicates poor analysis and will be rejected.
+Each stock should receive a DIFFERENT allocation based on its unique conviction level.
 
 HIGH CONVICTION (20-25% of budget): Stock meets ALL criteria:
 - Analyst consensus "Strong Buy" OR price target upside >25%
 - Strong fundamentals (P/E <20, revenue growth >20%, healthy margins >15%)
 - Positive technical momentum (price above both 50-day and 200-day MA)
 - Low risk (beta <1.2, strong balance sheet)
+- **Allocation examples: $2500, $2250, $2000 (for $10k budget)**
 
 MEDIUM CONVICTION (10-15% of budget): Stock meets MOST criteria:
 - Analyst consensus "Buy" OR price target upside 10-25%
 - Solid fundamentals (reasonable P/E, positive growth)
 - Neutral to positive technical signals
 - Moderate risk (beta 1.0-1.5)
+- **Allocation examples: $1500, $1250, $1000 (for $10k budget)**
 
 LOW CONVICTION (5-10% of budget): Stock meets MINIMUM criteria:
 - Analyst consensus "Hold/Buy" OR price target upside 10-15%
 - Acceptable fundamentals
 - Mixed technical signals
 - Higher risk (beta >1.5) OR smaller cap OR sector concerns
+- **Allocation examples: $750, $600, $500 (for $10k budget)**
+
+⚠️ **WEIGHTAGE DISTRIBUTION RULE:**
+If you have 3+ BUY recommendations, they MUST have DIFFERENT allocation amounts.
+Example CORRECT allocations for $10,000 budget with 4 BUY stocks:
+- Stock A (HIGH): $2,500 (25%)
+- Stock B (MEDIUM-HIGH): $2,000 (20%)
+- Stock C (MEDIUM): $1,500 (15%)
+- Stock D (LOW-MEDIUM): $1,000 (10%)
+- Remaining: $3,000 saved or allocated to top picks
+
+Example INCORRECT (will be rejected):
+- All stocks: $2,500 each ❌ (equal distribution shows no differentiation)
 
 ALLOCATION RULES (** CRITICAL - MUST FOLLOW **):
 1. ⚠️ NEVER EVER allocate $0 to a BUY recommendation - minimum is 5% of total budget
@@ -448,7 +468,8 @@ You must return ONLY a valid JSON object with the following structure:
         {{
             "ticker": "string",
             "percentage": "string (e.g., '25%')",
-            "investment_amount": "string (e.g., '$2500')"
+            "investment_amount": "string (e.g., '$2500')",
+            "number_of_shares": "string (calculated as investment_amount/current_price, e.g., '16.67 shares')"
         }}
     ],
     "individual_stock_recommendations": [
@@ -457,6 +478,7 @@ You must return ONLY a valid JSON object with the following structure:
             "recommendation": "string (BUY/HOLD/SELL)",
             "conviction_level": "string (HIGH/MEDIUM/LOW for BUY, N/A for HOLD/SELL)",
             "investment_amount": "string (NEVER $0 for BUY, always $0 for HOLD/SELL)",
+            "number_of_shares": "string (ONLY for BUY: calculated as investment_amount/current_price, e.g., '16.67 shares')",
             "shares_to_sell": "string (ONLY for SELL: 'ALL' or specific number like '10.5 shares' or 'PARTIAL: 5 shares')",
             "key_metrics": "string (Current P/E [X], Target Upside [X%], Analyst Rating [X], Revenue Growth [X%])",
             "reasoning": "string (2-3 sentences explaining the decision and conviction level)"
@@ -535,7 +557,7 @@ STOCK ANALYSIS DATA:
             # Generate portfolio recommendations using LLM
             logger.info(f"Generating comprehensive portfolio recommendations")
 
-            max_retries = 5  # Increased retries to account for JSON validation retries
+            max_retries = 5  # Increased retries to account for JSON validation and token limit retries
             base_delay = 1.0
 
             for attempt in range(max_retries):
@@ -546,22 +568,17 @@ STOCK ANALYSIS DATA:
                         logger.info(f"Retrying portfolio analysis after {delay:.2f}s delay (attempt {attempt + 1}/{max_retries})")
                         time.sleep(delay)
 
-                    # Call Perplexity API with sonar-pro model
-                    completion = client.chat.completions.create(
-                        messages=[
-                            {
-                                "role": "system",
-                                "content": system_prompt
-                            },
-                            {
-                                "role": "user",
-                                "content": user_prompt
-                            }
-                        ],
-                        model="sonar-pro"
+                    # Call Gemini API with gemini-3-pro-preview model
+                    response = client.models.generate_content(
+                        model="gemini-3-pro-preview",
+                        contents=user_prompt,
+                        config=GenerateContentConfig(
+                            system_instruction=[system_prompt],
+                            temperature=0.3,  # Low temperature for consistent, reliable recommendations
+                        )
                     )
 
-                    response_text = completion.choices[0].message.content if completion and completion.choices else None
+                    response_text = response.text if response and response.text else None
 
                     if response_text:
                         # Log successful generation
@@ -591,14 +608,18 @@ STOCK ANALYSIS DATA:
                                     return json.dumps({"error": f"Invalid JSON response: missing fields {missing_fields}"})
                                 continue  # Retry
 
-                            # Business logic validation: Fix BUY recommendations with $0 allocation
+                            # Business logic validation: Enhanced validation for recommendations
                             individual_recommendations = parsed_json.get("individual_stock_recommendations", [])
+
+                            # Step 1: Fix BUY+$0 violations
+                            recommendations_to_remove = []
                             fixed_count = 0
-                            for stock_rec in individual_recommendations:
+                            for idx, stock_rec in enumerate(individual_recommendations):
+                                ticker = stock_rec.get("ticker", "UNKNOWN")
                                 recommendation = stock_rec.get("recommendation", "")
                                 investment_amount = stock_rec.get("investment_amount", "")
 
-                                # Extract numeric value from investment_amount (handle "$0", "$0.00", "0", etc.)
+                                # Extract numeric value from investment_amount
                                 amount_value = 0.0
                                 if isinstance(investment_amount, str):
                                     amount_str = investment_amount.replace("$", "").replace(",", "").strip()
@@ -607,18 +628,123 @@ STOCK ANALYSIS DATA:
                                     except:
                                         pass
 
-                                # If BUY recommendation has $0 allocation, convert to HOLD
+                                # If BUY recommendation has $0 allocation
                                 if recommendation == "BUY" and amount_value == 0.0:
-                                    logger.warning(f"Fixed BUY+$0 violation for {stock_rec.get('ticker', 'UNKNOWN')}: Converting to HOLD")
-                                    stock_rec["recommendation"] = "HOLD"
-                                    stock_rec["conviction_level"] = "N/A"
-                                    # Add note to reasoning if it exists
-                                    if "reasoning" in stock_rec:
-                                        stock_rec["reasoning"] = f"[Auto-corrected from BUY to HOLD due to allocation constraints] {stock_rec['reasoning']}"
-                                    fixed_count += 1
+                                    # Check if it's a new stock (should be removed) or existing (convert to HOLD)
+                                    if ticker in self.new_stocks:
+                                        logger.warning(f"Removing BUY+$0 violation for NEW stock {ticker}")
+                                        recommendations_to_remove.append(idx)
+                                        fixed_count += 1
+                                    elif ticker in self.existing_stocks:
+                                        logger.warning(f"Converting BUY+$0 to HOLD for EXISTING stock {ticker}")
+                                        stock_rec["recommendation"] = "HOLD"
+                                        stock_rec["conviction_level"] = "N/A"
+                                        if "reasoning" in stock_rec:
+                                            stock_rec["reasoning"] = f"[Auto-corrected from BUY to HOLD due to allocation constraints] {stock_rec['reasoning']}"
+                                        fixed_count += 1
+
+                            # Remove new stocks with BUY+$0 (in reverse order to maintain indices)
+                            for idx in sorted(recommendations_to_remove, reverse=True):
+                                removed = individual_recommendations.pop(idx)
+                                logger.info(f"Removed new stock {removed.get('ticker')} with BUY+$0")
+
+                            # Step 2: Deduplicate recommendations (same ticker appearing multiple times)
+                            ticker_map = {}  # ticker -> best recommendation
+                            priority = {"SELL": 3, "BUY": 2, "HOLD": 1}  # SELL > BUY > HOLD
+
+                            for stock_rec in individual_recommendations:
+                                ticker = stock_rec.get("ticker", "")
+                                rec_type = stock_rec.get("recommendation", "HOLD")
+
+                                if ticker in ticker_map:
+                                    # Duplicate found - keep the higher priority recommendation
+                                    existing_rec = ticker_map[ticker]
+                                    existing_priority = priority.get(existing_rec.get("recommendation", "HOLD"), 0)
+                                    new_priority = priority.get(rec_type, 0)
+
+                                    if new_priority > existing_priority:
+                                        logger.warning(f"Duplicate {ticker} found: Replacing {existing_rec.get('recommendation')} with {rec_type}")
+                                        ticker_map[ticker] = stock_rec
+                                    else:
+                                        logger.warning(f"Duplicate {ticker} found: Keeping {existing_rec.get('recommendation')} over {rec_type}")
+                                else:
+                                    ticker_map[ticker] = stock_rec
+
+                            # Replace recommendations with deduplicated list
+                            individual_recommendations = list(ticker_map.values())
+                            parsed_json["individual_stock_recommendations"] = individual_recommendations
+
+                            # Step 3: Validate weight distribution (professional analysis requires varied allocations)
+                            buy_recommendations = [r for r in individual_recommendations if r.get("recommendation") == "BUY"]
+                            if len(buy_recommendations) >= 3:  # Only validate if 3+ BUY recommendations
+                                # Extract investment amounts
+                                buy_amounts = []
+                                for rec in buy_recommendations:
+                                    amount_str = rec.get("investment_amount", "$0").replace("$", "").replace(",", "").strip()
+                                    try:
+                                        buy_amounts.append(float(amount_str))
+                                    except:
+                                        buy_amounts.append(0.0)
+
+                                # CRITICAL: If ALL stocks have identical amounts → REJECT (immature analysis)
+                                unique_amounts = set(buy_amounts)
+                                if len(unique_amounts) == 1 and buy_amounts[0] > 0:
+                                    logger.error(f"REJECTED: All {len(buy_amounts)} BUY recommendations have identical amount ${buy_amounts[0]:.2f} - this indicates immature analysis without proper conviction differentiation")
+                                    if attempt < max_retries - 1:
+                                        logger.info("Forcing retry to get professional weight distribution based on conviction levels")
+                                        continue  # Force retry
+                                    else:
+                                        logger.error(f"Failed to get varied weight distribution after {max_retries} attempts - returning response anyway")
+
+                                # Check if too many stocks have the same amount (>80% threshold for warning)
+                                if len(buy_amounts) >= 5:  # Only check for larger portfolios
+                                    amount_counts = {}
+                                    for amount in buy_amounts:
+                                        amount_counts[amount] = amount_counts.get(amount, 0) + 1
+
+                                    max_same_amount = max(amount_counts.values())
+                                    threshold = int(len(buy_amounts) * 0.8)
+                                    if max_same_amount >= threshold:
+                                        logger.warning(f"WARNING: {max_same_amount} out of {len(buy_amounts)} stocks have the same allocation - weight distribution appears generic")
+
+                                logger.info(f"Weight distribution: {len(unique_amounts)} unique allocation amounts for {len(buy_amounts)} BUY recommendations")
 
                             if fixed_count > 0:
-                                logger.info(f"Auto-corrected {fixed_count} BUY+$0 violations to HOLD")
+                                logger.info(f"Auto-corrected {fixed_count} BUY+$0 violations")
+                            logger.info(f"Final recommendations after deduplication: {len(individual_recommendations)} stocks")
+
+                            # Step 4: Sync allocation_breakdown with deduplicated recommendations
+                            allocation_breakdown = parsed_json.get("allocation_breakdown", [])
+                            buy_tickers = {r.get("ticker") for r in buy_recommendations}
+
+                            # Remove allocations for stocks that aren't in BUY recommendations
+                            valid_allocations = []
+                            for allocation in allocation_breakdown:
+                                ticker = allocation.get("ticker", "")
+                                if ticker in buy_tickers:
+                                    valid_allocations.append(allocation)
+                                else:
+                                    logger.warning(f"Removing allocation for {ticker} as it's not in BUY recommendations")
+
+                            # Deduplicate allocation_breakdown (keep last occurrence)
+                            allocation_map = {}
+                            for allocation in valid_allocations:
+                                ticker = allocation.get("ticker", "")
+                                allocation_map[ticker] = allocation
+
+                            parsed_json["allocation_breakdown"] = list(allocation_map.values())
+                            logger.info(f"Synced allocation_breakdown: {len(parsed_json['allocation_breakdown'])} entries")
+
+                            # Step 5: Final validation - ensure BUY amounts match allocation_breakdown
+                            allocation_total = 0.0
+                            for allocation in parsed_json["allocation_breakdown"]:
+                                amount_str = allocation.get("investment_amount", "$0").replace("$", "").replace(",", "").strip()
+                                try:
+                                    allocation_total += float(amount_str)
+                                except:
+                                    pass
+
+                            logger.info(f"Total BUY allocations: ${allocation_total:.2f} (Budget: ${float(self.investment_amount) if self.investment_amount.replace('.','').isdigit() else 0:.2f})")
 
                             # Return the validated JSON string
                             logger.info(f"Successfully validated JSON response")
@@ -650,14 +776,23 @@ STOCK ANALYSIS DATA:
 
                 except Exception as llm_error:
                     logger.error(f"LLM API error for portfolio analysis (attempt {attempt + 1}): {str(llm_error)}")
-                    if attempt == max_retries - 1:
-                        return json.dumps({"error": f"LLM API error: {str(llm_error)}"})
+                    error_str = str(llm_error).lower()
+
+                    # Check if it's a token limit error - retry with adjusted content
+                    if "token" in error_str and "limit" in error_str:
+                        logger.warning(f"Token limit exceeded on attempt {attempt + 1}, will retry")
+                        if attempt < max_retries - 1:
+                            continue  # Retry
 
                     # Check if it's a quota/rate limit error
-                    error_str = str(llm_error).lower()
-                    if "quota" in error_str or "rate" in error_str or "limit" in error_str:
-                        logger.warning(f"Rate limit detected for portfolio analysis, increasing delay")
+                    if "quota" in error_str or "rate" in error_str:
+                        logger.warning(f"Rate/quota limit detected for portfolio analysis, increasing delay")
                         base_delay = min(base_delay * 2, 10.0)  # Cap at 10 seconds
+                        if attempt < max_retries - 1:
+                            continue  # Retry
+
+                    if attempt == max_retries - 1:
+                        return json.dumps({"error": f"LLM API error: {str(llm_error)}"})
 
         except Exception as e:
             error_msg = f"Error generating portfolio recommendations: {str(e)}"
@@ -1145,6 +1280,10 @@ body {{ font-family: Arial, sans-serif; padding: 20px; }}
             new_stocks = stocks_data.get("new_stocks", [])
             all_stocks = existing_stocks + new_stocks
 
+            # Store in instance variables for validation
+            self.existing_stocks = existing_stocks
+            self.new_stocks = new_stocks
+
             logger.info(f"Extracted {len(existing_stocks)} existing stocks and {len(new_stocks)} new stocks")
             logger.info(f"Context for analysis - User ID: {self.user_id}, Session ID: {self.session_id}, Email: {self.email_id}, Investment Amount: {self.investment_amount}")
 
@@ -1233,22 +1372,61 @@ body {{ font-family: Arial, sans-serif; padding: 20px; }}
                 entry_prices = self.stock_current_prices.copy()
                 logger.info(f"Using {len(entry_prices)} current prices extracted during analysis")
 
-                # Add entry_price to individual stock recommendations (for BUY and SELL)
+                # Add entry_price and number_of_shares to individual stock recommendations
                 individual_recommendations = recommendations_dict.get("individual_stock_recommendations", [])
                 prices_added = 0
+                shares_added = 0
                 for stock_rec in individual_recommendations:
                     ticker = stock_rec.get("ticker")
                     recommendation = stock_rec.get("recommendation", "")
 
                     # Add entry_price to BUY and SELL recommendations
                     if recommendation in ["BUY", "SELL"] and ticker in entry_prices:
-                        stock_rec["entry_price"] = f"${entry_prices[ticker]:.2f}"
-                        logger.info(f"Added entry price ${entry_prices[ticker]:.2f} to {recommendation} recommendation for {ticker}")
+                        current_price = entry_prices[ticker]
+                        stock_rec["entry_price"] = f"${current_price:.2f}"
+                        logger.info(f"Added entry price ${current_price:.2f} to {recommendation} recommendation for {ticker}")
                         prices_added += 1
+
+                        # Calculate and add number of shares for BUY recommendations
+                        if recommendation == "BUY":
+                            investment_amount_str = stock_rec.get("investment_amount", "$0")
+                            try:
+                                # Parse investment amount (remove $ and convert to float)
+                                investment_value = float(investment_amount_str.replace("$", "").replace(",", ""))
+                                if investment_value > 0 and current_price > 0:
+                                    number_of_shares = investment_value / current_price
+                                    stock_rec["number_of_shares"] = f"{number_of_shares:.4f} shares"
+                                    logger.info(f"Calculated {number_of_shares:.4f} shares for {ticker} (${investment_value:.2f} / ${current_price:.2f})")
+                                    shares_added += 1
+                                else:
+                                    logger.warning(f"Invalid investment amount or price for {ticker}: amount=${investment_value}, price=${current_price}")
+                            except (ValueError, AttributeError) as e:
+                                logger.error(f"Error calculating shares for {ticker}: {e}")
                     elif recommendation in ["BUY", "SELL"] and ticker not in entry_prices:
                         logger.warning(f"No entry price available for {recommendation} recommendation: {ticker}")
 
                 logger.info(f"Added entry prices to {prices_added} BUY/SELL recommendations")
+                logger.info(f"Added number of shares to {shares_added} BUY recommendations")
+
+                # Add number of shares to allocation_breakdown
+                allocation_breakdown = recommendations_dict.get("allocation_breakdown", [])
+                allocation_shares_added = 0
+                for allocation in allocation_breakdown:
+                    ticker = allocation.get("ticker")
+                    if ticker in entry_prices:
+                        current_price = entry_prices[ticker]
+                        investment_amount_str = allocation.get("investment_amount", "$0")
+                        try:
+                            # Parse investment amount (remove $ and convert to float)
+                            investment_value = float(investment_amount_str.replace("$", "").replace(",", ""))
+                            if investment_value > 0 and current_price > 0:
+                                number_of_shares = investment_value / current_price
+                                allocation["number_of_shares"] = f"{number_of_shares:.4f} shares"
+                                logger.info(f"Added {number_of_shares:.4f} shares to allocation breakdown for {ticker}")
+                                allocation_shares_added += 1
+                        except (ValueError, AttributeError) as e:
+                            logger.error(f"Error calculating shares for allocation breakdown {ticker}: {e}")
+                logger.info(f"Added number of shares to {allocation_shares_added} items in allocation breakdown")
 
                 # Add entry prices and recommendation timestamp to the recommendations
                 recommendations_dict["entry_prices"] = entry_prices

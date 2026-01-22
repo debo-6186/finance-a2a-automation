@@ -576,21 +576,25 @@ def read_portfolio_document(session_id: str = "", user_name: str = "", input_for
         return f"Error extracting text: {e}", ""
 
 
-def validate_exchange_consistency(holdings_data: list) -> Tuple[bool, str]:
+def validate_exchange_consistency(holdings_data: list, user_market_preference: str = None) -> Tuple[bool, str, str]:
     """
-    Validates that all stocks belong to the same exchange (US or India) and rejects crypto/other assets.
+    Validates that all assets (stocks and ETFs) belong to the same country and rejects crypto/unsupported assets.
+    Allows ETFs and index funds from the same country as stocks (e.g., US stocks + US ETFs is valid).
+    Also validates against user's market preference if provided.
 
     Args:
         holdings_data: List of holdings dictionaries with ticker symbols
+        user_market_preference: User's chosen market preference ("US" or "INDIA"), if set
 
     Returns:
-        Tuple of (is_valid, message)
-        - is_valid: True if all stocks are from same exchange and no crypto, False otherwise
+        Tuple of (is_valid, message, primary_exchange)
+        - is_valid: True if all assets are from same country and no crypto/unsupported assets, False otherwise
         - message: Explanation message
+        - primary_exchange: The primary country/exchange ("US", "India", "Mixed", or "Unknown")
     """
     try:
         if not holdings_data:
-            return True, "No holdings to validate"
+            return True, "No holdings to validate", "Unknown"
 
         logger.info(f"Validating exchange consistency for {len(holdings_data)} holdings")
 
@@ -602,7 +606,7 @@ def validate_exchange_consistency(holdings_data: list) -> Tuple[bool, str]:
             api_key = os.getenv("GOOGLE_API_KEY")
             if not api_key:
                 logger.error("No GOOGLE_API_KEY found for exchange validation")
-                return False, "**Error**: Google API key not configured for validation."
+                return False, "**Error**: Google API key not configured for validation.", "Unknown"
             client = genai.Client(api_key=api_key)
             logger.info("Using Google AI API for exchange validation")
 
@@ -614,30 +618,34 @@ def validate_exchange_consistency(holdings_data: list) -> Tuple[bool, str]:
         system_prompt = """You are an expert financial analyst specializing in stock exchange classification.
 
 Your task is to analyze a list of stock tickers and determine:
-1. Which stock exchange each ticker belongs to (US or India)
-2. Whether any tickers are cryptocurrencies or other non-stock assets
-3. Whether all stocks belong to the SAME exchange
+1. Which stock exchange/country each ticker belongs to (US or India)
+2. Whether any tickers are cryptocurrencies or other unsupported assets
+3. Whether all assets belong to the SAME country/exchange
 
 EXCHANGE IDENTIFICATION RULES:
-- **US Stocks**: Ticker symbols without country suffixes (e.g., AAPL, GOOGL, MSFT, TSLA, AMZN)
+- **US Assets**: Ticker symbols without country suffixes (e.g., AAPL, GOOGL, MSFT, TSLA, AMZN, VOO, SPY, QQQ)
+  - Includes individual stocks AND ETFs/index funds
   - Usually 1-5 uppercase letters
   - Listed on NYSE, NASDAQ, etc.
+  - Examples: AAPL (stock), VOO (ETF), SPY (ETF), QQQ (ETF)
 
-- **Indian Stocks**: Ticker symbols with .NS (NSE) or .BO (BSE) suffixes (e.g., RELIANCE.NS, TCS.BO, INFY.NS)
+- **Indian Assets**: Ticker symbols with .NS (NSE) or .BO (BSE) suffixes (e.g., RELIANCE.NS, TCS.BO, INFY.NS)
+  - Includes individual stocks AND ETFs/index funds from India
   - May also be Indian company names without suffixes that are clearly Indian companies
   - Listed on NSE (National Stock Exchange) or BSE (Bombay Stock Exchange)
+  - Examples: RELIANCE.NS (stock), NIFTYBEES.NS (ETF)
 
 - **Cryptocurrencies**: BTC, ETH, DOGE, BNB, ADA, SOL, XRP, USDT, USDC, etc.
-  - These are NOT stocks and must be REJECTED
+  - These are NOT supported and must be REJECTED
 
-- **Other Assets**: Commodities, forex, bonds, mutual funds, etc.
-  - These are NOT stocks and must be REJECTED
+- **Other Assets**: Commodities, forex, bonds, etc.
+  - These are NOT supported and must be REJECTED
 
 VALIDATION RULES:
-1. ALL tickers must be valid stocks (no crypto, no commodities, no forex)
-2. ALL tickers must belong to the SAME exchange (all US OR all India)
-3. If tickers are mixed (some US, some India), this is INVALID
-4. If any crypto or non-stock assets are present, this is INVALID
+1. ETFs and index funds are ALLOWED from the same country as stocks (e.g., US stock + US ETF = valid)
+2. ALL assets must belong to the SAME country/exchange (all US OR all India)
+3. Mixing assets from DIFFERENT countries is INVALID (e.g., US stock + Indian stock = invalid)
+4. Cryptocurrencies and unsupported assets must be REJECTED
 
 RESPONSE FORMAT - Return ONLY valid JSON in this EXACT format:
 {
@@ -648,24 +656,31 @@ RESPONSE FORMAT - Return ONLY valid JSON in this EXACT format:
     {"ticker": "GOLD", "type": "commodity", "reason": "Commodities not supported"}
   ],
   "exchange_breakdown": {
-    "us_stocks": ["AAPL", "GOOGL"],
-    "india_stocks": ["RELIANCE.NS", "TCS.BO"],
+    "us_assets": ["AAPL", "VOO", "GOOGL"],
+    "india_assets": ["RELIANCE.NS", "TCS.BO", "NIFTYBEES.NS"],
     "crypto": ["BTC", "ETH"],
     "other": ["GOLD"]
   },
   "message": "Detailed explanation of the validation result"
 }
 
+IMPORTANT NOTES:
+- ETFs like VOO, SPY, QQQ are valid US assets and should be classified as "us_assets"
+- Indian ETFs like NIFTYBEES.NS are valid Indian assets and should be classified as "india_assets"
+- Only flag as invalid if: (1) cryptocurrencies detected, (2) unsupported assets detected, or (3) mixing US and Indian assets
+- Do NOT flag ETFs as "other" or invalid - they belong with their country's assets
+
 Be thorough and accurate in your classification."""
 
-        user_prompt = f"""Analyze these stock tickers and validate their exchange consistency:
+        user_prompt = f"""Analyze these tickers and validate their country/exchange consistency:
 
 Tickers: {tickers_str}
 
 Determine:
-1. Are all these valid stocks (no crypto/commodities)?
-2. Do they all belong to the same exchange (all US or all India)?
-3. Provide detailed breakdown of each ticker.
+1. Are all these valid assets - stocks and/or ETFs (no crypto/commodities/bonds)?
+2. Do they all belong to the same country (all US or all India)?
+3. Remember: ETFs from the same country as stocks are ALLOWED (e.g., AAPL + VOO is valid)
+4. Provide detailed breakdown of each ticker.
 
 Respond in the specified JSON format."""
 
@@ -702,8 +717,33 @@ Respond in the specified JSON format."""
                 logger.info(f"Validation result: valid={is_valid}, exchange={primary_exchange}")
 
                 if is_valid:
+                    # Additional validation: Check against user's market preference if provided
+                    if user_market_preference:
+                        # Normalize the user preference for comparison
+                        user_pref_normalized = user_market_preference.upper()
+                        if user_pref_normalized == "INDIA":
+                            expected_exchange = "India"
+                        elif user_pref_normalized == "US":
+                            expected_exchange = "US"
+                        else:
+                            expected_exchange = None
+
+                        # Validate that portfolio matches user's market preference
+                        if expected_exchange and primary_exchange != expected_exchange:
+                            error_message = "**Invalid Portfolio: Market Preference Mismatch**\n\n"
+                            error_message += f"You selected **{user_market_preference} Market**, but your portfolio contains "
+                            error_message += f"**{primary_exchange}** stocks.\n\n"
+                            error_message += "**Requirement:** All stocks must match your selected market preference.\n"
+                            if expected_exchange == "US":
+                                error_message += "Please provide only US stocks (e.g., AAPL, GOOGL, MSFT, VOO, SPY).\n"
+                            else:
+                                error_message += "Please provide only Indian stocks (e.g., RELIANCE.NS, TCS.BO, INFY.NS).\n"
+
+                            logger.warning(f"Portfolio exchange ({primary_exchange}) doesn't match user preference ({user_market_preference})")
+                            return False, error_message, primary_exchange
+
                     message = f"All stocks validated successfully. Exchange: {primary_exchange}"
-                    return True, message
+                    return True, message, primary_exchange
                 else:
                     # Build detailed error message
                     message = "**Invalid Portfolio: Exchange Consistency Error**\n\n"
@@ -719,17 +759,17 @@ Respond in the specified JSON format."""
                         message += "\n"
 
                     # Check for mixed exchanges
-                    us_stocks = exchange_breakdown.get("us_stocks", [])
-                    india_stocks = exchange_breakdown.get("india_stocks", [])
+                    us_assets = exchange_breakdown.get("us_assets", [])
+                    india_assets = exchange_breakdown.get("india_assets", [])
 
-                    if us_stocks and india_stocks:
-                        message += "**Mixed Exchanges Detected:**\n"
-                        message += f"• US stocks: {', '.join(us_stocks)}\n"
-                        message += f"• Indian stocks: {', '.join(india_stocks)}\n\n"
-                        message += "**Requirement:** All stocks must be from the SAME exchange.\n"
+                    if us_assets and india_assets:
+                        message += "**Mixed Countries Detected:**\n"
+                        message += f"• US assets (stocks/ETFs): {', '.join(us_assets)}\n"
+                        message += f"• Indian assets (stocks/ETFs): {', '.join(india_assets)}\n\n"
+                        message += "**Requirement:** All assets must be from the SAME country.\n"
                         message += "Please provide either:\n"
-                        message += "- All US stocks only (e.g., AAPL, GOOGL, MSFT), OR\n"
-                        message += "- All Indian stocks only (e.g., RELIANCE.NS, TCS.BO, INFY.NS)\n"
+                        message += "- All US assets only (e.g., AAPL, GOOGL, VOO, SPY), OR\n"
+                        message += "- All Indian assets only (e.g., RELIANCE.NS, TCS.BO, NIFTYBEES.NS)\n"
 
                     # Check for crypto
                     crypto = exchange_breakdown.get("crypto", [])
@@ -746,31 +786,70 @@ Respond in the specified JSON format."""
                     if llm_message:
                         message += f"\n**Details:** {llm_message}"
 
-                    return False, message
+                    return False, message, primary_exchange
 
             except json.JSONDecodeError as e:
                 logger.error(f"Failed to parse exchange validation JSON: {e}")
                 logger.error(f"Response text: {response_text}")
                 # If we can't parse, be lenient and allow through (backward compatibility)
-                return True, "Could not fully validate exchange consistency, proceeding with analysis."
+                return True, "Could not fully validate exchange consistency, proceeding with analysis.", "Unknown"
         else:
             logger.error("No response from LLM for exchange validation")
             # If no response, be lenient and allow through
-            return True, "Could not validate exchange consistency, proceeding with analysis."
+            return True, "Could not validate exchange consistency, proceeding with analysis.", "Unknown"
 
     except Exception as e:
         logger.error(f"Error validating exchange consistency: {e}")
         # On error, be lenient and allow through
-        return True, f"Validation error, proceeding with analysis: {str(e)}"
+        return True, f"Validation error, proceeding with analysis: {str(e)}", "Unknown"
 
 
-def extract_stock_tickers_from_text(portfolio_text: str) -> str:
+def append_exchange_suffix(holdings_data: list, primary_exchange: str) -> list:
+    """
+    Appends appropriate exchange suffix to stock tickers based on the primary exchange.
+
+    Args:
+        holdings_data: List of holdings dictionaries with ticker symbols
+        primary_exchange: The primary exchange ("US", "India", etc.)
+
+    Returns:
+        Modified holdings_data with exchange suffixes appended
+    """
+    try:
+        if not holdings_data or not primary_exchange:
+            return holdings_data
+
+        logger.info(f"Appending exchange suffix for {primary_exchange} stocks")
+
+        # Only modify if all stocks are from India
+        if primary_exchange == "India":
+            for holding in holdings_data:
+                ticker = holding.get('ticker', '')
+                if ticker:
+                    # Check if ticker already has .NS or .BO suffix
+                    if not ticker.endswith('.NS') and not ticker.endswith('.BO'):
+                        # Append .NS suffix for NSE (National Stock Exchange)
+                        holding['ticker'] = f"{ticker}.NS"
+                        logger.info(f"Added .NS suffix: {ticker} -> {holding['ticker']}")
+
+        # For US stocks, no suffix needed (US tickers don't have suffixes)
+        # For foreign/other exchanges, keep as is
+
+        return holdings_data
+
+    except Exception as e:
+        logger.error(f"Error appending exchange suffix: {e}")
+        return holdings_data
+
+
+def extract_stock_tickers_from_text(portfolio_text: str, user_market_preference: str = None) -> str:
     """
     Extracts stock tickers from portfolio text using LLM.
     Works with text from PDFs, images, or direct text input.
 
     Args:
         portfolio_text: The portfolio text (from any source)
+        user_market_preference: User's chosen market preference ("US" or "INDIA"), if set
 
     Returns:
         Formatted string with list of stock tickers found and their allocation percentages
@@ -793,17 +872,19 @@ def extract_stock_tickers_from_text(portfolio_text: str) -> str:
         # System prompt for stock ticker extraction with share quantities
         system_prompt = """You are an expert financial analyst specializing in analyzing portfolio data and extracting stock holdings information.
 
-Your task is to carefully analyze portfolio text and extract ALL stock holdings with as much detail as possible.
+Your task is to carefully analyze portfolio text and extract ALL stock and ETF holdings with as much detail as possible.
 
 EXTRACTION RULES:
 1. Extract valid stock ticker symbols (1-5 characters, letters only)
-2. Convert company names to ticker symbols (e.g., "Apple Inc." → "AAPL")
-3. Include both individual stocks and ETFs
-4. Convert all tickers to uppercase
-5. Extract SHARE QUANTITIES when explicitly mentioned
-6. Extract dollar amounts invested when mentioned
-7. Extract percentage allocations when mentioned
-8. Do NOT include common words, currency codes, or non-stock identifiers
+2. Extract ETF ticker symbols (e.g., VOO, SPY, QQQ, VTI, NIFTYBEES.NS)
+3. Convert company names to ticker symbols (e.g., "Apple Inc." → "AAPL")
+4. Include BOTH individual stocks AND ETFs/index funds
+5. Convert all tickers to uppercase
+6. Extract SHARE QUANTITIES when explicitly mentioned
+7. Extract dollar amounts invested when mentioned
+8. Extract percentage allocations when mentioned
+9. Do NOT include common words, currency codes, or non-stock identifiers
+10. Do NOT include cryptocurrencies, commodities, or bonds
 
 PATTERNS TO LOOK FOR:
 - Share quantities: "10.5 shares of AAPL", "GOOGL: 25 shares", "15.3 MSFT"
@@ -917,17 +998,23 @@ Provide only the comma-separated ticker list with percentages as specified."""
 
         logger.info(f"LLM found {len(holdings_data)} holdings")
 
-        # VALIDATE EXCHANGE CONSISTENCY - Must all be from same exchange (US or India), no crypto
-        is_valid, validation_message = validate_exchange_consistency(holdings_data)
+        # VALIDATE EXCHANGE CONSISTENCY - Must all be from same country (US or India), stocks + ETFs allowed from same country, no crypto
+        # Also validates against user's market preference if provided
+        is_valid, validation_message, primary_exchange = validate_exchange_consistency(holdings_data, user_market_preference)
         if not is_valid:
             logger.warning(f"Exchange validation failed: {validation_message}")
             return validation_message
 
         logger.info(f"Exchange validation passed: {validation_message}")
 
+        # APPEND EXCHANGE SUFFIX - Add .NS for Indian stocks, keep US stocks as is
+        if primary_exchange and primary_exchange != "Unknown":
+            holdings_data = append_exchange_suffix(holdings_data, primary_exchange)
+            logger.info(f"Applied exchange suffix for {primary_exchange} stocks")
+
         # Format the result with detailed holdings information
         result = f"**Portfolio Holdings Extracted:**\n\n"
-        result += f"Total stocks identified: {len(holdings_data)}\n\n"
+        result += f"Total assets identified: {len(holdings_data)}\n\n"
 
         # Separate holdings into those with shares and those without
         with_shares = [h for h in holdings_data if h.get('shares', 0) > 0]
