@@ -52,6 +52,7 @@ class User(Base):
     contact_number = Column(String, nullable=True)
     country_code = Column(String, nullable=True, default='+1')
     paid_user = Column(Boolean, default=False, nullable=False)
+    message_credits = Column(Integer, default=30, nullable=False)
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
     
@@ -373,6 +374,126 @@ def can_user_send_message(db: Session, user_id: str) -> bool:
     except SQLAlchemyError as e:
         logger.error(f"Error checking user message limit for {user_id}: {e}")
         return False
+
+
+def can_user_send_message_credits(db: Session, user_id: str) -> tuple[bool, str]:
+    """
+    Check if user has credits remaining for free users.
+    Returns (can_send: bool, error_message: str)
+    """
+    try:
+        # Get user to check if paid and check credits
+        user = db.query(User).filter(User.id == user_id).first()
+        if not user:
+            return False, "User not found"
+
+        # Paid users have unlimited messages
+        if user.paid_user:
+            return True, ""
+
+        # Free users: check user credits
+        if user.message_credits <= 0:
+            return False, "Message credits exhausted. Click 'Add Credits' to continue."
+
+        return True, ""
+    except SQLAlchemyError as e:
+        logger.error(f"Error checking user credits for {user_id}: {e}")
+        return False, "Error checking user credits"
+
+
+def decrement_user_credits(db: Session, user_id: str) -> bool:
+    """
+    Decrement message credits for free users.
+    Returns True if successful, False otherwise.
+    """
+    try:
+        logger.info(f"[CREDITS] decrement_user_credits called for user {user_id}")
+
+        # Get user to check if paid
+        user = db.query(User).filter(User.id == user_id).first()
+        if not user:
+            logger.warning(f"[CREDITS] User {user_id} not found")
+            return False
+
+        logger.info(f"[CREDITS] User {user_id} - paid_user: {user.paid_user}, current credits: {user.message_credits}")
+
+        # Skip for paid users
+        if user.paid_user:
+            logger.info(f"[CREDITS] User {user_id} is paid, skipping credit decrement")
+            return True
+
+        # Decrement credits for free users
+        if user.message_credits > 0:
+            old_credits = user.message_credits
+            user.message_credits -= 1
+            user.updated_at = datetime.utcnow()
+            db.commit()
+            db.refresh(user)
+            logger.info(f"[CREDITS] Successfully decremented credits for user {user_id}. Before: {old_credits}, After: {user.message_credits}")
+        else:
+            logger.warning(f"[CREDITS] User {user_id} has no credits remaining: {user.message_credits}")
+
+        return True
+    except SQLAlchemyError as e:
+        db.rollback()
+        logger.error(f"[CREDITS] Error decrementing user credits for {user_id}: {e}")
+        return False
+
+
+def add_user_credits(db: Session, user_id: str, credits_to_add: int = 30) -> tuple[bool, int]:
+    """
+    Add credits to a user account.
+    Returns (success: bool, new_total: int)
+    """
+    try:
+        user = db.query(User).filter(User.id == user_id).first()
+
+        if not user:
+            return False, 0
+
+        user.message_credits += credits_to_add
+        user.updated_at = datetime.utcnow()
+        db.commit()
+        db.refresh(user)
+
+        logger.info(f"Added {credits_to_add} credits to user {user_id}. New total: {user.message_credits}")
+        return True, user.message_credits
+    except SQLAlchemyError as e:
+        db.rollback()
+        logger.error(f"Error adding credits to user {user_id}: {e}")
+        return False, 0
+
+
+def can_session_upload_file(db: Session, session_id: str, user_id: str) -> tuple[bool, str]:
+    """
+    Check if session can upload a file (1 per session limit for free users).
+    Returns (can_upload: bool, error_message: str)
+    """
+    try:
+        # Get user to check if paid
+        user = db.query(User).filter(User.id == user_id).first()
+        if not user:
+            return False, "User not found"
+
+        # Paid users have unlimited uploads
+        if user.paid_user:
+            return True, ""
+
+        # Free users: check if file already uploaded
+        session = db.query(ConversationSession).filter(
+            ConversationSession.id == session_id
+        ).first()
+
+        if not session:
+            return False, "Session not found"
+
+        if session.portfolio_statement_uploaded:
+            return False, "Only one file upload allowed per session. Please start a new session to upload another file."
+
+        return True, ""
+    except SQLAlchemyError as e:
+        logger.error(f"Error checking file upload limit for {session_id}: {e}")
+        return False, "Error checking file upload limit"
 
 
 def update_agent_state(db: Session, session_id: str, agent_name: str, state_data: str) -> AgentState:

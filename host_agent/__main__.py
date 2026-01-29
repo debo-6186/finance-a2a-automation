@@ -34,7 +34,8 @@ from database import (
     User, ConversationSession, ConversationMessage, FREE_USER_MESSAGE_LIMIT,
     get_stock_recommendation, get_user_stock_recommendations,
     can_user_generate_report, update_user_max_reports, add_user_credits,
-    set_user_whitelist_status, get_or_create_whitelist_entry
+    set_user_whitelist_status, get_or_create_whitelist_entry,
+    can_user_send_message_credits, decrement_user_credits, can_session_upload_file
 )
 from user_api import (
     get_user_profile, get_user_statistics,
@@ -187,15 +188,24 @@ def validate_firebase_token(id_token: str) -> dict:
         # Verify the Firebase ID token
         decoded_token = firebase_auth.verify_id_token(id_token)
         logger.info(f"[TOKEN] Firebase token verification successful for UID: {decoded_token.get('uid', 'unknown')}")
-        
+
+        # Get the user record from Firebase Admin SDK to retrieve displayName
+        try:
+            user_record = firebase_auth.get_user(decoded_token['uid'])
+            display_name = user_record.display_name or decoded_token.get('name', 'User')
+            logger.info(f"[TOKEN] Retrieved user record, displayName: {display_name}")
+        except Exception as e:
+            logger.warning(f"[TOKEN] Could not retrieve user record: {e}, using token name")
+            display_name = decoded_token.get('name', 'User')
+
         result = {
             'uid': decoded_token['uid'],
             'email': decoded_token.get('email', 'user@example.com'),
             'email_verified': decoded_token.get('email_verified', False),
-            'name': decoded_token.get('name', 'User'),
+            'name': display_name,
             'picture': decoded_token.get('picture')
         }
-        logger.info(f"[TOKEN] Returning user info: uid={result['uid']}, email={result['email']}")
+        logger.info(f"[TOKEN] Returning user info: uid={result['uid']}, email={result['email']}, name={result['name']}")
         return result
             
     except Exception as e:
@@ -633,6 +643,14 @@ async def chat(request: Request, current_user: dict = Depends(get_current_user))
                 detail=f"Message limit reached. Free users are limited to {FREE_USER_MESSAGE_LIMIT} messages. You have sent {message_count} messages. Upgrade to paid to continue."
             )
 
+        # Check user credits
+        can_send, error_msg = can_user_send_message_credits(db, final_user_id)
+        if not can_send:
+            raise HTTPException(
+                status_code=429,
+                detail=error_msg
+            )
+
         # Get or create session
         session = get_session(db, session_id)
         if not session:
@@ -668,6 +686,14 @@ async def chat(request: Request, current_user: dict = Depends(get_current_user))
         # Handle file upload if present
         file_uploaded = False
         if uploaded_file and hasattr(uploaded_file, 'filename') and uploaded_file.filename:
+            # Check if session can accept file upload (1 per session limit for free users)
+            can_upload, upload_error = can_session_upload_file(db, session_id, final_user_id)
+            if not can_upload:
+                raise HTTPException(
+                    status_code=400,
+                    detail=upload_error
+                )
+
             try:
                 # Validate file type (PDF or image formats)
                 filename_lower = uploaded_file.filename.lower()
@@ -727,7 +753,12 @@ async def chat(request: Request, current_user: dict = Depends(get_current_user))
         
         # Add user message to database
         add_message(db, session_id, final_user_id, "user", final_message)
-        
+
+        # Decrement user credits for free users
+        logger.info(f"[CREDITS] About to call decrement_user_credits for user {final_user_id}")
+        credit_result = decrement_user_credits(db, final_user_id)
+        logger.info(f"[CREDITS] decrement_user_credits returned: {credit_result}")
+
         # Test log to verify code insertion
         logger.info(f"Test log: Starting to process message for session {session_id}, user {final_user_id}")
         # Collect all streaming responses
@@ -961,6 +992,14 @@ async def chat_stream(request: Request):
         # Handle file upload if present
         file_uploaded = False
         if uploaded_file and hasattr(uploaded_file, 'filename') and uploaded_file.filename:
+            # Check if session can accept file upload (1 per session limit for free users)
+            can_upload, upload_error = can_session_upload_file(db, session_id, final_user_id)
+            if not can_upload:
+                raise HTTPException(
+                    status_code=400,
+                    detail=upload_error
+                )
+
             try:
                 # Validate file type (PDF or image formats)
                 filename_lower = uploaded_file.filename.lower()
@@ -1387,6 +1426,48 @@ def upgrade_user_to_paid_endpoint(user_id: str):
 def downgrade_user_to_free_endpoint(user_id: str):
     """Downgrade user to free status."""
     return downgrade_user_to_free(user_id)
+
+
+@app.post("/api/users/add-credits")
+async def add_credits_to_user(
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """
+    Add message credits to the current user's account.
+    For now: adds 30 credits for free.
+    Later: will integrate with Stripe payment.
+    """
+    try:
+        user_id = current_user["uid"]
+        logger.info(f"User {user_id} requesting to add credits")
+
+        # Verify user exists
+        user = db.query(User).filter(User.id == user_id).first()
+        if not user:
+            raise HTTPException(status_code=404, detail="User not found")
+
+        # Add credits (30 for now, will be configurable with payment later)
+        success, new_total = add_user_credits(db, user_id, credits_to_add=30)
+
+        if not success:
+            raise HTTPException(status_code=500, detail="Failed to add credits")
+
+        logger.info(f"Added 30 credits to user {user_id}. New total: {new_total}")
+
+        return {
+            "success": True,
+            "message": "Credits added successfully",
+            "credits_added": 30,
+            "total_credits": new_total,
+            "user_id": user_id
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error adding credits to user {user_id}: {e}")
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 
 # Admin API endpoints for managing user credits and whitelist
