@@ -26,6 +26,8 @@ from google.adk.tools.mcp_tool.mcp_toolset import MCPToolset, StdioConnectionPar
 from mcp import StdioServerParameters
 from config import get_config
 
+from sqlalchemy.orm import Session
+
 from host.agent import HostAgent
 from database import (
     get_db, get_or_create_user, create_session, get_session,

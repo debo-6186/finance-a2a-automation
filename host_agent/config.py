@@ -32,6 +32,10 @@ class Config:
     # Free user message limit
     FREE_USER_MESSAGE_LIMIT = int(os.getenv("FREE_USER_MESSAGE_LIMIT", "300"))
 
+    # User credits configuration
+    SESSION_MESSAGE_CREDITS = int(os.getenv("SESSION_MESSAGE_CREDITS", "30"))
+    CREDITS_PER_PURCHASE = int(os.getenv("CREDITS_PER_PURCHASE", "30"))
+
     # MCP Configuration
     MCP_DIRECTORY = os.getenv("MCP_DIRECTORY", "/Users/debojyotichakraborty/codebase/finhub-mcp")  # Default to local path
 

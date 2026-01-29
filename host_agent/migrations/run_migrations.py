@@ -39,13 +39,29 @@ def run_migration(migration_file: str):
             statements = [stmt.strip() for stmt in sql_content.split(';') if stmt.strip()]
 
             for statement in statements:
-                # Skip comments and empty statements
-                if statement.startswith('--') or not statement:
+                # Remove comment lines from the beginning of statements
+                lines = statement.split('\n')
+                non_comment_lines = [line for line in lines if not line.strip().startswith('--')]
+                clean_statement = '\n'.join(non_comment_lines).strip()
+
+                # Skip empty statements
+                if not clean_statement:
                     continue
 
-                logger.info(f"Executing statement: {statement[:100]}...")
-                conn.execute(text(statement))
-                conn.commit()
+                logger.info(f"Executing statement: {clean_statement[:100]}...")
+                try:
+                    conn.execute(text(clean_statement))
+                    conn.commit()
+                except Exception as stmt_error:
+                    # Check if error is about column already existing
+                    error_msg = str(stmt_error).lower()
+                    if 'already exists' in error_msg or 'duplicate column' in error_msg:
+                        logger.warning(f"Column/object already exists, skipping: {stmt_error}")
+                        conn.rollback()
+                        continue
+                    else:
+                        # Re-raise other errors
+                        raise
 
         logger.info(f"Successfully completed migration: {migration_file}")
         return True
