@@ -376,10 +376,10 @@ def can_user_send_message(db: Session, user_id: str) -> bool:
         return False
 
 
-def can_user_send_message_credits(db: Session, user_id: str) -> tuple[bool, str]:
+def can_user_send_message_credits(db: Session, user_id: str) -> tuple[bool, dict|str]:
     """
     Check if user has credits remaining for free users.
-    Returns (can_send: bool, error_message: str)
+    Returns (can_send: bool, error_message: dict|str)
     """
     try:
         # Get user to check if paid and check credits
@@ -393,7 +393,14 @@ def can_user_send_message_credits(db: Session, user_id: str) -> tuple[bool, str]
 
         # Free users: check user credits
         if user.message_credits <= 0:
-            return False, "Message credits exhausted. Click 'Add Credits' to continue."
+            return False, {
+                "message": "Maximum message limit is reached for free tier. Free users are limited to 30 messages. Add credits to continue.",
+                "payment_required": True,
+                "payment_url": current_config.PAYPAL_CHECKOUT_URL,
+                "credits_per_package": current_config.CREDITS_PER_PURCHASE,
+                "price": current_config.PAYPAL_PRICE_PER_PACKAGE,
+                "currency": current_config.PAYPAL_CURRENCY
+            }
 
         return True, ""
     except SQLAlchemyError as e:

@@ -493,21 +493,6 @@ async def init_chat(request: Request, current_user: dict = Depends(get_current_u
             # Get or create user
             user = get_or_create_user(db, user_id)
 
-            # Check if user can send messages
-            if not can_user_send_message(db, user_id):
-                config = get_config()
-                raise HTTPException(
-                    status_code=429,
-                    detail=json.dumps({
-                        "message": "Maximum message limit is reached for free tier. Free users are limited to 30 messages. Add credits to continue.",
-                        "payment_required": True,
-                        "payment_url": config.PAYPAL_CHECKOUT_URL,
-                        "credits_per_package": config.CREDITS_PER_PURCHASE,
-                        "price": config.PAYPAL_PRICE_PER_PACKAGE,
-                        "currency": config.PAYPAL_CURRENCY
-                    })
-                )
-
             # Get or create session
             session = get_session(db, session_id)
             if not session:
@@ -643,21 +628,6 @@ async def chat(request: Request, current_user: dict = Depends(get_current_user))
 
         # Get or create user
         user = get_or_create_user(db, final_user_id, paid_user=final_paid_user)
-
-        # Check if user can send more messages
-        if not can_user_send_message(db, final_user_id):
-            config = get_config()
-            raise HTTPException(
-                status_code=429,
-                detail=json.dumps({
-                    "message": "Maximum message limit is reached for free tier. Free users are limited to 30 messages. Add credits to continue.",
-                    "payment_required": True,
-                    "payment_url": config.PAYPAL_CHECKOUT_URL,
-                    "credits_per_package": config.CREDITS_PER_PURCHASE,
-                    "price": config.PAYPAL_PRICE_PER_PACKAGE,
-                    "currency": config.PAYPAL_CURRENCY
-                })
-            )
 
         # Check user credits
         can_send, error_msg = can_user_send_message_credits(db, final_user_id)
@@ -965,19 +935,12 @@ async def chat_stream(request: Request):
         # Get or create user
         user = get_or_create_user(db, final_user_id, paid_user=final_paid_user)
 
-        # Check if user can send more messages
-        if not can_user_send_message(db, final_user_id):
-            config = get_config()
+        # Check user credits
+        can_send, error_msg = can_user_send_message_credits(db, final_user_id)
+        if not can_send:
             raise HTTPException(
                 status_code=429,
-                detail=json.dumps({
-                    "message": "Maximum message limit is reached for free tier. Free users are limited to 30 messages. Add credits to continue.",
-                    "payment_required": True,
-                    "payment_url": config.PAYPAL_CHECKOUT_URL,
-                    "credits_per_package": config.CREDITS_PER_PURCHASE,
-                    "price": config.PAYPAL_PRICE_PER_PACKAGE,
-                    "currency": config.PAYPAL_CURRENCY
-                })
+                detail=error_msg
             )
 
         # Get or create session
