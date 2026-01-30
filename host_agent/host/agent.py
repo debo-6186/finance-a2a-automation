@@ -1380,7 +1380,7 @@ Return ONLY a JSON array of uppercase ticker symbols. If a name is already a tic
             perplexity_api_key = os.getenv("PERPLEXITY_API_KEY")
             if not perplexity_api_key:
                 logger.error("PERPLEXITY_API_KEY not found in environment variables")
-                return "I apologize, but I'm unable to answer general stock market questions at the moment due to a configuration issue. Please try asking about your portfolio analysis instead."
+                return "I apologize, I can only answer questions related to your portfolio analysis. Please try asking about your portfolio analysis instead."
 
             # Use OpenAI client with Perplexity base URL
             from openai import OpenAI

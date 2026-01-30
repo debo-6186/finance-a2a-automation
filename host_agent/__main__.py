@@ -495,10 +495,17 @@ async def init_chat(request: Request, current_user: dict = Depends(get_current_u
 
             # Check if user can send messages
             if not can_user_send_message(db, user_id):
-                message_count = get_user_message_count(db, user_id)
+                config = get_config()
                 raise HTTPException(
                     status_code=429,
-                    detail=f"Message limit reached. Free users are limited to {FREE_USER_MESSAGE_LIMIT} messages."
+                    detail=json.dumps({
+                        "message": "Maximum message limit is reached for free tier. Free users are limited to 30 messages. Add credits to continue.",
+                        "payment_required": True,
+                        "payment_url": config.PAYPAL_CHECKOUT_URL,
+                        "credits_per_package": config.CREDITS_PER_PURCHASE,
+                        "price": config.PAYPAL_PRICE_PER_PACKAGE,
+                        "currency": config.PAYPAL_CURRENCY
+                    })
                 )
 
             # Get or create session
@@ -639,10 +646,17 @@ async def chat(request: Request, current_user: dict = Depends(get_current_user))
 
         # Check if user can send more messages
         if not can_user_send_message(db, final_user_id):
-            message_count = get_user_message_count(db, final_user_id)
+            config = get_config()
             raise HTTPException(
                 status_code=429,
-                detail=f"Message limit reached. Free users are limited to {FREE_USER_MESSAGE_LIMIT} messages. You have sent {message_count} messages. Upgrade to paid to continue."
+                detail=json.dumps({
+                    "message": "Maximum message limit is reached for free tier. Free users are limited to 30 messages. Add credits to continue.",
+                    "payment_required": True,
+                    "payment_url": config.PAYPAL_CHECKOUT_URL,
+                    "credits_per_package": config.CREDITS_PER_PURCHASE,
+                    "price": config.PAYPAL_PRICE_PER_PACKAGE,
+                    "currency": config.PAYPAL_CURRENCY
+                })
             )
 
         # Check user credits
@@ -953,10 +967,17 @@ async def chat_stream(request: Request):
 
         # Check if user can send more messages
         if not can_user_send_message(db, final_user_id):
-            message_count = get_user_message_count(db, final_user_id)
+            config = get_config()
             raise HTTPException(
                 status_code=429,
-                detail=f"Message limit reached. Free users are limited to {FREE_USER_MESSAGE_LIMIT} messages. You have sent {message_count} messages. Upgrade to paid to continue."
+                detail=json.dumps({
+                    "message": "Maximum message limit is reached for free tier. Free users are limited to 30 messages. Add credits to continue.",
+                    "payment_required": True,
+                    "payment_url": config.PAYPAL_CHECKOUT_URL,
+                    "credits_per_package": config.CREDITS_PER_PURCHASE,
+                    "price": config.PAYPAL_PRICE_PER_PACKAGE,
+                    "currency": config.PAYPAL_CURRENCY
+                })
             )
 
         # Get or create session
@@ -1470,6 +1491,62 @@ async def add_credits_to_user(
     except Exception as e:
         logger.error(f"Error adding credits to user {user_id}: {e}")
         raise HTTPException(status_code=500, detail="Internal server error")
+
+
+@app.get("/api/payment/paypal-info")
+async def get_paypal_payment_info(
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """
+    Get PayPal payment information for purchasing credits.
+    Returns the PayPal checkout URL and pricing details.
+    """
+    try:
+        config = get_config()
+
+        return {
+            "success": True,
+            "payment_url": config.PAYPAL_CHECKOUT_URL,
+            "credits_per_package": config.CREDITS_PER_PURCHASE,
+            "price": config.PAYPAL_PRICE_PER_PACKAGE,
+            "currency": config.PAYPAL_CURRENCY,
+            "message": f"Pay ${config.PAYPAL_PRICE_PER_PACKAGE} {config.PAYPAL_CURRENCY} to receive {config.CREDITS_PER_PURCHASE} message credits"
+        }
+    except Exception as e:
+        logger.error(f"Error fetching PayPal info: {e}")
+        raise HTTPException(status_code=500, detail="Failed to fetch payment information")
+
+
+@app.post("/api/payment/verify")
+async def verify_payment(
+    transaction_id: str,
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """
+    Verify PayPal payment and add credits to user account.
+    For manual verification: Admin needs to confirm the transaction.
+
+    Args:
+        transaction_id: PayPal transaction ID provided by user after payment
+    """
+    try:
+        user_id = current_user["uid"]
+        logger.info(f"User {user_id} submitted payment verification for transaction: {transaction_id}")
+
+        # For now, return a pending status
+        # In production, you would verify with PayPal API or have admin approval
+        return {
+            "success": True,
+            "status": "pending",
+            "message": "Payment verification submitted. Credits will be added after manual verification.",
+            "transaction_id": transaction_id,
+            "user_id": user_id
+        }
+    except Exception as e:
+        logger.error(f"Error verifying payment: {e}")
+        raise HTTPException(status_code=500, detail="Failed to verify payment")
 
 
 # Admin API endpoints for managing user credits and whitelist

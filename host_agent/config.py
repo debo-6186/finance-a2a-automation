@@ -36,6 +36,11 @@ class Config:
     SESSION_MESSAGE_CREDITS = int(os.getenv("SESSION_MESSAGE_CREDITS", "30"))
     CREDITS_PER_PURCHASE = int(os.getenv("CREDITS_PER_PURCHASE", "30"))
 
+    # PayPal Configuration
+    PAYPAL_CHECKOUT_URL = os.getenv("PAYPAL_CHECKOUT_URL", "https://www.paypal.com/checkout")
+    PAYPAL_PRICE_PER_PACKAGE = float(os.getenv("PAYPAL_PRICE_PER_PACKAGE", "5.00"))
+    PAYPAL_CURRENCY = os.getenv("PAYPAL_CURRENCY", "USD")
+
     # MCP Configuration
     MCP_DIRECTORY = os.getenv("MCP_DIRECTORY", "/Users/debojyotichakraborty/codebase/finhub-mcp")  # Default to local path
 
